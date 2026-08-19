@@ -8,13 +8,21 @@ from launch_ros.actions import Node
 
 def generate_launch_description():
     """Declare platform-facing settings and launch the live driver."""
+    defaults = {
+        'sonar_ip': '192.168.194.96',
+        'frame_id': 'sonar3d_link',
+        'speed_of_sound': '0.0',
+        'configure_sonar': 'true',
+        'http_timeout': '5.0',
+        'multicast_group': '224.0.0.96',
+        'multicast_port': '4747',
+        'multicast_interface': '0.0.0.0',
+        'poll_period': '0.01',
+        'max_packets_per_spin': '32',
+    }
     arguments = [
-        DeclareLaunchArgument('sonar_ip', default_value='192.168.194.96'),
-        DeclareLaunchArgument('frame_id', default_value='sonar3d_link'),
-        DeclareLaunchArgument('speed_of_sound', default_value='0'),
-        DeclareLaunchArgument('configure_sonar', default_value='true'),
-        DeclareLaunchArgument('http_timeout', default_value='5.0'),
-        DeclareLaunchArgument('multicast_interface', default_value='0.0.0.0'),
+        DeclareLaunchArgument(name, default_value=value)
+        for name, value in defaults.items()
     ]
     driver = Node(
         package='sonar3d',
@@ -22,12 +30,8 @@ def generate_launch_description():
         name='sonar3d_driver',
         output='screen',
         parameters=[{
-            'sonar_ip': LaunchConfiguration('sonar_ip'),
-            'frame_id': LaunchConfiguration('frame_id'),
-            'speed_of_sound': LaunchConfiguration('speed_of_sound'),
-            'configure_sonar': LaunchConfiguration('configure_sonar'),
-            'http_timeout': LaunchConfiguration('http_timeout'),
-            'multicast_interface': LaunchConfiguration('multicast_interface'),
+            name: LaunchConfiguration(name)
+            for name in defaults
         }],
     )
     return LaunchDescription(arguments + [driver])

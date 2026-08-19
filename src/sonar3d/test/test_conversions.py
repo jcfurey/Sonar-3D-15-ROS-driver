@@ -5,14 +5,14 @@ import math
 import numpy as np
 import pytest
 
-from sonar3d.api.sonar_3d_15_protocol_pb2 import (
-    BitmapImageGreyscale8,
-    RangeImage,
-)
 from sonar3d.conversions import (
     bitmap_image_to_mono8,
     range_image_to_meters,
     range_image_to_points,
+)
+from wlsonar.range_image_protocol import (
+    BitmapImageGreyscale8,
+    RangeImage,
 )
 
 

@@ -1,5 +1,5 @@
-# Convenience requirements for non-ROS use. ROS deployments should use rosdep,
-# which resolves the dependencies declared in package.xml.
--r sonar3d/api/requirements.txt
+# Official Water Linked HTTP client and RIP1/RIP2 parser validated by this driver.
+wlsonar==0.5.4
+
 numpy
 setuptools

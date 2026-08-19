@@ -3,15 +3,15 @@
 from builtin_interfaces.msg import Time
 import numpy as np
 
-from sonar3d.api.sonar_3d_15_protocol_pb2 import (
-    BitmapImageGreyscale8,
-    RangeImage,
-)
 from sonar3d.ros_messages import (
     bitmap_image_message,
     header_from_sonar_message,
     point_cloud_message,
     range_image_message,
+)
+from wlsonar.range_image_protocol import (
+    BitmapImageGreyscale8,
+    RangeImage,
 )
 
 

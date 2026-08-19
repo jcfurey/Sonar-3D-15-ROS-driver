@@ -7,7 +7,7 @@ package_name = 'sonar3d'
 
 setup(
     name=package_name,
-    version='0.1.0',
+    version='0.2.0',
     packages=find_packages(exclude=['test']),
     data_files=[
         ('share/ament_index/resource_index/packages',
@@ -15,7 +15,7 @@ setup(
         ('share/' + package_name, ['package.xml']),
         (os.path.join('share', package_name, 'launch'), glob('launch/*.py')),
     ],
-    install_requires=['setuptools'],
+    install_requires=['setuptools', 'numpy', 'wlsonar==0.5.4'],
     zip_safe=True,
     maintainer='Water Linked',
     maintainer_email='support@waterlinked.com',
