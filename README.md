@@ -26,8 +26,8 @@ timestamps are used when present; the ROS clock is only a fallback.
 ## Dependencies and build
 
 `wlsonar` is distributed on PyPI and does not currently have a rosdep key. The
-package pins the validated release in both `requirements.txt` and `setup.py`.
-Install it on the target platform before building:
+package pins the validated release in `requirements.txt`. Install it on the
+target platform before building:
 
 ```bash
 python3 -m pip install -r src/sonar3d/requirements.txt
@@ -36,6 +36,9 @@ rosdep install --from-paths src --ignore-src -r -y
 colcon build --packages-select sonar3d
 source install/setup.bash
 ```
+
+The ROS package uses `ament_cmake_auto` and `ament_cmake_python`, so colcon does
+not invoke a package-owned `setup.py` or setuptools `install_data` path.
 
 ## Live operation
 
