@@ -1,135 +1,193 @@
+"""ROS 2 live driver for Water Linked Sonar 3D-15 multicast data."""
+
+import socket
+
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
+from sensor_msgs.msg import Image, PointCloud2
 
-from sensor_msgs.msg import PointCloud2
-from sensor_msgs.msg import Image
-from sensor_msgs_py import point_cloud2
-from std_msgs.msg import Header
+from sonar3d.api.inspect_sonar_data import decode_protobuf_packet, parse_rip1_packet
+from sonar3d.http_api import configure_sonar
+from sonar3d.ros_messages import (
+    bitmap_image_message,
+    header_from_sonar_message,
+    point_cloud_message,
+    range_image_message,
+)
 
-from sonar3d.api.inspect_sonar_data import parse_rip1_packet, decode_protobuf_packet, rangeImageToXYZ
-from sonar3d.api.interface_sonar_api import set_acoustics, describe_response, enable_multicast
-import socket
-import struct
-import numpy as np
 
-class TimerNode(Node):
+class Sonar3DNode(Node):
+    """Receive Sonar 3D-15 datagrams and publish native ROS products."""
 
-    # Multicast group and port used by the Sonar 3D-15
-    MULTICAST_GROUP = '224.0.0.96'
-    PORT = 4747
-
-    # The maximum possible packet size for Sonar 3D-15 data
-    BUFFER_SIZE = 65535
+    DEFAULT_MULTICAST_GROUP = '224.0.0.96'
+    DEFAULT_MULTICAST_PORT = 4747
+    MAX_DATAGRAM_SIZE = 65535
 
     def __init__(self):
-        super().__init__('timer_node')
-        
-        # Declare parameters
-        self.declare_parameter('IP', '192.168.194.96')# '192.168.194.96' is the fallback ip, to change this, edit the launchfile.
-        self.declare_parameter('speed_of_sound', 1491)    # setting this takes ~20s
+        """Configure the sonar, multicast socket, and ROS publishers."""
+        super().__init__('sonar3d_driver')
 
-        self.sonar_ip = self.get_parameter('IP').get_parameter_value().string_value
-        self.sonar_speed_of_sound = self.get_parameter('speed_of_sound').get_parameter_value().integer_value
+        self.declare_parameter('sonar_ip', '192.168.194.96')
+        self.declare_parameter('frame_id', 'sonar3d_link')
+        self.declare_parameter('speed_of_sound', 0)
+        self.declare_parameter('configure_sonar', True)
+        self.declare_parameter('http_timeout', 5.0)
+        self.declare_parameter('multicast_group', self.DEFAULT_MULTICAST_GROUP)
+        self.declare_parameter('multicast_port', self.DEFAULT_MULTICAST_PORT)
+        self.declare_parameter('multicast_interface', '0.0.0.0')
+        self.declare_parameter('poll_period', 0.01)
+        self.declare_parameter('max_packets_per_spin', 32)
 
-        # Create a timer that calls the timer_callback every sample_time seconds 
-        sample_time = 0.01          # sample time in seconds
-        self.create_timer(sample_time, self.timer_callback)
-        self.get_logger().info(f'Timer Node initialized with {1/sample_time} Hz')
+        self.sonar_ip = self.get_parameter('sonar_ip').value
+        self.frame_id = self.get_parameter('frame_id').value
+        self.max_packets_per_spin = self.get_parameter('max_packets_per_spin').value
 
-        # Create a publisher that publishes the point cloud data
-        self.pointcloud_publisher_ = self.create_publisher(PointCloud2, 'sonar_point_cloud', 10)
-        self.image_publisher_ = self.create_publisher(Image, 'sonar_range_image', 10)
+        self.pointcloud_publisher = self.create_publisher(
+            PointCloud2,
+            'sonar_point_cloud',
+            qos_profile_sensor_data,
+        )
+        self.range_image_publisher = self.create_publisher(
+            Image,
+            'sonar_range_image',
+            qos_profile_sensor_data,
+        )
+        self.intensity_image_publisher = self.create_publisher(
+            Image,
+            'sonar_intensity_image',
+            qos_profile_sensor_data,
+        )
 
-        # Enable the acoustics on the sonar
-        resp = set_acoustics(self.sonar_ip, True)
-        self.get_logger().info(f'Enabling acoustics response: {describe_response(self.sonar_ip, resp)}')
+        if self.get_parameter('configure_sonar').value:
+            self._configure_sonar()
 
-        resp = enable_multicast(self.sonar_ip)
-        self.get_logger().info(f'Enabling multicast response: {describe_response(self.sonar_ip, resp)}')
+        multicast_group = self.get_parameter('multicast_group').value
+        multicast_port = self.get_parameter('multicast_port').value
+        multicast_interface = self.get_parameter('multicast_interface').value
+        self.sock = self._open_multicast_socket(
+            multicast_group,
+            multicast_port,
+            multicast_interface,
+        )
+        poll_period = self.get_parameter('poll_period').value
+        self.timer = self.create_timer(poll_period, self._poll_socket)
+        self.get_logger().info(
+            f'Listening for Sonar 3D-15 RIP1 packets on '
+            f'{multicast_group}:{multicast_port}'
+        )
 
-        # Set up a UDP socket with multicast membership
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.sock.bind(('', self.PORT))
+    @staticmethod
+    def _open_multicast_socket(group, port, interface):
+        """Create a nonblocking UDP multicast receiver."""
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(('', port))
+        membership = socket.inet_aton(group) + socket.inet_aton(interface)
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, membership)
+        sock.setblocking(False)
+        return sock
 
-        group = socket.inet_aton(self.MULTICAST_GROUP)
-        mreq = struct.pack('4sL', group, socket.INADDR_ANY)
-        self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+    def _configure_sonar(self):
+        """Apply requested HTTP settings before listening for datagrams."""
+        speed_of_sound = self.get_parameter('speed_of_sound').value
+        http_timeout = self.get_parameter('http_timeout').value
+        try:
+            applied = configure_sonar(
+                self.sonar_ip,
+                speed_of_sound=speed_of_sound,
+                timeout=http_timeout,
+            )
+            self.get_logger().info(f'Configured sonar settings: {", ".join(applied)}')
+        except Exception as error:  # requests exposes several transport exceptions
+            self.get_logger().warning(
+                f'Could not configure Sonar 3D-15 at {self.sonar_ip}: {error}'
+            )
 
-        self.get_logger().info(f"Listening for Sonar 3D-15 RIP1 packets on {self.MULTICAST_GROUP}:{self.PORT}...")
+    def _poll_socket(self):
+        """Drain a bounded batch without blocking the ROS executor."""
+        for _ in range(self.max_packets_per_spin):
+            try:
+                data, address = self.sock.recvfrom(self.MAX_DATAGRAM_SIZE)
+            except BlockingIOError:
+                return
+            except OSError as error:
+                if rclpy.ok():
+                    self.get_logger().error(f'Multicast receive failed: {error}')
+                return
+            self._handle_datagram(data, address[0])
 
-        if self.sonar_ip != "":
-            self.get_logger().info(f"Filtering packets from IP: {self.sonar_ip}")
-
-
-    def timer_callback(self):
-
-        data, addr = self.sock.recvfrom(self.BUFFER_SIZE)
-
-        # If SONAR_IP is configured, and this doesn't match the known Sonar IP, skip it.
-        if not (addr[0] == self.sonar_ip or addr[0] == '192.168.194.96'):
-            self.get_logger().info(f"Received packet from {addr[0]}. Data was received from an IP that does not match the declared SONAR_IP ({self.sonar_ip}), so the packet will be skipped.")
+    def _handle_datagram(self, data, source_ip):
+        """Decode and publish one datagram if it came from the selected sonar."""
+        if self.sonar_ip and source_ip != self.sonar_ip:
+            self.get_logger().debug(
+                f'Ignoring Sonar 3D-15 packet from unexpected source {source_ip}'
+            )
             return
 
         payload = parse_rip1_packet(data)
         if payload is None:
-            self.get_logger().warning("Parsed payload is None, skipping packet.")
+            self.get_logger().warning('Rejected malformed Sonar 3D-15 RIP1 packet')
             return
-        # Decode the Protobuf message
         result = decode_protobuf_packet(payload)
         if not result:
-            self.get_logger().warning("Decoding Protobuf packet failed, skipping packet.")
+            self.get_logger().warning('Could not decode Sonar 3D-15 protobuf packet')
             return
 
-        msg_type, msg_obj = result
+        message_type, message = result
+        header = header_from_sonar_message(
+            message,
+            self.frame_id,
+            self.get_clock().now().to_msg(),
+        )
+        try:
+            if message_type == 'RangeImage':
+                self.range_image_publisher.publish(range_image_message(message, header))
+                self.pointcloud_publisher.publish(point_cloud_message(message, header))
+            elif message_type == 'BitmapImageGreyscale8':
+                self.intensity_image_publisher.publish(
+                    bitmap_image_message(message, header)
+                )
+            else:
+                self.get_logger().debug(
+                    f'Ignoring unsupported Sonar 3D-15 message {message_type}'
+                )
+        except ValueError as error:
+            self.get_logger().warning(f'Rejected malformed {message_type}: {error}')
 
-        if msg_type == 'RangeImage':
-            # Convert the RangeImage message to voxel data
-            voxels = rangeImageToXYZ(msg_obj)
+    def destroy_node(self):
+        """Close the multicast socket before destroying the ROS node."""
+        if hasattr(self, 'sock'):
+            sock = self.sock
+            del self.sock
+            try:
+                sock.close()
+            except KeyboardInterrupt:
+                pass
+        return super().destroy_node()
 
-            # extract the x, y, z coordinates from the voxels
-            pts = []
-            for i in range(len(voxels)):
-                pts.append((voxels[i]['x'], voxels[i]['y'], voxels[i]['z']))
-
-            # Create a PointCloud2 message
-            # Create the msg header
-            header = Header()
-            header.stamp = self.get_clock().now().to_msg()  # Use ROS2 time
-            header.frame_id = 'sonar_frame'
-
-            cloud_msg = point_cloud2.create_cloud_xyz32(header, pts)
-
-            # Publish the PointCloud2 message
-            self.pointcloud_publisher_.publish(cloud_msg)
-
-            # Publish the raw range image
-            img_msg = Image()
-            img_msg.header = header
-            img_msg.height = msg_obj.height
-            img_msg.width = msg_obj.width
-            img_msg.encoding = '32FC1'
-            img_msg.is_bigendian = False
-            img_msg.step = msg_obj.width * 4
-            range_image = (np.array(msg_obj.image_pixel_data, dtype=np.uint32) * msg_obj.image_pixel_scale).astype(np.float32)
-            img_msg.data = range_image.tobytes()
-            self.image_publisher_.publish(img_msg)
-
-        
-        
-    
 
 def main(args=None):
+    """Run the Sonar 3D-15 live driver."""
     rclpy.init(args=args)
-    node = TimerNode()
+    node = None
+    try:
+        node = Sonar3DNode()
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if node is not None:
+            try:
+                node.destroy_node()
+            except KeyboardInterrupt:
+                pass
+        try:
+            if rclpy.ok():
+                rclpy.shutdown()
+        except KeyboardInterrupt:
+            pass
 
-    rclpy.spin(node)
-
-    # Destroy the node explicitly
-    # (optional - otherwise it will be done automatically
-    # when the garbage collector destroys the node object)
-    node.destroy_node()
-    rclpy.shutdown()
 
 if __name__ == '__main__':
     main()

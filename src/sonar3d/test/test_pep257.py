@@ -19,5 +19,14 @@ import pytest
 @pytest.mark.linter
 @pytest.mark.pep257
 def test_pep257():
-    rc = main(argv=['.', 'test'])
+    rc = main(argv=[
+        'launch',
+        'setup.py',
+        'sonar3d/conversions.py',
+        'sonar3d/http_api.py',
+        'sonar3d/multicast_listener.py',
+        'sonar3d/ros_messages.py',
+        'sonar3d/sonar_to_bag.py',
+        'test',
+    ])
     assert rc == 0, 'Found code style errors / warnings'

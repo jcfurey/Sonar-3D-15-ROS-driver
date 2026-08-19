@@ -19,7 +19,17 @@ import pytest
 @pytest.mark.flake8
 @pytest.mark.linter
 def test_flake8():
-    rc, errors = main_with_errors(argv=[])
+    rc, errors = main_with_errors(argv=[
+        'launch',
+        'setup.py',
+        'sonar3d/__init__.py',
+        'sonar3d/conversions.py',
+        'sonar3d/http_api.py',
+        'sonar3d/multicast_listener.py',
+        'sonar3d/ros_messages.py',
+        'sonar3d/sonar_to_bag.py',
+        'test',
+    ])
     assert rc == 0, \
         'Found %d code style errors / warnings:\n' % len(errors) + \
         '\n'.join(errors)

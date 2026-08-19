@@ -1,5 +1,5 @@
+# Convenience requirements for non-ROS use. ROS deployments should use rosdep,
+# which resolves the dependencies declared in package.xml.
 -r sonar3d/api/requirements.txt
-
-setuptools
 numpy
-
+setuptools
