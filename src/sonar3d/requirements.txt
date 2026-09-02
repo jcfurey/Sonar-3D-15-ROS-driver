@@ -1,5 +1,0 @@
-# Official Water Linked HTTP client and RIP1/RIP2 parser validated by this driver.
-wlsonar==0.5.4
-
-numpy
-setuptools

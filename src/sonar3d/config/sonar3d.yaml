@@ -1,0 +1,20 @@
+sonar3d_driver:
+  ros__parameters:
+    sonar_ip: "192.168.194.96"
+    frame_id: "sonar3d_link"
+    imu_frame_id: "sonar3d_imu_link"
+    configure_sonar: true
+    speed_of_sound: 0.0
+    http_timeout: 5.0
+    multicast_group: "224.0.0.96"
+    multicast_port: 4747
+    multicast_interface: "0.0.0.0"
+    poll_period: 0.01
+    max_packets_per_spin: 32
+    use_sensor_timestamps: true
+    publish_point_cloud: true
+    publish_range_image: true
+    publish_bitmap_images: true
+    publish_imu: true
+    diagnostics_period: 1.0
+    packet_stale_timeout: 2.0

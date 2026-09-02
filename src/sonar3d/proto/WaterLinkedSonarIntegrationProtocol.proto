@@ -1,0 +1,58 @@
+// Water Linked Sonar 3D-15 integration protocol.
+//
+// Sourced from https://github.com/waterlinked/wlsonar at tag v0.5.4.
+// The upstream protocol definition is distributed under the MIT license.
+syntax = "proto3";
+
+package waterlinked.sonar.protocol;
+
+import "google/protobuf/any.proto";
+import "google/protobuf/timestamp.proto";
+
+message Packet {
+  google.protobuf.Any msg = 1;
+}
+
+message Header {
+  google.protobuf.Timestamp timestamp = 1;
+  uint32 sequence_id = 2;
+}
+
+enum BitmapImageType {
+  SIGNAL_STRENGTH_IMAGE = 0;
+  SHADED_IMAGE = 1;
+}
+
+message BitmapImageGreyscale8 {
+  Header header = 1;
+  float speed_of_sound = 2;
+  float range = 3;
+  uint32 frequency = 4;
+  BitmapImageType type = 5;
+  uint32 width = 6;
+  uint32 height = 7;
+  float fov_horizontal = 8;
+  float fov_vertical = 9;
+  bytes image_pixel_data = 10;
+}
+
+message RangeImage {
+  Header header = 1;
+  float speed_of_sound = 2;
+  float range = 3;
+  uint32 frequency = 4;
+  uint32 width = 5;
+  uint32 height = 6;
+  float fov_horizontal = 7;
+  float fov_vertical = 8;
+  float image_pixel_scale = 9;
+  repeated uint32 image_pixel_data = 10;
+}
+
+message ImuBatch {
+  uint32 batch_sequence_id = 1;
+  uint32 samples = 2;
+  repeated google.protobuf.Timestamp timestamp = 3;
+  repeated float specific_force = 4;
+  repeated float rate_of_turn = 5;
+}

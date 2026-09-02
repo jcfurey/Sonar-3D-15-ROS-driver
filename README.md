@@ -1,44 +1,62 @@
-# Sonar 3D-15 ROS Driver
+# Sonar 3D-15 ROS 2 Driver
 
-ROS 2 driver and recording playback tools for the Water Linked Sonar 3D-15.
-The package is tested with ROS 2 Jazzy. It receives RIP1 and RIP2 UDP packets,
-decodes them with Water Linked's official
-[`wlsonar`](https://github.com/waterlinked/wlsonar) library, and publishes the
-range, intensity, and point-cloud products without requiring the browser
-interface.
+Native C++20 ROS 2 driver and recording player for the Water Linked Sonar
+3D-15. The package is tested on ROS 2 Jazzy and has no Python or `wlsonar`
+runtime dependency.
 
-## ROS topics
+The driver is split into small reusable libraries:
 
-The live driver and recording player use the same relative topic names, so a
-platform launch file can namespace or remap them normally.
+- `sonar3d_protocol` validates CRC and framing, decompresses RIP2 with Snappy,
+  and decodes the vendor protobuf. RIP1 remains supported for old recordings.
+- `sonar3d_ros` validates images and converts them to ROS messages and REP-103
+  geometry.
+- `sonar3d_io` owns the nonblocking multicast socket and bounded HTTP client.
+- `sonar3d_component` is a composable `rclcpp` node. The installed
+  `sonar_publisher` executable loads that same component.
+
+The protobuf definition is generated during the CMake build from Water
+Linked's published protocol, so generated sources are not checked in.
+
+## Published topics
+
+All topic names are relative and can be namespaced or remapped normally.
 
 | Topic | Type | Contract |
 | --- | --- | --- |
-| `sonar_range_image` | `sensor_msgs/Image` | `32FC1` range in meters; zero is no return |
-| `sonar_intensity_image` | `sensor_msgs/Image` | Native, unscaled `mono8` vendor bitmap |
-| `sonar_point_cloud` | `sensor_msgs/PointCloud2` | Dense valid returns with `x,y,z,range,azimuth,elevation` float32 fields |
+| `sonar_range_image` | `sensor_msgs/Image` | `32FC1` range in metres; zero means no return |
+| `sonar_intensity_image` | `sensor_msgs/Image` | Native `mono8` signal-strength bitmap |
+| `sonar_shaded_image` | `sensor_msgs/Image` | Native `mono8` vendor shaded-depth bitmap |
+| `sonar_point_cloud` | `sensor_msgs/PointCloud2` | Valid returns with `x,y,z,range,azimuth,elevation` float32 fields |
+| `sonar_imu` | `sensor_msgs/Imu` | Batched specific force and angular rate, one ROS message per sample |
+| `/diagnostics` | `diagnostic_msgs/DiagnosticArray` | Stream health, configuration state, CRC errors, and sequence statistics |
 
-The point cloud uses a ROS REP-103 body frame: x forward, y left, z up. The
-vendor's y-right/z-down coordinates and native yaw sign are converted when the
-cloud is formed. Images retain the vendor's row-major pixel ordering. Sensor
-timestamps are used when present; the ROS clock is only a fallback.
+The point cloud is x-forward, y-left, z-up (REP-103). The device's native
+x-forward, y-right, z-down coordinates are converted when points and IMU
+vectors are built. Images retain the vendor's row-major pixel order.
+
+The internal IMU origin is documented as `(-0.022, -0.046, -0.003)` metres in
+the vendor frame relative to the point-cloud origin. After the REP-103 axis
+conversion, publish a static transform from `sonar3d_link` to
+`sonar3d_imu_link` with translation `(-0.022, 0.046, 0.003)` metres for a
+complete TF model.
+
+Sensor protobuf timestamps are used by default. Set
+`use_sensor_timestamps:=false` if the sonar clock is not synchronized to the
+ROS system clock.
 
 ## Dependencies and build
 
-`wlsonar` is distributed on PyPI and does not currently have a rosdep key. The
-package pins the validated release in `requirements.txt`. Install it on the
-target platform before building:
+Install dependencies through rosdep; no pip step is needed:
 
 ```bash
-python3 -m pip install -r src/sonar3d/requirements.txt
 source /opt/ros/jazzy/setup.bash
 rosdep install --from-paths src --ignore-src -r -y
 colcon build --packages-select sonar3d
 source install/setup.bash
 ```
 
-The ROS package uses `ament_cmake_auto` and `ament_cmake_python`, so colcon does
-not invoke a package-owned `setup.py` or setuptools `install_data` path.
+The native protocol implementation requires Protobuf, Snappy, and zlib. The
+HTTP configuration client uses libcurl.
 
 ## Live operation
 
@@ -49,55 +67,91 @@ ros2 launch sonar3d sonar3d.launch.py \
   multicast_interface:=0.0.0.0
 ```
 
-Launch arguments:
+HTTP configuration runs on a bounded background thread, so a missing sonar
+does not block the executor or multicast receive path. Setting
+`configure_sonar:=false` makes the node listen without changing device state.
 
-| Argument | Default | Meaning |
+The component can also be loaded into an existing container:
+
+```bash
+ros2 component load /ComponentManager sonar3d sonar3d::SonarDriver
+```
+
+The checked-in defaults are in `src/sonar3d/config/sonar3d.yaml`.
+
+| Parameter | Default | Meaning |
 | --- | --- | --- |
-| `sonar_ip` | `192.168.194.96` | Expected packet source and HTTP API address |
-| `frame_id` | `sonar3d_link` | Frame attached to all published products |
-| `speed_of_sound` | `0.0` | m/s value to configure; zero preserves the sonar setting |
+| `sonar_ip` | `192.168.194.96` | Literal IPv4 packet source and HTTP API address; empty accepts any source when configuration is disabled |
+| `frame_id` | `sonar3d_link` | Frame for range, bitmap, and point-cloud products |
+| `imu_frame_id` | `sonar3d_imu_link` | Frame at the internal IMU origin |
+| `speed_of_sound` | `0.0` | m/s to configure; zero preserves the device setting |
 | `configure_sonar` | `true` | Enable acoustics and multicast through the HTTP API |
-| `http_timeout` | `5.0` | Maximum seconds for ordinary HTTP API requests |
-| `multicast_group` | `224.0.0.96` | UDP multicast group |
-| `multicast_port` | `4747` | UDP multicast port |
+| `http_timeout` | `5.0` | Ordinary HTTP timeout in seconds |
+| `multicast_group` | `224.0.0.96` | RIP multicast group |
+| `multicast_port` | `4747` | RIP UDP port |
 | `multicast_interface` | `0.0.0.0` | Local IPv4 interface used to join multicast |
-| `poll_period` | `0.01` | ROS timer period in seconds |
-| `max_packets_per_spin` | `32` | Maximum datagrams drained per timer callback |
+| `poll_period` | `0.01` | Nonblocking socket poll period in wall-clock seconds |
+| `max_packets_per_spin` | `32` | Maximum datagrams drained per executor callback |
+| `use_sensor_timestamps` | `true` | Prefer valid device timestamps over receive time |
+| `publish_point_cloud` | `true` | Enable the derived cloud |
+| `publish_range_image` | `true` | Enable the scaled range image |
+| `publish_bitmap_images` | `true` | Enable signal-strength and shaded bitmap topics |
+| `publish_imu` | `true` | Publish `ImuBatch` samples when present |
+| `diagnostics_period` | `1.0` | Diagnostic publication period in seconds |
+| `packet_stale_timeout` | `2.0` | Time without valid packets before diagnostics report a stale stream |
 
-The receive socket is nonblocking, so the ROS executor and shutdown path remain
-responsive when the sonar is absent or stops transmitting. HTTP setup calls are
-also bounded; setting speed of sound permits up to 30 seconds because the device
-may apply that setting slowly. Set `configure_sonar:=false` to listen to a sonar
-that is already configured without making HTTP requests.
+Parameters that determine socket, publisher, or device setup are read-only;
+restart the node to change them. This avoids reporting a parameter update that
+was not actually applied to the hardware or transport.
 
 ## Recording playback
 
-The installed playback executable reads mixed RIP1/RIP2 `.sonar` recordings and
-publishes the same topic contract as the live driver:
+Playback is native C++:
 
 ```bash
-ros2 run sonar3d sonar_to_bag \
+ros2 run sonar3d sonar_replay \
   --file survey.sonar \
   --realtime-factor 1.0 \
   --frame-id sonar3d_link
 ```
 
-Record the replay with normal rosbag tooling if an MCAP or SQLite bag is needed:
+The old `sonar_to_bag` executable name remains as a compatibility alias.
+
+It reads mixed RIP1/RIP2 recordings using declared packet lengths, validates
+CRCs, skips damaged packets when framing remains recoverable, and publishes
+the same data topics as the live driver with reliable QoS. A short startup
+delay allows DDS discovery before the first sample; control it with
+`--startup-delay`. Use `--receive-time` to ignore recorded sensor timestamps.
+
+Record the replay with standard rosbag tooling:
 
 ```bash
 ros2 bag record \
   /sonar_range_image \
   /sonar_intensity_image \
-  /sonar_point_cloud
+  /sonar_shaded_image \
+  /sonar_point_cloud \
+  /sonar_imu
 ```
 
-Playback follows packet lengths and validates CRCs. A damaged packet with valid
-framing is skipped; playback stops if stream framing is lost. RIP1 and RIP2 are
-both decoded by the same official parser.
+## Tests
 
-## License and attribution
+```bash
+colcon test --packages-select sonar3d --return-code-on-test-failure
+colcon test-result --verbose
+```
 
-The ROS package is MIT licensed. Recording playback work includes attribution to
-Marios Xanthidis (SINTEF Ocean), the Research Council of Norway EchoNav project,
-and Alberto Quattrini Li's earlier ROS integration, as described in the source
-history.
+The suite covers RIP1 and RIP2 round trips, an external golden packet produced
+by official `wlsonar` 0.5.4, corrupt/truncated framing, ROS image/cloud
+contracts, REP-103 geometry, IMU conversion, and configuration sequencing.
+
+## Protocol source and license
+
+The wire definition and behavior follow Water Linked's
+[Sonar 3D-15 integration API](https://docs.waterlinked.com/sonar-3d/sonar-3d-15-api/)
+and the tagged
+[`wlsonar` 0.5.4 implementation](https://github.com/waterlinked/wlsonar/tree/v0.5.4).
+Both the driver and vendored protocol definition are MIT licensed. Recording
+playback history retains attribution to Marios Xanthidis (SINTEF Ocean), the
+Research Council of Norway EchoNav project, and Alberto Quattrini Li's earlier
+ROS integration.

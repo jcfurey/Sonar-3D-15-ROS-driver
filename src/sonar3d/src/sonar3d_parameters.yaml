@@ -1,0 +1,120 @@
+sonar3d:
+  sonar_ip:
+    type: string
+    default_value: "192.168.194.96"
+    description: "Literal IPv4 address used as the expected packet source and Sonar 3D-15 HTTP API address. Empty accepts packets from any source when configure_sonar is false."
+    read_only: true
+
+  frame_id:
+    type: string
+    default_value: "sonar3d_link"
+    description: "REP-103 body frame used by range, bitmap, and point-cloud products."
+    read_only: true
+
+  imu_frame_id:
+    type: string
+    default_value: "sonar3d_imu_link"
+    description: "Frame at the internal IMU location; publish a static transform to frame_id using the documented sensor offset."
+    read_only: true
+
+  configure_sonar:
+    type: bool
+    default_value: true
+    description: "Enable acoustics and UDP multicast through the device HTTP API at startup."
+    read_only: true
+
+  speed_of_sound:
+    type: double
+    default_value: 0.0
+    description: "Speed of sound to configure in m/s. Zero preserves the device setting; nonzero values must be in [1000, 2000]."
+    read_only: true
+
+  http_timeout:
+    type: double
+    default_value: 5.0
+    description: "HTTP connect and request timeout in seconds. Speed-of-sound updates are allowed at least 30 seconds."
+    read_only: true
+    validation:
+      bounds<>: [0.1, 60.0]
+
+  multicast_group:
+    type: string
+    default_value: "224.0.0.96"
+    description: "IPv4 multicast group carrying RIP packets."
+    read_only: true
+
+  multicast_port:
+    type: int
+    default_value: 4747
+    description: "UDP port carrying RIP packets."
+    read_only: true
+    validation:
+      bounds<>: [1, 65535]
+
+  multicast_interface:
+    type: string
+    default_value: "0.0.0.0"
+    description: "Local IPv4 interface address used for multicast membership."
+    read_only: true
+
+  poll_period:
+    type: double
+    default_value: 0.01
+    description: "Wall-clock interval in seconds between nonblocking socket polls."
+    read_only: true
+    validation:
+      bounds<>: [0.001, 1.0]
+
+  max_packets_per_spin:
+    type: int
+    default_value: 32
+    description: "Maximum datagrams drained in one executor callback."
+    read_only: true
+    validation:
+      bounds<>: [1, 4096]
+
+  use_sensor_timestamps:
+    type: bool
+    default_value: true
+    description: "Use valid protobuf timestamps; otherwise stamp products from the ROS clock on receipt."
+    read_only: true
+
+  publish_point_cloud:
+    type: bool
+    default_value: true
+    description: "Publish dense valid returns as sensor_msgs/PointCloud2."
+    read_only: true
+
+  publish_range_image:
+    type: bool
+    default_value: true
+    description: "Publish scaled range pixels as a 32FC1 sensor_msgs/Image."
+    read_only: true
+
+  publish_bitmap_images:
+    type: bool
+    default_value: true
+    description: "Publish signal-strength and shaded bitmap messages on their respective mono8 topics."
+    read_only: true
+
+  publish_imu:
+    type: bool
+    default_value: true
+    description: "Publish RIP2 ImuBatch samples when the device is configured to emit them."
+    read_only: true
+
+  diagnostics_period:
+    type: double
+    default_value: 1.0
+    description: "Wall-clock interval between /diagnostics updates in seconds."
+    read_only: true
+    validation:
+      bounds<>: [0.1, 60.0]
+
+  packet_stale_timeout:
+    type: double
+    default_value: 2.0
+    description: "Age in seconds after which a previously active RIP stream is diagnosed as stale."
+    read_only: true
+    validation:
+      bounds<>: [0.1, 60.0]
