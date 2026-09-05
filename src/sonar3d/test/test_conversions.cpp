@@ -6,11 +6,13 @@
 // SPDX-License-Identifier: MIT
 
 #include <numbers>
+#include <bit>
 #include <gtest/gtest.h>
 
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -147,6 +149,108 @@ TEST(Conversions, RejectsMalformedImageAndImuDimensions)
     static_cast<void>(sonar3d::conversions::make_imu_messages(
       imu, "imu", builtin_interfaces::msg::Time{})),
     std::invalid_argument);
+}
+
+TEST(Conversions, DirectBuffersMatchPixelGeometryAtFullResolutionAndDegenerateSizes)
+{
+  // Independent per-pixel equations check both the packed cloud and the public
+  // vector API, including sparse returns, one-pixel axes, and changing FOVs.
+  for (const auto width : {1U, 256U}) {
+    for (const auto height : {1U, 64U}) {
+      for (const auto hfov : {40.0F, 90.0F}) {
+        for (const bool sparse : {false, true}) {
+          auto source = test_range_image();
+          source.width = width;
+          source.height = height;
+          source.horizontal_fov_degrees = hfov;
+          source.pixels.resize(width * height);
+          for (std::size_t index = 0; index < source.pixels.size(); ++index) {
+            source.pixels[index] = sparse && index % 4 ? 0 : 1000 + index % 10000;
+          }
+          const std_msgs::msg::Header header = sonar3d::conversions::make_header(
+            source.header, "sonar_link", builtin_interfaces::msg::Time{});
+          const auto image = sonar3d::conversions::make_range_image(source, header);
+          const auto cloud = sonar3d::conversions::make_point_cloud(source, header);
+          const auto points = sonar3d::conversions::range_image_to_points(source);
+          EXPECT_EQ(image.header, header);
+          EXPECT_EQ(cloud.header, header);
+          EXPECT_EQ(image.is_bigendian, std::endian::native == std::endian::big);
+          EXPECT_EQ(cloud.is_bigendian, std::endian::native == std::endian::big);
+          EXPECT_EQ(image.data.size(), source.pixels.size() * sizeof(float));
+          EXPECT_EQ(cloud.data.size(), points.size() * cloud.point_step);
+          const float horizontal = hfov * std::numbers::pi_v<float>/ 180.0F;
+          const float vertical = source.vertical_fov_degrees * std::numbers::pi_v<float>/ 180.0F;
+          std::size_t point_index = 0;
+          for (std::uint32_t row = 0; row < height; ++row) {
+            for (std::uint32_t column = 0; column < width; ++column) {
+              const auto pixel_index = row * width + column;
+              const float distance = source.pixels[pixel_index] * source.pixel_scale;
+              EXPECT_FLOAT_EQ(read_float(image.data, pixel_index * sizeof(float)), distance);
+              if (source.pixels[pixel_index] == 0) {
+                continue;
+              }
+              const float yaw = width == 1 ? 0.0F :
+                -horizontal / 2.0F + horizontal * column / (width - 1);
+              const float pitch = height == 1 ? 0.0F :
+                -vertical / 2.0F + vertical * row / (height - 1);
+              const float expected[] = {
+                distance * std::cos(pitch) * std::cos(yaw),
+                -distance * std::cos(pitch) * std::sin(yaw),
+                distance * std::sin(pitch), distance, -yaw, pitch};
+              ASSERT_LT(point_index, points.size());
+              const auto & point = points[point_index];
+              const float unpacked[] = {point.x, point.y, point.z, point.range,
+                point.azimuth, point.elevation};
+              // The equivalent angle equations use a different float operation
+              // order. Allow four range-scaled float epsilons for rounding.
+              const auto tolerance = 4.0F * std::numeric_limits<float>::epsilon() * distance;
+              for (std::size_t field = 0; field < 6; ++field) {
+                EXPECT_NEAR(
+                  read_float(cloud.data, point_index * cloud.point_step + field * sizeof(float)),
+                  expected[field], tolerance);
+                EXPECT_NEAR(unpacked[field], expected[field], tolerance);
+              }
+              ++point_index;
+            }
+          }
+          EXPECT_EQ(cloud.width, point_index);
+        }
+      }
+    }
+  }
+}
+
+TEST(Conversions, EmptyReturnsProduceAnEmptyCloudAndZeroRangeImage)
+{
+  auto source = test_range_image();
+  source.pixels.assign(source.pixels.size(), 0);
+  const auto image = sonar3d::conversions::make_range_image(source, std_msgs::msg::Header{});
+  const auto cloud = sonar3d::conversions::make_point_cloud(source, std_msgs::msg::Header{});
+  EXPECT_EQ(image.data, std::vector<std::uint8_t>(source.pixels.size() * sizeof(float), 0));
+  EXPECT_TRUE(cloud.data.empty());
+  EXPECT_EQ(cloud.width, 0U);
+  EXPECT_EQ(cloud.row_step, 0U);
+  EXPECT_EQ(cloud.fields.size(), 6U);
+}
+
+TEST(Conversions, DirectBuildersRetainValidationOfDimensionsAndOverflow)
+{
+  auto source = test_range_image();
+  source.pixels.pop_back();
+  EXPECT_THROW(
+    static_cast<void>(sonar3d::conversions::make_range_image(source, std_msgs::msg::Header{})),
+      std::invalid_argument);
+  EXPECT_THROW(
+    static_cast<void>(sonar3d::conversions::make_point_cloud(source, std_msgs::msg::Header{})),
+      std::invalid_argument);
+  source = test_range_image();
+  source.pixel_scale = std::numeric_limits<float>::max();
+  EXPECT_THROW(
+    static_cast<void>(sonar3d::conversions::make_range_image(source, std_msgs::msg::Header{})),
+      std::invalid_argument);
+  EXPECT_THROW(
+    static_cast<void>(sonar3d::conversions::make_point_cloud(source, std_msgs::msg::Header{})),
+      std::invalid_argument);
 }
 
 }  // namespace

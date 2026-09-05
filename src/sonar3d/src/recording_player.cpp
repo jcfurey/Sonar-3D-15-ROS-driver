@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -28,7 +29,9 @@
 #include <sensor_msgs/msg/point_cloud2.hpp>
 
 #include "sonar3d/conversions.hpp"
+#include "sonar3d/playback_clock.hpp"
 #include "sonar3d/protocol.hpp"
+#include "sonar3d/publisher_demand.hpp"
 
 namespace sonar3d
 {
@@ -130,27 +133,30 @@ void print_usage(const char * executable)
   return options;
 }
 
-[[nodiscard]] std::optional<double> sensor_time_seconds(const protocol::Message & message)
+[[nodiscard]] std::optional<std::int64_t> sensor_time_nanoseconds(const protocol::Message & message)
 {
-  const auto to_seconds = [](const protocol::Timestamp & stamp) -> std::optional<double> {
+  const auto to_nanoseconds = [](const protocol::Timestamp & stamp) -> std::optional<std::int64_t> {
       if (stamp.seconds == 0 && stamp.nanoseconds == 0) {
         return std::nullopt;
       }
-      if (stamp.nanoseconds < 0 || stamp.nanoseconds >= 1'000'000'000) {
+      if (stamp.nanoseconds < 0 || stamp.nanoseconds >= 1'000'000'000 ||
+        stamp.seconds < std::numeric_limits<std::int32_t>::min() ||
+        stamp.seconds > std::numeric_limits<std::int32_t>::max())
+      {
         return std::nullopt;
       }
-      return static_cast<double>(stamp.seconds) + static_cast<double>(stamp.nanoseconds) / 1.0e9;
+      return stamp.seconds * 1'000'000'000 + stamp.nanoseconds;
     };
 
   return std::visit(
-    [&to_seconds](const auto & value) -> std::optional<double> {
+    [&to_nanoseconds](const auto & value) -> std::optional<std::int64_t> {
       using MessageType = std::decay_t<decltype(value)>;
       if constexpr (std::is_same_v<MessageType, protocol::RangeImage>||
       std::is_same_v<MessageType, protocol::BitmapImage>)
       {
-        return value.header.timestamp ? to_seconds(*value.header.timestamp) : std::nullopt;
+        return value.header.timestamp ? to_nanoseconds(*value.header.timestamp) : std::nullopt;
       } else if constexpr (std::is_same_v<MessageType, protocol::ImuBatch>) {
-        return value.timestamps.empty() ? std::nullopt : to_seconds(value.timestamps.front());
+        return value.timestamps.empty() ? std::nullopt : to_nanoseconds(value.timestamps.front());
       } else {
         return std::nullopt;
       }
@@ -158,13 +164,19 @@ void print_usage(const char * executable)
     message);
 }
 
-void interruptible_sleep(double seconds)
+void interruptible_sleep_until(std::chrono::steady_clock::time_point deadline)
 {
-  const auto deadline = std::chrono::steady_clock::now() + std::chrono::duration<double>(seconds);
   while (rclcpp::ok() && std::chrono::steady_clock::now() < deadline) {
     const std::chrono::duration<double> remaining = deadline - std::chrono::steady_clock::now();
     std::this_thread::sleep_for(std::min(remaining, std::chrono::duration<double>(0.05)));
   }
+}
+
+void interruptible_sleep(double seconds)
+{
+  interruptible_sleep_until(std::chrono::steady_clock::now() +
+    std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+      std::chrono::duration<double>(seconds)));
 }
 
 class RecordingPlayer final : public rclcpp::Node
@@ -199,35 +211,38 @@ public:
             frame_id_,
             fallback_stamp,
             use_sensor_timestamps_);
-          auto range_image = conversions::make_range_image(message, header);
-          auto point_cloud = conversions::make_point_cloud(message, header);
-          range_image_publisher_->publish(std::move(range_image));
-          point_cloud_publisher_->publish(std::move(point_cloud));
+          if (has_subscribers(range_image_publisher_)) {
+            range_image_publisher_->publish(std::make_unique<sensor_msgs::msg::Image>(
+                conversions::make_range_image(message, header)));
+          }
+          if (has_subscribers(point_cloud_publisher_)) {
+            point_cloud_publisher_->publish(std::make_unique<sensor_msgs::msg::PointCloud2>(
+                conversions::make_point_cloud(message, header)));
+          }
           return true;
         } else if constexpr (std::is_same_v<MessageType, protocol::BitmapImage>) {
-          const auto header = conversions::make_header(
-            message.header,
-            frame_id_,
-            fallback_stamp,
-            use_sensor_timestamps_);
-          auto image = conversions::make_bitmap_image(message, header);
+          rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr publisher;
           if (message.type == protocol::BitmapImageType::SIGNAL_STRENGTH_IMAGE) {
-            intensity_image_publisher_->publish(std::move(image));
-            return true;
+            publisher = intensity_image_publisher_;
+          } else if (message.type == protocol::BitmapImageType::SHADED_IMAGE) {
+            publisher = shaded_image_publisher_;
+          } else {
+            return false;
           }
-          if (message.type == protocol::BitmapImageType::SHADED_IMAGE) {
-            shaded_image_publisher_->publish(std::move(image));
-            return true;
+          if (has_subscribers(publisher)) {
+            const auto header = conversions::make_header(
+              message.header, frame_id_, fallback_stamp, use_sensor_timestamps_);
+            publisher->publish(std::make_unique<sensor_msgs::msg::Image>(
+                conversions::make_bitmap_image(message, header)));
           }
-          return false;
+          return true;
         } else if constexpr (std::is_same_v<MessageType, protocol::ImuBatch>) {
-          auto messages = conversions::make_imu_messages(
-            message,
-            imu_frame_id_,
-            fallback_stamp,
-            use_sensor_timestamps_);
-          for (auto & imu : messages) {
-            imu_publisher_->publish(std::move(imu));
+          if (has_subscribers(imu_publisher_)) {
+            auto messages = conversions::make_imu_messages(
+              message, imu_frame_id_, fallback_stamp, use_sensor_timestamps_);
+            for (auto & imu : messages) {
+              imu_publisher_->publish(std::make_unique<sensor_msgs::msg::Imu>(std::move(imu)));
+            }
           }
           return true;
         } else {
@@ -258,7 +273,7 @@ private:
   auto node = std::make_shared<RecordingPlayer>(options);
   interruptible_sleep(options.startup_delay);
 
-  std::optional<double> previous_stamp;
+  PlaybackClock playback_clock(options.realtime_factor);
   std::uint64_t published{};
   std::uint64_t skipped{};
   while (rclcpp::ok()) {
@@ -282,12 +297,10 @@ private:
       break;
     }
 
-    const auto stamp = sensor_time_seconds(packet->message);
-    if (stamp && previous_stamp) {
-      const auto delay = (*stamp - *previous_stamp) / options.realtime_factor;
-      if (delay > 0.0) {
-        interruptible_sleep(delay);
-      }
+    interruptible_sleep_until(playback_clock.deadline(
+        sensor_time_nanoseconds(packet->message), std::chrono::steady_clock::now()));
+    if (!rclcpp::ok()) {
+      break;
     }
 
     try {
@@ -300,9 +313,6 @@ private:
       RCLCPP_WARN(node->get_logger(), "Skipping malformed decoded message: %s", error.what());
       continue;
     }
-    if (stamp) {
-      previous_stamp = stamp;
-    }
     ++published;
     rclcpp::spin_some(node);
   }
@@ -312,7 +322,7 @@ private:
   rclcpp::spin_some(node);
   RCLCPP_INFO(
     node->get_logger(),
-    "Published %" PRIu64 " Sonar 3D-15 packets; skipped %" PRIu64,
+    "Processed %" PRIu64 " Sonar 3D-15 packets; skipped %" PRIu64,
     published,
     skipped);
   return EXIT_SUCCESS;

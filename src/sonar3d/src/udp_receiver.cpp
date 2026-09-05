@@ -46,10 +46,14 @@ namespace
 UdpReceiver::UdpReceiver(
   const std::string & multicast_group,
   std::uint16_t port,
-  const std::string & interface_address)
+  const std::string & interface_address,
+  int receive_buffer_size)
 {
   if (port == 0) {
     throw std::invalid_argument("multicast_port must be greater than zero");
+  }
+  if (receive_buffer_size < 0) {
+    throw std::invalid_argument("receive_buffer_size must not be negative");
   }
 
   socket_ = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, IPPROTO_UDP);
@@ -68,6 +72,17 @@ UdpReceiver::UdpReceiver(
   const int reuse_address = 1;
   if (setsockopt(socket_, SOL_SOCKET, SO_REUSEADDR, &reuse_address, sizeof(reuse_address)) < 0) {
     close_and_throw(socket_, "enable SO_REUSEADDR");
+  }
+  if (receive_buffer_size > 0 && setsockopt(
+      socket_, SOL_SOCKET, SO_RCVBUF, &receive_buffer_size, sizeof(receive_buffer_size)) < 0)
+  {
+    close_and_throw(socket_, "set UDP receive buffer size");
+  }
+  socklen_t buffer_size_length = sizeof(receive_buffer_size_);
+  if (getsockopt(
+      socket_, SOL_SOCKET, SO_RCVBUF, &receive_buffer_size_, &buffer_size_length) < 0)
+  {
+    close_and_throw(socket_, "read UDP receive buffer size");
   }
 
   sockaddr_in bind_address{};

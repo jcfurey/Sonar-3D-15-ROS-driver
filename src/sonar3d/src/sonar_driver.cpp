@@ -30,6 +30,7 @@
 
 #include "sonar3d/conversions.hpp"
 #include "sonar3d/http_client.hpp"
+#include "sonar3d/publisher_demand.hpp"
 
 namespace sonar3d
 {
@@ -114,7 +115,8 @@ SonarDriver::SonarDriver(const rclcpp::NodeOptions & options)
   receiver_ = std::make_unique<UdpReceiver>(
     parameters.multicast_group,
     static_cast<std::uint16_t>(parameters.multicast_port),
-    parameters.multicast_interface);
+    parameters.multicast_interface,
+    static_cast<int>(parameters.udp_receive_buffer_size));
 
   const auto sensor_qos = rclcpp::SensorDataQoS();
   if (publish_range_image_) {
@@ -307,17 +309,19 @@ void SonarDriver::handle_range_image(
 
   std::optional<sensor_msgs::msg::Image> range_message;
   std::optional<sensor_msgs::msg::PointCloud2> cloud_message;
-  if (range_image_publisher_) {
+  if (has_subscribers(range_image_publisher_)) {
     range_message = conversions::make_range_image(image, header);
   }
-  if (point_cloud_publisher_) {
+  if (has_subscribers(point_cloud_publisher_)) {
     cloud_message = conversions::make_point_cloud(image, header);
   }
   if (range_message) {
-    range_image_publisher_->publish(std::move(*range_message));
+    range_image_publisher_->publish(
+      std::make_unique<sensor_msgs::msg::Image>(std::move(*range_message)));
   }
   if (cloud_message) {
-    point_cloud_publisher_->publish(std::move(*cloud_message));
+    point_cloud_publisher_->publish(
+      std::make_unique<sensor_msgs::msg::PointCloud2>(std::move(*cloud_message)));
   }
   metrics_.range_images.fetch_add(1, std::memory_order_relaxed);
 }
@@ -331,20 +335,15 @@ void SonarDriver::handle_bitmap_image(
     return;
   }
 
-  const auto header = conversions::make_header(
-    image.header,
-    frame_id_,
-    fallback_stamp,
-    use_sensor_timestamps_);
-  auto message = conversions::make_bitmap_image(image, header);
+  rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr publisher;
   switch (image.type) {
     case protocol::BitmapImageType::SIGNAL_STRENGTH_IMAGE:
       observe_sequence(intensity_sequence_, image.header.sequence_id);
-      intensity_image_publisher_->publish(std::move(message));
+      publisher = intensity_image_publisher_;
       break;
     case protocol::BitmapImageType::SHADED_IMAGE:
       observe_sequence(shaded_sequence_, image.header.sequence_id);
-      shaded_image_publisher_->publish(std::move(message));
+      publisher = shaded_image_publisher_;
       break;
     default:
       metrics_.unknown_messages.fetch_add(1, std::memory_order_relaxed);
@@ -356,6 +355,12 @@ void SonarDriver::handle_bitmap_image(
         static_cast<int>(image.type));
       return;
   }
+  if (has_subscribers(publisher)) {
+    const auto header = conversions::make_header(
+      image.header, frame_id_, fallback_stamp, use_sensor_timestamps_);
+    publisher->publish(std::make_unique<sensor_msgs::msg::Image>(
+        conversions::make_bitmap_image(image, header)));
+  }
   metrics_.bitmap_images.fetch_add(1, std::memory_order_relaxed);
 }
 
@@ -364,14 +369,14 @@ void SonarDriver::handle_imu_batch(
   const builtin_interfaces::msg::Time & fallback_stamp)
 {
   observe_sequence(imu_sequence_, batch.sequence_id);
-  if (imu_publisher_) {
+  if (has_subscribers(imu_publisher_)) {
     auto messages = conversions::make_imu_messages(
       batch,
       imu_frame_id_,
       fallback_stamp,
       use_sensor_timestamps_);
     for (auto & message : messages) {
-      imu_publisher_->publish(std::move(message));
+      imu_publisher_->publish(std::make_unique<sensor_msgs::msg::Imu>(std::move(message)));
     }
   }
   metrics_.imu_batches.fetch_add(1, std::memory_order_relaxed);
@@ -458,6 +463,7 @@ void SonarDriver::publish_diagnostics()
     add_diagnostic_value(status, "configuration_error", configuration_error_);
   }
   add_diagnostic_value(status, "last_packet_age_seconds", packet_age);
+  add_diagnostic_value(status, "udp_receive_buffer_bytes", receiver_->receive_buffer_size());
   add_diagnostic_value(status, "datagrams", metrics_.datagrams.load(std::memory_order_relaxed));
   add_diagnostic_value(status, "rejected_sources",
       metrics_.rejected_sources.load(std::memory_order_relaxed));

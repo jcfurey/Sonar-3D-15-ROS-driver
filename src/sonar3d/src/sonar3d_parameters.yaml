@@ -57,6 +57,14 @@ sonar3d:
     description: "Local IPv4 interface address used for multicast membership."
     read_only: true
 
+  udp_receive_buffer_size:
+    type: int
+    default_value: 1048576
+    description: "Requested UDP socket receive buffer in bytes. Zero keeps the OS default; the OS may clamp or adjust this value. Diagnostics report the actual socket value."
+    read_only: true
+    validation:
+      bounds<>: [0, 67108864]
+
   poll_period:
     type: double
     default_value: 0.01

@@ -9,6 +9,7 @@
 
 #include <numbers>
 #include <bit>
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -110,6 +111,52 @@ void validate_range_image(const protocol::RangeImage & image, bool require_angle
   return field;
 }
 
+template<typename Output>
+void for_each_range_point(const protocol::RangeImage & image, Output output)
+{
+  const auto horizontal_fov =
+    image.horizontal_fov_degrees * std::numbers::pi_v<float>/ 180.0F;
+  const auto vertical_fov = image.vertical_fov_degrees * std::numbers::pi_v<float>/ 180.0F;
+  struct Column
+  {
+    float yaw;
+    float cosine;
+    float sine;
+  };
+  // Column geometry is identical on every row. Compute the trigonometry once
+  // per axis, retaining the original order of the per-point multiplications.
+  std::vector<Column> columns;
+  columns.reserve(image.width);
+  for (std::uint32_t column = 0; column < image.width; ++column) {
+    const auto yaw = pixel_angle(horizontal_fov, column, image.width);
+    columns.push_back({yaw, std::cos(yaw), std::sin(yaw)});
+  }
+  for (std::uint32_t row = 0; row < image.height; ++row) {
+    const auto pitch = pixel_angle(vertical_fov, row, image.height);
+    const auto cosine_pitch = std::cos(pitch);
+    const auto sine_pitch = std::sin(pitch);
+    for (std::uint32_t column = 0; column < image.width; ++column) {
+      const auto pixel = image.pixels[static_cast<std::size_t>(row) * image.width + column];
+      if (pixel == 0) {
+        continue;
+      }
+      const auto distance = static_cast<float>(pixel) * image.pixel_scale;
+      if (!std::isfinite(distance)) {
+        throw std::invalid_argument("range image produces a non-finite point distance");
+      }
+      const auto & direction = columns[column];
+      output(RangePoint{
+            distance * cosine_pitch * direction.cosine,
+            -distance * cosine_pitch * direction.sine,
+            distance * sine_pitch,
+            distance,
+            -direction.yaw,
+            pitch,
+        });
+    }
+  }
+}
+
 }  // namespace
 
 std::vector<float> range_image_to_meters(const protocol::RangeImage & image)
@@ -130,36 +177,9 @@ std::vector<float> range_image_to_meters(const protocol::RangeImage & image)
 std::vector<RangePoint> range_image_to_points(const protocol::RangeImage & image)
 {
   validate_range_image(image, true);
-  const auto horizontal_fov =
-    image.horizontal_fov_degrees * std::numbers::pi_v<float>/ 180.0F;
-  const auto vertical_fov = image.vertical_fov_degrees * std::numbers::pi_v<float>/ 180.0F;
-
   std::vector<RangePoint> points;
   points.reserve(image.pixels.size());
-  for (std::uint32_t row = 0; row < image.height; ++row) {
-    const auto native_pitch = pixel_angle(vertical_fov, row, image.height);
-    const auto cosine_pitch = std::cos(native_pitch);
-    for (std::uint32_t column = 0; column < image.width; ++column) {
-      const auto pixel = image.pixels[static_cast<std::size_t>(row) * image.width + column];
-      if (pixel == 0) {
-        continue;
-      }
-
-      const auto distance = static_cast<float>(pixel) * image.pixel_scale;
-      if (!std::isfinite(distance)) {
-        throw std::invalid_argument("range image produces a non-finite point distance");
-      }
-      const auto native_yaw = pixel_angle(horizontal_fov, column, image.width);
-      points.push_back(RangePoint{
-          distance * cosine_pitch * std::cos(native_yaw),
-          -distance * cosine_pitch * std::sin(native_yaw),
-          distance * std::sin(native_pitch),
-          distance,
-          -native_yaw,
-          native_pitch,
-      });
-    }
-  }
+  for_each_range_point(image, [&points](const RangePoint & point) {points.push_back(point);});
   return points;
 }
 
@@ -182,7 +202,7 @@ sensor_msgs::msg::Image make_range_image(
   const protocol::RangeImage & source,
   const std_msgs::msg::Header & header)
 {
-  const auto ranges = range_image_to_meters(source);
+  validate_range_image(source, false);
   sensor_msgs::msg::Image message;
   message.header = header;
   message.width = source.width;
@@ -190,8 +210,14 @@ sensor_msgs::msg::Image make_range_image(
   message.encoding = "32FC1";
   message.is_bigendian = std::endian::native == std::endian::big;
   message.step = source.width * static_cast<std::uint32_t>(sizeof(float));
-  message.data.resize(ranges.size() * sizeof(float));
-  std::memcpy(message.data.data(), ranges.data(), message.data.size());
+  message.data.resize(source.pixels.size() * sizeof(float));
+  for (std::size_t index = 0; index < source.pixels.size(); ++index) {
+    const auto range = static_cast<float>(source.pixels[index]) * source.pixel_scale;
+    if (!std::isfinite(range)) {
+      throw std::invalid_argument("range image produces a non-finite distance");
+    }
+    std::memcpy(message.data.data() + index * sizeof(float), &range, sizeof(float));
+  }
   return message;
 }
 
@@ -201,15 +227,17 @@ sensor_msgs::msg::PointCloud2 make_point_cloud(
 {
   constexpr std::uint32_t kFieldCount = 6;
   constexpr std::uint32_t kPointStep = kFieldCount * sizeof(float);
-  const auto points = range_image_to_points(source);
-  if (points.size() > std::numeric_limits<std::uint32_t>::max()) {
+  validate_range_image(source, true);
+  const auto point_count = static_cast<std::size_t>(std::count_if(
+      source.pixels.begin(), source.pixels.end(), [](std::uint32_t pixel) {return pixel != 0;}));
+  if (point_count > std::numeric_limits<std::uint32_t>::max()) {
     throw std::length_error("point cloud contains too many points for PointCloud2");
   }
 
   sensor_msgs::msg::PointCloud2 message;
   message.header = header;
   message.height = 1;
-  message.width = static_cast<std::uint32_t>(points.size());
+  message.width = static_cast<std::uint32_t>(point_count);
   message.fields = {
     point_field("x", 0),
     point_field("y", 4),
@@ -224,16 +252,15 @@ sensor_msgs::msg::PointCloud2 make_point_cloud(
   message.is_dense = true;
   message.data.resize(static_cast<std::size_t>(message.row_step));
 
-  for (std::size_t index = 0; index < points.size(); ++index) {
-    const std::array<float, kFieldCount> values{
-      points[index].x,
-      points[index].y,
-      points[index].z,
-      points[index].range,
-      points[index].azimuth,
-      points[index].elevation,
-    };
-    std::memcpy(message.data.data() + index * kPointStep, values.data(), kPointStep);
+  if (point_count != 0) {
+    std::size_t offset = 0;
+    for_each_range_point(source, [&message, &offset](const RangePoint & point) {
+        const std::array<float, kFieldCount> values{
+          point.x, point.y, point.z, point.range, point.azimuth, point.elevation,
+        };
+        std::memcpy(message.data.data() + offset, values.data(), kPointStep);
+        offset += kPointStep;
+      });
   }
   return message;
 }

@@ -29,7 +29,7 @@ class UdpReceiver
 public:
   UdpReceiver(
     const std::string & multicast_group, std::uint16_t port,
-    const std::string & interface_address);
+    const std::string & interface_address, int receive_buffer_size = 1024 * 1024);
   ~UdpReceiver();
 
   UdpReceiver(const UdpReceiver &) = delete;
@@ -38,9 +38,11 @@ public:
   UdpReceiver & operator=(UdpReceiver &&) = delete;
 
   [[nodiscard]] std::optional<Datagram> receive();
+  [[nodiscard]] int receive_buffer_size() const {return receive_buffer_size_;}
 
 private:
   int socket_{-1};
+  int receive_buffer_size_{};
   std::array<std::uint8_t, protocol::kMaximumUdpPacketSize> buffer_{};
 };
 

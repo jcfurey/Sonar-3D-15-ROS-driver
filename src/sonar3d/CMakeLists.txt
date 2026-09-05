@@ -162,6 +162,10 @@ if(BUILD_TESTING)
     test/test_conversions.cpp
     test/test_http_client.cpp
     test/test_protocol.cpp
+    test/test_playback_clock.cpp
+    test/test_udp_receiver.cpp
+    test/test_driver_stream.cpp
+    test/test_recording_player.cpp
   )
   ament_lint_auto_find_test_dependencies()
 
@@ -173,6 +177,26 @@ if(BUILD_TESTING)
 
   ament_add_gtest(test_http_client test/test_http_client.cpp)
   target_link_libraries(test_http_client sonar3d_io)
+
+  ament_add_gtest(test_playback_clock test/test_playback_clock.cpp)
+  target_link_libraries(test_playback_clock sonar3d_protocol)
+
+  ament_add_gtest(test_udp_receiver test/test_udp_receiver.cpp)
+  target_link_libraries(test_udp_receiver sonar3d_io)
+
+  ament_add_gtest(test_driver_stream test/test_driver_stream.cpp TIMEOUT 60)
+  target_link_libraries(test_driver_stream sonar3d_component)
+
+  ament_add_gtest(test_recording_player test/test_recording_player.cpp TIMEOUT 30)
+  target_link_libraries(test_recording_player sonar3d_ros rclcpp::rclcpp)
+  target_compile_definitions(
+    test_recording_player PRIVATE TEST_SONAR_REPLAY_PATH="$<TARGET_FILE:sonar_replay>"
+  )
+  add_dependencies(test_recording_player sonar_replay)
+
+  # Opt-in measurement tool: timings are reported, never asserted by CTest.
+  add_executable(benchmark_stream EXCLUDE_FROM_ALL test/benchmark_stream.cpp)
+  target_link_libraries(benchmark_stream sonar3d_component)
 endif()
 
 ament_export_targets(sonar3dTargets HAS_LIBRARY_TARGET)

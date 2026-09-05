@@ -44,6 +44,11 @@ Sensor protobuf timestamps are used by default. Set
 `use_sensor_timestamps:=false` if the sonar clock is not synchronized to the
 ROS system clock.
 
+The driver and player build each enabled product only while that topic has a
+subscriber, including subscribers in the same component process. Subscription
+changes take effect as discovery completes. Packet reception and live stream
+diagnostics continue when no data topics have subscribers.
+
 ## Dependencies and build
 
 Install dependencies through rosdep; no pip step is needed:
@@ -90,6 +95,7 @@ The checked-in defaults are in `src/sonar3d/config/sonar3d.yaml`.
 | `multicast_group` | `224.0.0.96` | RIP multicast group |
 | `multicast_port` | `4747` | RIP UDP port |
 | `multicast_interface` | `0.0.0.0` | Local IPv4 interface used to join multicast |
+| `udp_receive_buffer_size` | `1048576` | Requested socket receive buffer in bytes; zero keeps the OS default |
 | `poll_period` | `0.01` | Nonblocking socket poll period in wall-clock seconds |
 | `max_packets_per_spin` | `32` | Maximum datagrams drained per executor callback |
 | `use_sensor_timestamps` | `true` | Prefer valid device timestamps over receive time |
@@ -103,6 +109,10 @@ The checked-in defaults are in `src/sonar3d/config/sonar3d.yaml`.
 Parameters that determine socket, publisher, or device setup are read-only;
 restart the node to change them. This avoids reporting a parameter update that
 was not actually applied to the hardware or transport.
+
+The receive buffer holds packet bursts while the executor is busy. The OS can
+adjust or clamp the request; `/diagnostics` reports the effective socket value
+as `udp_receive_buffer_bytes`. This setting changes only the driver's socket.
 
 ## Recording playback
 
@@ -122,6 +132,14 @@ CRCs, skips damaged packets when framing remains recoverable, and publishes
 the same data topics as the live driver with reliable QoS. A short startup
 delay allows DDS discovery before the first sample; control it with
 `--startup-delay`. Use `--receive-time` to ignore recorded sensor timestamps.
+
+Playback uses deadlines anchored to the first valid recorded timestamp, so
+decoding and publication consume the recorded interval instead of extending it.
+Repeated timestamps and older interleaved IMU samples are sent without an extra
+delay. A backward clock jump exceeding one second starts a new timing segment.
+`--realtime-factor` scales these intervals; `--receive-time` changes ROS message
+stamps while retaining recorded pacing. Start subscribers (including rosbag)
+before playback and allow enough startup delay for discovery.
 
 Record the replay with standard rosbag tooling:
 
@@ -144,6 +162,32 @@ colcon test-result --verbose
 The suite covers RIP1 and RIP2 round trips, an external golden packet produced
 by official `wlsonar` 0.5.4, corrupt/truncated framing, ROS image/cloud
 contracts, REP-103 geometry, IMU conversion, and configuration sequencing.
+It also exercises full-resolution dense/sparse conversions, UDP burst retention,
+single-sonar RIP1/RIP2 delivery through DDS and intra-process subscriptions,
+subscriber join/leave, and mixed recording playback with both timestamp modes.
+Deterministic clock tests cover processing time, interleaved IMU batches, speed
+factors, and recorded clock resets.
+
+For repeatable performance measurements, build the optional benchmark from the
+workspace root after an optimized build with testing enabled:
+
+```bash
+colcon build --packages-select sonar3d --cmake-args \
+  -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBUILD_TESTING=ON
+source install/setup.bash
+cmake --build build/sonar3d --target benchmark_stream
+./build/sonar3d/benchmark_stream conversions
+./build/sonar3d/benchmark_stream live 20 200 all 2 dds
+```
+
+The live arguments are rate (`5` or `20` Hz), frame count, subscribed products
+(`none`, `range`, `cloud`, `all`), image protocol version (`1` or `2`), and ROS
+transport (`dds` or `ipc`). It simulates one sonar over loopback multicast with
+256×64 images and 100 Hz RIP2 IMU samples. It reports delivered counts, sequence
+gaps, range/cloud latency, and CPU for the entire test process, including the
+sender and subscriber. HTTP configuration is disabled. Nonzero exit status
+indicates incomplete delivery; timing values are measurements, not pass limits.
+Use an unused `ROS_DOMAIN_ID` to isolate these ROS topics from other tests.
 
 ## Protocol source and license
 
