@@ -86,6 +86,13 @@ sonar3d:
     default_value: true
     description: "Use valid protobuf timestamps; otherwise stamp products from the ROS clock on receipt."
     read_only: true
+  max_sensor_clock_offset:
+    type: double
+    default_value: 1.0
+    description: "Largest accepted difference in seconds between a sensor timestamp and ROS receive time. The sonar clock starts at an arbitrary time and stays there until NTP succeeds; beyond this offset a message is re-anchored to receive time, keeping IMU sample spacing. Zero trusts sensor timestamps unconditionally."
+    read_only: true
+    validation:
+      bounds<>: [0.0, 3600.0]
 
   publish_point_cloud:
     type: bool

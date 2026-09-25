@@ -13,6 +13,8 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -111,6 +113,62 @@ TEST(Conversions, PreservesBitmapAndFallsBackToRosClock)
   EXPECT_EQ(image.encoding, "mono8");
   EXPECT_EQ(image.step, 2U);
   EXPECT_EQ(image.data, source.pixels);
+}
+
+TEST(Conversions, ReportsOnlyUsableSensorTimestampsAsNanoseconds)
+{
+  using sonar3d::conversions::sensor_nanoseconds;
+  using sonar3d::protocol::Timestamp;
+  EXPECT_EQ(sensor_nanoseconds(Timestamp{2, 5}), 2'000'000'005);
+  EXPECT_EQ(sensor_nanoseconds(std::nullopt), std::nullopt);
+  EXPECT_EQ(sensor_nanoseconds(Timestamp{0, 0}), std::nullopt);
+  EXPECT_EQ(sensor_nanoseconds(Timestamp{1, 1'000'000'000}), std::nullopt);
+  EXPECT_EQ(sensor_nanoseconds(Timestamp{std::int64_t{1} << 40, 0}), std::nullopt);
+}
+
+TEST(Conversions, ReanchorsSensorTimestampsByAnOffset)
+{
+  sonar3d::protocol::MessageHeader source;
+  source.timestamp = sonar3d::protocol::Timestamp{100, 900'000'000};
+
+  const auto forward = sonar3d::conversions::make_header(
+    source, "sonar_link", builtin_interfaces::msg::Time{}, true, 2'300'000'000);
+  EXPECT_EQ(forward.stamp.sec, 103);
+  EXPECT_EQ(forward.stamp.nanosec, 200'000'000U);
+
+  const auto backward = sonar3d::conversions::make_header(
+    source, "sonar_link", builtin_interfaces::msg::Time{}, true, -100'900'000'000);
+  EXPECT_EQ(backward.stamp.sec, 0);
+  EXPECT_EQ(backward.stamp.nanosec, 0U);
+
+  EXPECT_THROW(
+    static_cast<void>(sonar3d::conversions::make_header(
+      source, "sonar_link", builtin_interfaces::msg::Time{}, true, -100'900'000'001)),
+    std::invalid_argument);
+
+  builtin_interfaces::msg::Time fallback;
+  fallback.sec = 7;
+  const auto disabled = sonar3d::conversions::make_header(
+    source, "sonar_link", fallback, false, 2'300'000'000);
+  EXPECT_EQ(disabled.stamp, fallback);
+}
+
+TEST(Conversions, ReanchoredImuBatchKeepsItsSampleSpacing)
+{
+  sonar3d::protocol::ImuBatch batch;
+  batch.sample_count = 3;
+  batch.timestamps = {{10, 0}, {10, 10'000'000}, {10, 20'000'000}};
+  batch.specific_force.assign(9, 0.0F);
+  batch.rate_of_turn.assign(9, 0.0F);
+
+  const auto messages = sonar3d::conversions::make_imu_messages(
+    batch, "sonar_imu", builtin_interfaces::msg::Time{}, true, 5'000'000'000);
+
+  ASSERT_EQ(messages.size(), 3U);
+  for (std::size_t sample = 0; sample < messages.size(); ++sample) {
+    EXPECT_EQ(messages[sample].header.stamp.sec, 15);
+    EXPECT_EQ(messages[sample].header.stamp.nanosec, sample * 10'000'000U);
+  }
 }
 
 TEST(Conversions, TransformsImuVectorsIntoRosBodyAxes)

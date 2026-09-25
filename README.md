@@ -40,9 +40,15 @@ conversion, publish a static transform from `sonar3d_link` to
 `sonar3d_imu_link` with translation `(-0.022, 0.046, 0.003)` metres for a
 complete TF model.
 
-Sensor protobuf timestamps are used by default. Set
-`use_sensor_timestamps:=false` if the sonar clock is not synchronized to the
-ROS system clock.
+Sensor protobuf timestamps are used by default. The sonar keeps an arbitrary
+clock until NTP succeeds, so each timestamped message is compared with ROS
+receive time. When they differ by more than `max_sensor_clock_offset` (1 s by
+default), the message is re-anchored to receive time, and IMU batches keep
+their sample spacing. The switch is logged in both directions, and diagnostics
+report `timestamp_source`, `sensor_clock_offset_seconds` and
+`sensor_clock_fallbacks`. Give the sonar a reachable NTP server so its own
+acquisition timestamps are used. Set `use_sensor_timestamps:=false` to always
+stamp on receipt.
 
 The driver and player build each enabled product only while that topic has a
 subscriber, including subscribers in the same component process. Subscription
@@ -99,6 +105,7 @@ The checked-in defaults are in `src/sonar3d/config/sonar3d.yaml`.
 | `poll_period` | `0.01` | Nonblocking socket poll period in wall-clock seconds |
 | `max_packets_per_spin` | `32` | Maximum datagrams drained per executor callback |
 | `use_sensor_timestamps` | `true` | Prefer valid device timestamps over receive time |
+| `max_sensor_clock_offset` | `1.0` | Seconds a sensor timestamp may differ from receive time before the message is re-anchored to receive time; zero trusts the sensor clock unconditionally |
 | `publish_point_cloud` | `true` | Enable the derived cloud |
 | `publish_range_image` | `true` | Enable the scaled range image |
 | `publish_bitmap_images` | `true` | Enable signal-strength and shaded bitmap topics |
@@ -166,7 +173,9 @@ It also exercises full-resolution dense/sparse conversions, UDP burst retention,
 single-sonar RIP1/RIP2 delivery through DDS and intra-process subscriptions,
 subscriber join/leave, and mixed recording playback with both timestamp modes.
 Deterministic clock tests cover processing time, interleaved IMU batches, speed
-factors, and recorded clock resets.
+factors, and recorded clock resets. Live stream tests check that an
+unsynchronized sonar clock is re-anchored to receive time with IMU spacing
+preserved, and that a synchronized clock keeps exact sensor timestamps.
 
 For repeatable performance measurements, build the optional benchmark from the
 workspace root after an optimized build with testing enabled:

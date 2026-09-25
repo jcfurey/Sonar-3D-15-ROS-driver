@@ -36,7 +36,9 @@ protected:
   static void SetUpTestSuite() {rclcpp::init(0, nullptr);}
   static void TearDownTestSuite() {rclcpp::shutdown();}
 
-  void start(bool enable_products = true)
+  // The fixtures carry fixed 2023 sensor timestamps, so exact-stamp tests turn
+  // the sensor clock check off; the clock tests enable it explicitly.
+  void start(bool enable_products = true, double max_sensor_clock_offset = 0.0)
   {
     port_ = sonar3d::testing::unused_udp_port();
     rclcpp::NodeOptions options;
@@ -50,6 +52,7 @@ protected:
     options.append_parameter_override("frame_id", "test_sonar");
     options.append_parameter_override("imu_frame_id", "test_imu");
     options.append_parameter_override("diagnostics_period", 0.1);
+    options.append_parameter_override("max_sensor_clock_offset", max_sensor_clock_offset);
     for (const auto * parameter : {"publish_range_image", "publish_point_cloud",
         "publish_bitmap_images", "publish_imu"})
     {
@@ -86,14 +89,20 @@ protected:
     return false;
   }
 
-  std::uint64_t metric(const std::string & key) const
+  std::string value(const std::string & key) const
   {
-    for (const auto & value : status_.values) {
-      if (value.key == key) {
-        return std::stoull(value.value);
+    for (const auto & item : status_.values) {
+      if (item.key == key) {
+        return item.value;
       }
     }
-    return 0;
+    return {};
+  }
+
+  std::uint64_t metric(const std::string & key) const
+  {
+    const auto text = value(key);
+    return text.empty() ? 0 : std::stoull(text);
   }
 
   void subscribe()
@@ -248,6 +257,66 @@ TEST_P(DriverStream, DisabledProductsKeepReceivingAndReportingPackets)
   EXPECT_TRUE(intensities_.empty());
   EXPECT_TRUE(shaded_.empty());
   EXPECT_TRUE(imus_.empty());
+}
+
+TEST_P(DriverStream, UnsynchronizedSonarClockIsReanchoredToReceiveTime)
+{
+  start(true, 1.0);
+  subscribe();
+  ASSERT_TRUE(discovered());
+  const rclcpp::Time before = observer_->now();
+  send_frame(0, ProtocolVersion::RIP2);
+  ASSERT_TRUE(wait_for([this] {
+      return ranges_.size() == 1 && clouds_.size() == 1 && intensities_.size() == 1 &&
+             shaded_.size() == 1 && imus_.size() == 5;
+    }));
+  const rclcpp::Time after = observer_->now();
+
+  const auto received = [&before, &after](const builtin_interfaces::msg::Time & stamp) {
+      const rclcpp::Time time(stamp);
+      return time >= before && time <= after;
+    };
+  EXPECT_TRUE(received(ranges_[0]->header.stamp));
+  EXPECT_EQ(clouds_[0]->header.stamp, ranges_[0]->header.stamp);
+  EXPECT_TRUE(received(intensities_[0]->header.stamp));
+  EXPECT_TRUE(received(shaded_[0]->header.stamp));
+  EXPECT_TRUE(received(imus_[4]->header.stamp));
+  for (std::size_t sample = 1; sample < 5; ++sample) {
+    EXPECT_EQ(
+      (rclcpp::Time(imus_[sample]->header.stamp) -
+      rclcpp::Time(imus_[sample - 1]->header.stamp)).nanoseconds(),
+      10'000'000);
+  }
+
+  ASSERT_TRUE(wait_for([this] {return metric("sensor_clock_fallbacks") == 4;}));
+  EXPECT_EQ(value("timestamp_source"), "receive (sensor clock unsynchronized)");
+  EXPECT_EQ(status_.level, diagnostic_msgs::msg::DiagnosticStatus::WARN);
+  EXPECT_GT(std::stod(value("sensor_clock_offset_seconds")), 1.0e7);
+}
+
+TEST_P(DriverStream, SynchronizedSonarClockKeepsSensorTimestamps)
+{
+  start(true, 1.0);
+  subscribe();
+  ASSERT_TRUE(discovered());
+  auto image = sonar3d::testing::range_image(0);
+  image.header.timestamp = sonar3d::testing::timestamp(
+    rclcpp::Clock(RCL_SYSTEM_TIME).now().nanoseconds() - 20'000'000);
+  sender_.send(port_, sonar3d::protocol::encode_packet(image), "239.255.96.15");
+  ASSERT_TRUE(wait_for([this] {return ranges_.size() == 1 && clouds_.size() == 1;}));
+
+  builtin_interfaces::msg::Time expected;
+  expected.sec = static_cast<std::int32_t>(image.header.timestamp->seconds);
+  expected.nanosec = static_cast<std::uint32_t>(image.header.timestamp->nanoseconds);
+  EXPECT_EQ(ranges_[0]->header.stamp, expected);
+  EXPECT_EQ(clouds_[0]->header.stamp, expected);
+
+  ASSERT_TRUE(wait_for([this] {return value("timestamp_source") == "sensor";}));
+  EXPECT_EQ(metric("sensor_clock_fallbacks"), 0U);
+  EXPECT_EQ(status_.level, diagnostic_msgs::msg::DiagnosticStatus::OK);
+  const auto offset = std::stod(value("sensor_clock_offset_seconds"));
+  EXPECT_GT(offset, 0.0);
+  EXPECT_LT(offset, 1.0);
 }
 
 INSTANTIATE_TEST_SUITE_P(Transport, DriverStream, ::testing::Bool());

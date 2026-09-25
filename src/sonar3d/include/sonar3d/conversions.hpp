@@ -8,6 +8,8 @@
 #pragma once
 
 #include <array>
+#include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -37,11 +39,19 @@ struct RangePoint
 [[nodiscard]] std::vector<float> range_image_to_meters(const protocol::RangeImage & image);
 [[nodiscard]] std::vector<RangePoint> range_image_to_points(const protocol::RangeImage & image);
 
+// Nanoseconds since the epoch for a usable sensor timestamp. Absent, zero, and
+// out-of-range timestamps return nullopt; this never throws.
+[[nodiscard]] std::optional<std::int64_t> sensor_nanoseconds(
+  const std::optional<protocol::Timestamp> & stamp);
+
+// sensor_offset_nanoseconds is added to a valid sensor timestamp. A driver uses
+// it to re-anchor messages from an unsynchronized sonar clock to receive time.
 [[nodiscard]] std_msgs::msg::Header make_header(
   const protocol::MessageHeader & source,
   const std::string & frame_id,
   const builtin_interfaces::msg::Time & fallback_stamp,
-  bool use_sensor_timestamp = true);
+  bool use_sensor_timestamp = true,
+  std::int64_t sensor_offset_nanoseconds = 0);
 
 [[nodiscard]] sensor_msgs::msg::Image make_range_image(
   const protocol::RangeImage & source,
@@ -59,6 +69,7 @@ struct RangePoint
   const protocol::ImuBatch & source,
   const std::string & frame_id,
   const builtin_interfaces::msg::Time & fallback_stamp,
-  bool use_sensor_timestamp = true);
+  bool use_sensor_timestamp = true,
+  std::int64_t sensor_offset_nanoseconds = 0);
 
 }  // namespace sonar3d::conversions

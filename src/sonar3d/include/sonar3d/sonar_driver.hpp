@@ -57,6 +57,16 @@ private:
     std::atomic<std::uint64_t> out_of_order_messages{0};
     std::atomic<std::uint64_t> sequence_resets{0};
     std::atomic<std::uint64_t> socket_errors{0};
+    std::atomic<std::uint64_t> sensor_clock_fallbacks{0};
+  };
+
+  // Which clock stamps the products: no sensor timestamp seen yet, the sonar's
+  // own clock, or receive time because the sonar clock is unsynchronized.
+  enum class TimestampSource : int
+  {
+    NONE,
+    SENSOR,
+    RECEIVE,
   };
 
   void poll_socket();
@@ -70,6 +80,12 @@ private:
   void handle_imu_batch(
     const protocol::ImuBatch & batch,
     const builtin_interfaces::msg::Time & fallback_stamp);
+  // Offset to add to a message's sensor timestamps: zero while the sonar clock
+  // agrees with receive time, otherwise the shift that places `reference` at
+  // receive time.
+  [[nodiscard]] std::int64_t sensor_clock_offset(
+    const std::optional<protocol::Timestamp> & reference,
+    const builtin_interfaces::msg::Time & receive_stamp);
   void observe_sequence(SequenceState & state, std::uint32_t sequence_id);
   void publish_diagnostics();
   void start_configuration(double speed_of_sound, double timeout_seconds);
@@ -79,6 +95,7 @@ private:
   std::string frame_id_;
   std::string imu_frame_id_;
   bool use_sensor_timestamps_{true};
+  std::int64_t max_sensor_clock_offset_ns_{0};
   bool publish_point_cloud_{true};
   bool publish_range_image_{true};
   bool publish_bitmap_images_{true};
@@ -102,6 +119,9 @@ private:
   SequenceState imu_sequence_;
   Metrics metrics_;
   std::atomic<std::int64_t> last_valid_packet_steady_ns_{-1};
+  std::atomic<TimestampSource> timestamp_source_{TimestampSource::NONE};
+  // Receive time minus sensor time for the latest timestamped message.
+  std::atomic<std::int64_t> last_sensor_clock_offset_ns_{0};
   std::unordered_set<std::string> warned_sources_;
 
   // 0 = configuration disabled, 1 = pending, 2 = successful, 3 = failed.

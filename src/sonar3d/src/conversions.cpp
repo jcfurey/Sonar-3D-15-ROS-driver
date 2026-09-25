@@ -63,10 +63,13 @@ void validate_range_image(const protocol::RangeImage & image, bool require_angle
   }
 }
 
+constexpr std::int64_t kNanosecondsPerSecond = 1'000'000'000;
+
 [[nodiscard]] builtin_interfaces::msg::Time choose_stamp(
   const std::optional<protocol::Timestamp> & sensor_stamp,
   const builtin_interfaces::msg::Time & fallback_stamp,
-  bool use_sensor_timestamp)
+  bool use_sensor_timestamp,
+  std::int64_t sensor_offset_nanoseconds)
 {
   if (!use_sensor_timestamp || !sensor_stamp ||
     (sensor_stamp->seconds == 0 && sensor_stamp->nanoseconds == 0))
@@ -83,8 +86,22 @@ void validate_range_image(const protocol::RangeImage & image, bool require_angle
   }
 
   builtin_interfaces::msg::Time result;
-  result.sec = static_cast<std::int32_t>(sensor_stamp->seconds);
-  result.nanosec = static_cast<std::uint32_t>(sensor_stamp->nanoseconds);
+  if (sensor_offset_nanoseconds == 0) {
+    result.sec = static_cast<std::int32_t>(sensor_stamp->seconds);
+    result.nanosec = static_cast<std::uint32_t>(sensor_stamp->nanoseconds);
+    return result;
+  }
+
+  // Validated above: seconds fit int32, so the product cannot overflow int64.
+  const auto sensor = sensor_stamp->seconds * kNanosecondsPerSecond + sensor_stamp->nanoseconds;
+  std::int64_t shifted{};
+  if (__builtin_add_overflow(sensor, sensor_offset_nanoseconds, &shifted) || shifted < 0 ||
+    shifted / kNanosecondsPerSecond > std::numeric_limits<std::int32_t>::max())
+  {
+    throw std::invalid_argument("re-anchored sonar timestamp is outside the ROS message range");
+  }
+  result.sec = static_cast<std::int32_t>(shifted / kNanosecondsPerSecond);
+  result.nanosec = static_cast<std::uint32_t>(shifted % kNanosecondsPerSecond);
   return result;
 }
 
@@ -183,18 +200,32 @@ std::vector<RangePoint> range_image_to_points(const protocol::RangeImage & image
   return points;
 }
 
+std::optional<std::int64_t> sensor_nanoseconds(const std::optional<protocol::Timestamp> & stamp)
+{
+  if (!stamp || (stamp->seconds == 0 && stamp->nanoseconds == 0) ||
+    stamp->nanoseconds < 0 || stamp->nanoseconds >= 1'000'000'000 ||
+    stamp->seconds < std::numeric_limits<std::int32_t>::min() ||
+    stamp->seconds > std::numeric_limits<std::int32_t>::max())
+  {
+    return std::nullopt;
+  }
+  return stamp->seconds * kNanosecondsPerSecond + stamp->nanoseconds;
+}
+
 std_msgs::msg::Header make_header(
   const protocol::MessageHeader & source,
   const std::string & frame_id,
   const builtin_interfaces::msg::Time & fallback_stamp,
-  bool use_sensor_timestamp)
+  bool use_sensor_timestamp,
+  std::int64_t sensor_offset_nanoseconds)
 {
   if (frame_id.empty()) {
     throw std::invalid_argument("frame_id must not be empty");
   }
   std_msgs::msg::Header header;
   header.frame_id = frame_id;
-  header.stamp = choose_stamp(source.timestamp, fallback_stamp, use_sensor_timestamp);
+  header.stamp = choose_stamp(
+    source.timestamp, fallback_stamp, use_sensor_timestamp, sensor_offset_nanoseconds);
   return header;
 }
 
@@ -286,7 +317,8 @@ std::vector<sensor_msgs::msg::Imu> make_imu_messages(
   const protocol::ImuBatch & source,
   const std::string & frame_id,
   const builtin_interfaces::msg::Time & fallback_stamp,
-  bool use_sensor_timestamp)
+  bool use_sensor_timestamp,
+  std::int64_t sensor_offset_nanoseconds)
 {
   const auto sample_count = static_cast<std::size_t>(source.sample_count);
   if (source.timestamps.size() != sample_count ||
@@ -303,7 +335,8 @@ std::vector<sensor_msgs::msg::Imu> make_imu_messages(
     source_header.timestamp = source.timestamps[index];
 
     sensor_msgs::msg::Imu message;
-    message.header = make_header(source_header, frame_id, fallback_stamp, use_sensor_timestamp);
+    message.header = make_header(
+      source_header, frame_id, fallback_stamp, use_sensor_timestamp, sensor_offset_nanoseconds);
     message.orientation.w = 1.0;
     message.orientation_covariance[0] = -1.0;
 

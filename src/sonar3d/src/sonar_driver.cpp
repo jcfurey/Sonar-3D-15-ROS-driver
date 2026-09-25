@@ -13,6 +13,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <functional>
 #include <optional>
 #include <sstream>
@@ -105,6 +106,7 @@ SonarDriver::SonarDriver(const rclcpp::NodeOptions & options)
   frame_id_ = parameters.frame_id;
   imu_frame_id_ = parameters.imu_frame_id;
   use_sensor_timestamps_ = parameters.use_sensor_timestamps;
+  max_sensor_clock_offset_ns_ = std::llround(parameters.max_sensor_clock_offset * 1.0e9);
   publish_point_cloud_ = parameters.publish_point_cloud;
   publish_range_image_ = parameters.publish_range_image;
   publish_bitmap_images_ = parameters.publish_bitmap_images;
@@ -305,7 +307,8 @@ void SonarDriver::handle_range_image(
     image.header,
     frame_id_,
     fallback_stamp,
-    use_sensor_timestamps_);
+    use_sensor_timestamps_,
+    sensor_clock_offset(image.header.timestamp, fallback_stamp));
 
   std::optional<sensor_msgs::msg::Image> range_message;
   std::optional<sensor_msgs::msg::PointCloud2> cloud_message;
@@ -355,9 +358,10 @@ void SonarDriver::handle_bitmap_image(
         static_cast<int>(image.type));
       return;
   }
+  const auto offset = sensor_clock_offset(image.header.timestamp, fallback_stamp);
   if (has_subscribers(publisher)) {
     const auto header = conversions::make_header(
-      image.header, frame_id_, fallback_stamp, use_sensor_timestamps_);
+      image.header, frame_id_, fallback_stamp, use_sensor_timestamps_, offset);
     publisher->publish(std::make_unique<sensor_msgs::msg::Image>(
         conversions::make_bitmap_image(image, header)));
   }
@@ -369,17 +373,59 @@ void SonarDriver::handle_imu_batch(
   const builtin_interfaces::msg::Time & fallback_stamp)
 {
   observe_sequence(imu_sequence_, batch.sequence_id);
+  // Anchor on the newest sample so a re-anchored batch keeps its sample spacing.
+  const auto offset = sensor_clock_offset(
+    batch.timestamps.empty() ? std::nullopt : std::optional{batch.timestamps.back()},
+    fallback_stamp);
   if (has_subscribers(imu_publisher_)) {
     auto messages = conversions::make_imu_messages(
       batch,
       imu_frame_id_,
       fallback_stamp,
-      use_sensor_timestamps_);
+      use_sensor_timestamps_,
+      offset);
     for (auto & message : messages) {
       imu_publisher_->publish(std::make_unique<sensor_msgs::msg::Imu>(std::move(message)));
     }
   }
   metrics_.imu_batches.fetch_add(1, std::memory_order_relaxed);
+}
+
+std::int64_t SonarDriver::sensor_clock_offset(
+  const std::optional<protocol::Timestamp> & reference,
+  const builtin_interfaces::msg::Time & receive_stamp)
+{
+  const auto sensor = conversions::sensor_nanoseconds(reference);
+  if (!use_sensor_timestamps_ || !sensor) {
+    return 0;
+  }
+
+  // Both operands are within the int32-second ROS range, so this cannot overflow.
+  const auto offset = rclcpp::Time(receive_stamp).nanoseconds() - *sensor;
+  last_sensor_clock_offset_ns_.store(offset, std::memory_order_relaxed);
+  const bool synchronized =
+    max_sensor_clock_offset_ns_ == 0 || std::llabs(offset) <= max_sensor_clock_offset_ns_;
+  const auto source = synchronized ? TimestampSource::SENSOR : TimestampSource::RECEIVE;
+  if (timestamp_source_.exchange(source) != source) {
+    if (synchronized) {
+      RCLCPP_INFO(
+        get_logger(),
+        "Sonar 3D-15 clock agrees with ROS time (receive offset %.3f s); using sensor timestamps",
+        static_cast<double>(offset) / 1.0e9);
+    } else {
+      RCLCPP_WARN(
+        get_logger(),
+        "Sonar 3D-15 clock differs from ROS time by %.3f s; stamping with receive time until it "
+        "synchronizes. The sonar keeps an arbitrary clock until NTP succeeds, so give it a "
+        "reachable NTP server.",
+        static_cast<double>(offset) / 1.0e9);
+    }
+  }
+  if (synchronized) {
+    return 0;
+  }
+  metrics_.sensor_clock_fallbacks.fetch_add(1, std::memory_order_relaxed);
+  return offset;
 }
 
 void SonarDriver::observe_sequence(SequenceState & state, std::uint32_t sequence_id)
@@ -462,6 +508,36 @@ void SonarDriver::publish_diagnostics()
     std::lock_guard<std::mutex> lock(configuration_error_mutex_);
     add_diagnostic_value(status, "configuration_error", configuration_error_);
   }
+
+  std::string timestamp_text;
+  if (!use_sensor_timestamps_) {
+    timestamp_text = "receive (sensor timestamps disabled)";
+  } else {
+    switch (timestamp_source_.load(std::memory_order_relaxed)) {
+      case TimestampSource::NONE:
+        timestamp_text = "none yet";
+        break;
+      case TimestampSource::SENSOR:
+        timestamp_text = "sensor";
+        add_diagnostic_value(status, "sensor_clock_offset_seconds",
+          static_cast<double>(last_sensor_clock_offset_ns_.load(std::memory_order_relaxed)) /
+          1.0e9);
+        break;
+      case TimestampSource::RECEIVE:
+        timestamp_text = "receive (sensor clock unsynchronized)";
+        add_diagnostic_value(status, "sensor_clock_offset_seconds",
+          static_cast<double>(last_sensor_clock_offset_ns_.load(std::memory_order_relaxed)) /
+          1.0e9);
+        status.level = std::max(status.level, diagnostic_msgs::msg::DiagnosticStatus::WARN);
+        if (status.message == "receiving RIP packets") {
+          status.message = "sonar clock unsynchronized; stamping with receive time";
+        }
+        break;
+    }
+  }
+  add_diagnostic_value(status, "timestamp_source", timestamp_text);
+  add_diagnostic_value(status, "sensor_clock_fallbacks",
+      metrics_.sensor_clock_fallbacks.load(std::memory_order_relaxed));
   add_diagnostic_value(status, "last_packet_age_seconds", packet_age);
   add_diagnostic_value(status, "udp_receive_buffer_bytes", receiver_->receive_buffer_size());
   add_diagnostic_value(status, "datagrams", metrics_.datagrams.load(std::memory_order_relaxed));
