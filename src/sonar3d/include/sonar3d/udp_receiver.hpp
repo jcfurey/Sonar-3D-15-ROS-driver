@@ -50,8 +50,13 @@ public:
   // interrupt() is called (false). A negative timeout waits indefinitely.
   [[nodiscard]] bool wait(std::chrono::milliseconds timeout);
 
-  // Wake every current and future wait(). Safe to call from any thread.
+  // Wake every current and future wait() until clear_interrupt(). Safe to call
+  // from any thread.
   void interrupt();
+  void clear_interrupt();
+
+  // Drop every queued datagram, returning how many were dropped.
+  std::size_t discard_pending();
 
   [[nodiscard]] int receive_buffer_size() const {return receive_buffer_size_;}
 

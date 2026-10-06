@@ -240,11 +240,11 @@ public:
     mode_(options.validate_only ? OutputMode::VALIDATE :
       (options.output.empty() ? OutputMode::PUBLISH : OutputMode::BAG))
   {
-    range_image_.topic = resolve("sonar_range_image");
-    intensity_image_.topic = resolve("sonar_intensity_image");
-    shaded_image_.topic = resolve("sonar_shaded_image");
-    point_cloud_.topic = resolve("sonar_point_cloud");
-    imu_.topic = resolve("sonar_imu");
+    range_image_.topic = resolve("range_image");
+    intensity_image_.topic = resolve("intensity_image");
+    shaded_image_.topic = resolve("shaded_image");
+    point_cloud_.topic = resolve("points");
+    imu_.topic = resolve("imu/data_raw");
     if (mode_ == OutputMode::BAG) {
       rosbag2_storage::StorageOptions storage;
       storage.uri = options.output;
@@ -253,8 +253,9 @@ public:
       writer_ = std::make_unique<rosbag2_cpp::Writer>();
       writer_->open(storage);
     } else if (mode_ == OutputMode::PUBLISH) {
-      auto qos = rclcpp::SensorDataQoS(rclcpp::KeepLast(100));
-      qos.reliable();
+      // Reliable, as REP-2003 asks of sensor sources; the deep history covers
+      // IMU batches published back to back.
+      const auto qos = rclcpp::SystemDefaultsQoS().keep_last(100);
       advertise(range_image_, qos);
       advertise(intensity_image_, qos);
       advertise(shaded_image_, qos);

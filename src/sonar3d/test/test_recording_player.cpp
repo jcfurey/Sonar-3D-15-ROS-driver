@@ -303,7 +303,7 @@ TEST_F(ReplayTest, PlaybackRecoversAndReportsActualPublicationCounts)
   qos.reliable();
   std::size_t received{};
   const auto subscription = observer->create_subscription<Cloud>(
-    "sonar_point_cloud", qos, [&received](Cloud::ConstSharedPtr) {++received;});
+    "points", qos, [&received](Cloud::ConstSharedPtr) {++received;});
   PlayerProcess process(recording.path(), false);
   const auto deadline = std::chrono::steady_clock::now() + 5s;
   while (std::chrono::steady_clock::now() < deadline && (!process.finished() || received == 0)) {
@@ -317,7 +317,7 @@ TEST_F(ReplayTest, PlaybackRecoversAndReportsActualPublicationCounts)
       "Processed 1 supported packets; unsupported 1; damaged 1; malformed 1; framing errors 0"),
     std::string::npos);
   EXPECT_NE(process.output().find(
-      "Published /sonar3d_replay_test/sonar_point_cloud: 1 ROS messages"), std::string::npos);
+      "Published /sonar3d_replay_test/points: 1 ROS messages"), std::string::npos);
 }
 
 TEST_F(ReplayTest, InterruptStopsPlaybackCleanlyWithAnIncompleteSummary)
@@ -328,7 +328,7 @@ TEST_F(ReplayTest, InterruptStopsPlaybackCleanlyWithAnIncompleteSummary)
   qos.reliable();
   std::size_t received{};
   const auto subscription = observer->create_subscription<Cloud>(
-    "sonar_point_cloud", qos, [&received](Cloud::ConstSharedPtr) {++received;});
+    "points", qos, [&received](Cloud::ConstSharedPtr) {++received;});
   PlayerProcess process(recording.path(), std::vector<std::string>{
       "--startup-delay", "1.0", "--realtime-factor", "0.01"});
   const auto deadline = std::chrono::steady_clock::now() + 5s;
@@ -359,7 +359,7 @@ TEST_F(ReplayTest, OutputWritesEveryProductToABagWithoutPacing)
     ASSERT_TRUE(process.wait()) << process.output();
     ASSERT_TRUE(process.succeeded()) << process.output();
     EXPECT_NE(process.output().find(
-        "Wrote /sonar3d_replay_test/sonar_point_cloud: 12 ROS messages"), std::string::npos)
+        "Wrote /sonar3d_replay_test/points: 12 ROS messages"), std::string::npos)
       << process.output();
   }
 
@@ -375,11 +375,11 @@ TEST_F(ReplayTest, OutputWritesEveryProductToABagWithoutPacing)
   }
   std::filesystem::remove_all(directory);
 
-  ASSERT_EQ(topics["/sonar3d_replay_test/sonar_range_image"].size(), 12U);
-  ASSERT_EQ(topics["/sonar3d_replay_test/sonar_point_cloud"].size(), 12U);
-  ASSERT_EQ(topics["/sonar3d_replay_test/sonar_intensity_image"].size(), 12U);
-  ASSERT_EQ(topics["/sonar3d_replay_test/sonar_shaded_image"].size(), 12U);
-  ASSERT_EQ(topics["/sonar3d_replay_test/sonar_imu"].size(), 60U);
+  ASSERT_EQ(topics["/sonar3d_replay_test/range_image"].size(), 12U);
+  ASSERT_EQ(topics["/sonar3d_replay_test/points"].size(), 12U);
+  ASSERT_EQ(topics["/sonar3d_replay_test/intensity_image"].size(), 12U);
+  ASSERT_EQ(topics["/sonar3d_replay_test/shaded_image"].size(), 12U);
+  ASSERT_EQ(topics["/sonar3d_replay_test/imu/data_raw"].size(), 60U);
 
   rclcpp::Serialization<Cloud> cloud_serialization;
   rclcpp::Serialization<Imu> imu_serialization;
@@ -387,7 +387,7 @@ TEST_F(ReplayTest, OutputWritesEveryProductToABagWithoutPacing)
     const auto source = sonar3d::testing::range_image(sequence, sequence % 2 != 0);
     const auto header = sonar3d::conversions::make_header(
       source.header, "sonar3d_link", builtin_interfaces::msg::Time{});
-    const auto & stored = topics["/sonar3d_replay_test/sonar_point_cloud"][sequence];
+    const auto & stored = topics["/sonar3d_replay_test/points"][sequence];
     Cloud cloud;
     const rclcpp::SerializedMessage serialized(*stored->serialized_data);
     cloud_serialization.deserialize_message(&serialized, &cloud);
@@ -399,7 +399,7 @@ TEST_F(ReplayTest, OutputWritesEveryProductToABagWithoutPacing)
   for (std::size_t sample = 0; sample < expected_imu.size(); ++sample) {
     Imu imu;
     const rclcpp::SerializedMessage serialized(
-      *topics["/sonar3d_replay_test/sonar_imu"][15 + sample]->serialized_data);
+      *topics["/sonar3d_replay_test/imu/data_raw"][15 + sample]->serialized_data);
     imu_serialization.deserialize_message(&serialized, &imu);
     EXPECT_EQ(imu, expected_imu[sample]);
   }
@@ -426,23 +426,23 @@ TEST_P(RecordingPlayer, MixedRecordingDeliversAllProductsWithSensorOrReceiveTime
   std::vector<Cloud::ConstSharedPtr> clouds;
   std::vector<Imu::ConstSharedPtr> imus;
   const auto range_sub = observer->create_subscription<Image>(
-    "sonar_range_image", qos, [&ranges](Image::ConstSharedPtr message) {
+    "range_image", qos, [&ranges](Image::ConstSharedPtr message) {
       ranges.push_back(message);
       });
   const auto cloud_sub = observer->create_subscription<Cloud>(
-    "sonar_point_cloud", qos, [&clouds](Cloud::ConstSharedPtr message) {
+    "points", qos, [&clouds](Cloud::ConstSharedPtr message) {
       clouds.push_back(message);
       });
   const auto intensity_sub = observer->create_subscription<Image>(
-    "sonar_intensity_image", qos, [&intensities](Image::ConstSharedPtr message) {
+    "intensity_image", qos, [&intensities](Image::ConstSharedPtr message) {
       intensities.push_back(message);
     });
   const auto shaded_sub = observer->create_subscription<Image>(
-    "sonar_shaded_image", qos, [&shaded](Image::ConstSharedPtr message) {
+    "shaded_image", qos, [&shaded](Image::ConstSharedPtr message) {
       shaded.push_back(message);
       });
   const auto imu_sub = observer->create_subscription<Imu>(
-    "sonar_imu", qos, [&imus](Imu::ConstSharedPtr message) {imus.push_back(message);});
+    "imu/data_raw", qos, [&imus](Imu::ConstSharedPtr message) {imus.push_back(message);});
   rclcpp::executors::SingleThreadedExecutor executor;
   executor.add_node(observer);
   const builtin_interfaces::msg::Time started = observer->now();
@@ -467,9 +467,9 @@ TEST_P(RecordingPlayer, MixedRecordingDeliversAllProductsWithSensorOrReceiveTime
   EXPECT_NE(process.output().find("Processed 48 supported packets; unsupported 0; damaged 0"),
     std::string::npos);
   EXPECT_NE(process.output().find(
-      "Published /sonar3d_replay_test/sonar_point_cloud: 12 ROS messages"),
+      "Published /sonar3d_replay_test/points: 12 ROS messages"),
     std::string::npos);
-  EXPECT_NE(process.output().find("Published /sonar3d_replay_test/sonar_imu: 60 ROS messages"),
+  EXPECT_NE(process.output().find("Published /sonar3d_replay_test/imu/data_raw: 60 ROS messages"),
     std::string::npos);
   for (std::uint32_t sequence = 0; sequence < 12; ++sequence) {
     const auto source = sonar3d::testing::range_image(sequence, sequence % 2 != 0);

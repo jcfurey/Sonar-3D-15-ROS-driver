@@ -15,14 +15,19 @@
 #include <string>
 #include <thread>
 #include <unordered_set>
+#include <vector>
 
-#include <diagnostic_msgs/msg/diagnostic_array.hpp>
+#include <diagnostic_updater/diagnostic_updater.hpp>
+#include <diagnostic_updater/update_functions.hpp>
 #include <rclcpp/rclcpp.hpp>
+#include <rclcpp_lifecycle/lifecycle_node.hpp>
+#include <rclcpp_lifecycle/lifecycle_publisher.hpp>
 #include <sensor_msgs/msg/image.hpp>
 #include <sensor_msgs/msg/imu.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <tf2_ros/static_transform_broadcaster.hpp>
 
+#include "sonar3d/conversions.hpp"
 #include "sonar3d/protocol.hpp"
 #include "sonar3d/sensor_clock.hpp"
 #include "sonar3d/sonar3d_parameters.hpp"
@@ -31,13 +36,33 @@
 namespace sonar3d
 {
 
-class SonarDriver final : public rclcpp::Node
+// Managed (lifecycle) Sonar 3D-15 driver.
+//   configure:  validate parameters, open the multicast socket, create
+//               publishers, broadcast the IMU transform, start HTTP setup.
+//   activate:   discard queued datagrams and start streaming.
+//   deactivate: stop streaming; the socket and device setup are kept.
+//   cleanup:    release the socket, publishers and HTTP setup.
+// /diagnostics is published in every state.
+class SonarDriver final : public rclcpp_lifecycle::LifecycleNode
 {
 public:
+  using CallbackReturn =
+    rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn;
+
   explicit SonarDriver(const rclcpp::NodeOptions & options = rclcpp::NodeOptions());
   ~SonarDriver() override;
 
+  CallbackReturn on_configure(const rclcpp_lifecycle::State & previous_state) override;
+  CallbackReturn on_activate(const rclcpp_lifecycle::State & previous_state) override;
+  CallbackReturn on_deactivate(const rclcpp_lifecycle::State & previous_state) override;
+  CallbackReturn on_cleanup(const rclcpp_lifecycle::State & previous_state) override;
+  CallbackReturn on_shutdown(const rclcpp_lifecycle::State & previous_state) override;
+  CallbackReturn on_error(const rclcpp_lifecycle::State & previous_state) override;
+
 private:
+  template<typename MessageT>
+  using Publisher = typename rclcpp_lifecycle::LifecyclePublisher<MessageT>::SharedPtr;
+
   struct SequenceState
   {
     std::optional<std::uint32_t> last;
@@ -72,8 +97,36 @@ private:
     RECEIVE,
   };
 
-  // Runs on receive_thread_: blocks on the socket and publishes each product
-  // as soon as its datagram arrives, independent of executor scheduling.
+  enum class ConfigurationState : int
+  {
+    DISABLED,
+    PENDING,
+    SUCCESSFUL,
+    FAILED,
+  };
+
+  // Settings fixed for one configure/cleanup cycle.
+  struct Settings
+  {
+    std::string sonar_ip;
+    std::string fallback_ip;
+    std::optional<std::uint32_t> sonar_address;
+    std::optional<std::uint32_t> fallback_address;
+    std::string frame_id;
+    std::string imu_frame_id;
+    bool use_sensor_timestamps{true};
+    std::int64_t max_sensor_clock_offset_ns{0};
+    conversions::ImuNoise imu_noise;
+    double packet_stale_timeout{2.0};
+  };
+
+  void configure_driver();
+  void release();
+  void stop_streaming();
+  void stop_configuration();
+
+  // Runs on receive_thread_ while active: blocks on the socket and publishes
+  // each product as soon as its datagram arrives.
   void receive_loop(const std::stop_token & stop);
   [[nodiscard]] bool accepts_source(std::uint32_t source_address) const;
   void handle_datagram(const Datagram & datagram);
@@ -93,36 +146,27 @@ private:
     const std::optional<protocol::Timestamp> & reference,
     const builtin_interfaces::msg::Time & receive_stamp);
   void observe_sequence(SequenceState & state, std::uint32_t sequence_id);
-  void publish_diagnostics();
+  void diagnose_stream(diagnostic_updater::DiagnosticStatusWrapper & status);
   void publish_imu_transform();
-  void start_configuration(double speed_of_sound, double timeout_seconds);
+  void start_configuration(double speed_of_sound, bool imu_output, double timeout_seconds);
 
   std::shared_ptr<ParamListener> parameter_listener_;
-  std::string sonar_ip_;
-  std::string fallback_ip_;
-  std::optional<std::uint32_t> sonar_address_;
-  std::optional<std::uint32_t> fallback_address_;
-  std::string frame_id_;
-  std::string imu_frame_id_;
-  bool use_sensor_timestamps_{true};
-  std::int64_t max_sensor_clock_offset_ns_{0};
-  bool publish_point_cloud_{true};
-  bool publish_range_image_{true};
-  bool publish_bitmap_images_{true};
-  bool publish_imu_{true};
-  double packet_stale_timeout_{2.0};
+  // Driver parameters may change only while unconfigured; configure applies them.
+  std::unordered_set<std::string> driver_parameters_;
+  rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr parameter_guard_;
+  rclcpp::TimerBase::SharedPtr autostart_timer_;
+  Settings settings_;
 
+  // Configured state.
   std::unique_ptr<UdpReceiver> receiver_;
-  rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr range_image_publisher_;
-  rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr intensity_image_publisher_;
-  rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr shaded_image_publisher_;
-  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr point_cloud_publisher_;
-  rclcpp::Publisher<sensor_msgs::msg::Imu>::SharedPtr imu_publisher_;
-  rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr diagnostics_publisher_;
+  Publisher<sensor_msgs::msg::Image> range_image_publisher_;
+  Publisher<sensor_msgs::msg::Image> intensity_image_publisher_;
+  Publisher<sensor_msgs::msg::Image> shaded_image_publisher_;
+  Publisher<sensor_msgs::msg::PointCloud2> point_cloud_publisher_;
+  Publisher<sensor_msgs::msg::Imu> imu_publisher_;
   std::unique_ptr<tf2_ros::StaticTransformBroadcaster> static_transform_broadcaster_;
-  rclcpp::TimerBase::SharedPtr diagnostics_timer_;
 
-  // Touched only by receive_thread_.
+  // Touched only by receive_thread_ (reset while it is stopped).
   SequenceState range_sequence_;
   SequenceState intensity_sequence_;
   SequenceState shaded_sequence_;
@@ -134,16 +178,24 @@ private:
 
   // Shared with the diagnostics timer.
   Metrics metrics_;
+  std::atomic<bool> streaming_{false};
   std::atomic<std::int64_t> last_valid_packet_steady_ns_{-1};
   std::atomic<TimestampSource> timestamp_source_{TimestampSource::NONE};
   // Receive time minus sensor time for the latest timestamped message.
   std::atomic<std::int64_t> last_sensor_clock_offset_ns_{0};
 
-  // 0 = configuration disabled, 1 = pending, 2 = successful, 3 = failed.
-  std::atomic<int> configuration_state_{0};
-  std::mutex configuration_error_mutex_;
+  std::atomic<ConfigurationState> configuration_state_{ConfigurationState::DISABLED};
+  std::mutex configuration_mutex_;
   std::string configuration_error_;
+  std::vector<std::string> configuration_unsupported_;
   std::jthread configuration_thread_;
+
+  // The sonar images at 5 Hz (low frequency mode) or 20 Hz (high frequency).
+  double minimum_range_rate_{5.0};
+  double maximum_range_rate_{20.0};
+  diagnostic_updater::FrequencyStatus range_rate_;
+  diagnostic_updater::Updater diagnostics_;
+
   std::jthread receive_thread_;
 };
 

@@ -25,7 +25,7 @@ Visualization Manager:
       Name: Sonar returns
       Enabled: true
       Topic:
-        Value: sonar_point_cloud
+        Value: points
         Reliability Policy: Reliable
         Durability Policy: Volatile
         History Policy: Keep Last
@@ -43,7 +43,7 @@ Visualization Manager:
       Name: Signal strength
       Enabled: true
       Topic:
-        Value: sonar_intensity_image
+        Value: intensity_image
         Reliability Policy: Reliable
         Durability Policy: Volatile
         History Policy: Keep Last
@@ -53,7 +53,7 @@ Visualization Manager:
       Name: Shaded depth
       Enabled: false
       Topic:
-        Value: sonar_shaded_image
+        Value: shaded_image
         Reliability Policy: Reliable
         Durability Policy: Volatile
         History Policy: Keep Last

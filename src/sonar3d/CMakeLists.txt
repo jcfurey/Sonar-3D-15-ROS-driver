@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(sonar3d VERSION 0.4.0 LANGUAGES CXX)
+project(sonar3d VERSION 0.5.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -13,11 +13,14 @@ find_package(ament_cmake REQUIRED)
 find_package(builtin_interfaces REQUIRED)
 find_package(CURL REQUIRED)
 find_package(diagnostic_msgs REQUIRED)
+find_package(diagnostic_updater REQUIRED)
 find_package(generate_parameter_library REQUIRED)
 find_package(geometry_msgs REQUIRED)
+find_package(lifecycle_msgs REQUIRED)
 find_package(Protobuf REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(rclcpp_components REQUIRED)
+find_package(rclcpp_lifecycle REQUIRED)
 find_package(rosbag2_cpp REQUIRED)
 find_package(rosbag2_storage REQUIRED)
 find_package(sensor_msgs REQUIRED)
@@ -114,11 +117,14 @@ target_link_libraries(
     sonar3d_ros
     ${builtin_interfaces_TARGETS}
     ${diagnostic_msgs_TARGETS}
+    diagnostic_updater::diagnostic_updater
     rclcpp::rclcpp
+    rclcpp_lifecycle::rclcpp_lifecycle
     ${sensor_msgs_TARGETS}
     tf2_ros::tf2_ros
   PRIVATE
     ${geometry_msgs_TARGETS}
+    ${lifecycle_msgs_TARGETS}
     rclcpp_components::component
 )
 rclcpp_components_register_node(
@@ -221,8 +227,10 @@ ament_export_targets(sonar3dTargets HAS_LIBRARY_TARGET)
 ament_export_dependencies(
   builtin_interfaces
   diagnostic_msgs
+  diagnostic_updater
   generate_parameter_library
   rclcpp
+  rclcpp_lifecycle
   sensor_msgs
   std_msgs
   tf2_ros

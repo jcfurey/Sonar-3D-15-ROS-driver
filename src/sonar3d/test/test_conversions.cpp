@@ -9,6 +9,7 @@
 #include <bit>
 #include <gtest/gtest.h>
 
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -218,6 +219,35 @@ TEST(Conversions, TransformsImuVectorsIntoRosBodyAxes)
   EXPECT_DOUBLE_EQ(messages[0].angular_velocity.y, -5.0);
   EXPECT_DOUBLE_EQ(messages[0].angular_velocity.z, -6.0);
   EXPECT_DOUBLE_EQ(messages[0].orientation_covariance[0], -1.0);
+}
+
+TEST(Conversions, ImuCovarianceFollowsRep145)
+{
+  sonar3d::protocol::ImuBatch batch;
+  batch.sample_count = 1;
+  batch.timestamps = {{10, 20}};
+  batch.specific_force = {0.0F, 0.0F, -9.81F};
+  batch.rate_of_turn = {0.0F, 0.0F, 0.0F};
+
+  const auto unknown = sonar3d::conversions::make_imu_messages(
+    batch, "sonar_imu", builtin_interfaces::msg::Time{});
+  EXPECT_EQ(unknown[0].linear_acceleration_covariance, (std::array<double, 9>{}));
+  EXPECT_EQ(unknown[0].angular_velocity_covariance, (std::array<double, 9>{}));
+  // At rest in the vendor's z-down frame gravity reads -g; REP-145 wants +g up.
+  EXPECT_FLOAT_EQ(unknown[0].linear_acceleration.z, 9.81F);
+
+  const auto known = sonar3d::conversions::make_imu_messages(
+    batch, "sonar_imu", builtin_interfaces::msg::Time{}, true, 0, {0.02, 0.003});
+  EXPECT_EQ(known[0].linear_acceleration_covariance,
+    (std::array<double, 9>{0.0004, 0, 0, 0, 0.0004, 0, 0, 0, 0.0004}));
+  EXPECT_DOUBLE_EQ(known[0].angular_velocity_covariance[4], 0.003 * 0.003);
+  EXPECT_DOUBLE_EQ(known[0].angular_velocity_covariance[1], 0.0);
+  EXPECT_DOUBLE_EQ(known[0].orientation_covariance[0], -1.0);
+
+  EXPECT_THROW(
+    static_cast<void>(sonar3d::conversions::make_imu_messages(
+      batch, "sonar_imu", builtin_interfaces::msg::Time{}, true, 0, {-1.0, 0.0})),
+    std::invalid_argument);
 }
 
 TEST(Conversions, RejectsMalformedImageAndImuDimensions)
