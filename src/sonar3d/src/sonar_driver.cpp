@@ -7,8 +7,6 @@
 
 #include "sonar3d/sonar_driver.hpp"
 
-#include <arpa/inet.h>
-
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -27,6 +25,7 @@
 
 #include <diagnostic_msgs/msg/diagnostic_status.hpp>
 #include <diagnostic_msgs/msg/key_value.hpp>
+#include <geometry_msgs/msg/transform_stamped.hpp>
 #include <rclcpp_components/register_node_macro.hpp>
 
 #include "sonar3d/conversions.hpp"
@@ -42,12 +41,6 @@ namespace
 {
   return std::chrono::duration_cast<std::chrono::nanoseconds>(
     std::chrono::steady_clock::now().time_since_epoch()).count();
-}
-
-[[nodiscard]] bool is_ipv4_address(const std::string & value)
-{
-  in_addr address{};
-  return inet_pton(AF_INET, value.c_str(), &address) == 1;
 }
 
 [[nodiscard]] std::string join(const std::vector<std::string> & values)
@@ -94,15 +87,25 @@ SonarDriver::SonarDriver(const rclcpp::NodeOptions & options)
   if (parameters.configure_sonar && parameters.sonar_ip.empty()) {
     throw std::invalid_argument("sonar_ip must not be empty when configure_sonar is true");
   }
-  if (!parameters.sonar_ip.empty() && !is_ipv4_address(parameters.sonar_ip)) {
-    throw std::invalid_argument(
-            "sonar_ip must be a literal IPv4 address so UDP source filtering is unambiguous");
+  if (!parameters.sonar_ip.empty()) {
+    sonar_address_ = parse_ipv4(parameters.sonar_ip);
+    if (!sonar_address_) {
+      throw std::invalid_argument(
+              "sonar_ip must be a literal IPv4 address so UDP source filtering is unambiguous");
+    }
+  }
+  if (!parameters.fallback_ip.empty()) {
+    fallback_address_ = parse_ipv4(parameters.fallback_ip);
+    if (!fallback_address_) {
+      throw std::invalid_argument("fallback_ip must be empty or a literal IPv4 address");
+    }
   }
   if (parameters.frame_id.empty() || parameters.imu_frame_id.empty()) {
     throw std::invalid_argument("frame_id and imu_frame_id must not be empty");
   }
 
   sonar_ip_ = parameters.sonar_ip;
+  fallback_ip_ = parameters.fallback_ip;
   frame_id_ = parameters.frame_id;
   imu_frame_id_ = parameters.imu_frame_id;
   use_sensor_timestamps_ = parameters.use_sensor_timestamps;
@@ -111,7 +114,6 @@ SonarDriver::SonarDriver(const rclcpp::NodeOptions & options)
   publish_range_image_ = parameters.publish_range_image;
   publish_bitmap_images_ = parameters.publish_bitmap_images;
   publish_imu_ = parameters.publish_imu;
-  max_packets_per_spin_ = static_cast<std::size_t>(parameters.max_packets_per_spin);
   packet_stale_timeout_ = parameters.packet_stale_timeout;
 
   receiver_ = std::make_unique<UdpReceiver>(
@@ -140,13 +142,14 @@ SonarDriver::SonarDriver(const rclcpp::NodeOptions & options)
   }
   diagnostics_publisher_ =
     create_publisher<diagnostic_msgs::msg::DiagnosticArray>("/diagnostics", rclcpp::QoS(10));
+  if (parameters.publish_tf) {
+    static_transform_broadcaster_ = std::make_unique<tf2_ros::StaticTransformBroadcaster>(*this);
+    publish_imu_transform();
+  }
 
-  poll_timer_ = create_wall_timer(
-    std::chrono::duration<double>(parameters.poll_period),
-    std::bind(&SonarDriver::poll_socket, this));
   diagnostics_timer_ = create_wall_timer(
     std::chrono::duration<double>(parameters.diagnostics_period),
-    std::bind(&SonarDriver::publish_diagnostics, this));
+    [this]() {publish_diagnostics();});
 
   RCLCPP_INFO(
     get_logger(),
@@ -154,19 +157,27 @@ SonarDriver::SonarDriver(const rclcpp::NodeOptions & options)
     parameters.multicast_group.c_str(),
     parameters.multicast_port,
     parameters.multicast_interface.c_str());
-  if (!sonar_ip_.empty()) {
+  if (sonar_address_ && fallback_address_ && *sonar_address_ != *fallback_address_) {
+    RCLCPP_INFO(
+      get_logger(), "Accepting packets only from %s and the fallback address %s",
+      sonar_ip_.c_str(), fallback_ip_.c_str());
+  } else if (sonar_address_) {
     RCLCPP_INFO(get_logger(), "Accepting packets only from %s", sonar_ip_.c_str());
   }
 
   if (parameters.configure_sonar) {
     start_configuration(parameters.speed_of_sound, parameters.http_timeout);
   }
+  receive_thread_ = std::jthread([this](std::stop_token stop) {receive_loop(stop);});
 }
 
 SonarDriver::~SonarDriver()
 {
-  if (poll_timer_) {
-    poll_timer_->cancel();
+  // Stop the publishing thread before any member it uses is destroyed.
+  if (receive_thread_.joinable()) {
+    receive_thread_.request_stop();
+    receiver_->interrupt();
+    receive_thread_.join();
   }
   if (diagnostics_timer_) {
     diagnostics_timer_->cancel();
@@ -176,6 +187,22 @@ SonarDriver::~SonarDriver()
     configuration_thread_.join();
   }
   receiver_.reset();
+}
+
+void SonarDriver::publish_imu_transform()
+{
+  // Water Linked documents the IMU at (-22, -46, -3) mm from the point-cloud
+  // origin in its x-forward, y-right, z-down frame. Both frames use REP-103
+  // axes here, so y and z change sign and no rotation is needed.
+  geometry_msgs::msg::TransformStamped transform;
+  transform.header.stamp = now();
+  transform.header.frame_id = frame_id_;
+  transform.child_frame_id = imu_frame_id_;
+  transform.transform.translation.x = -0.022;
+  transform.transform.translation.y = 0.046;
+  transform.transform.translation.z = 0.003;
+  transform.transform.rotation.w = 1.0;
+  static_transform_broadcaster_->sendTransform(transform);
 }
 
 void SonarDriver::start_configuration(double speed_of_sound, double timeout_seconds)
@@ -212,17 +239,22 @@ void SonarDriver::start_configuration(double speed_of_sound, double timeout_seco
     });
 }
 
-void SonarDriver::poll_socket()
+void SonarDriver::receive_loop(const std::stop_token & stop)
 {
-  for (std::size_t packet_index = 0; packet_index < max_packets_per_spin_; ++packet_index) {
+  while (!stop.stop_requested()) {
     try {
-      const auto datagram = receiver_->receive();
-      if (!datagram) {
-        return;
+      if (!receiver_->wait(std::chrono::milliseconds(-1))) {
+        continue;
       }
-      metrics_.datagrams.fetch_add(1, std::memory_order_relaxed);
-      handle_datagram(*datagram);
-    } catch (const std::system_error & error) {
+      while (!stop.stop_requested()) {
+        const auto datagram = receiver_->receive();
+        if (!datagram) {
+          break;
+        }
+        metrics_.datagrams.fetch_add(1, std::memory_order_relaxed);
+        handle_datagram(*datagram);
+      }
+    } catch (const std::exception & error) {
       metrics_.socket_errors.fetch_add(1, std::memory_order_relaxed);
       RCLCPP_ERROR_THROTTLE(
         get_logger(),
@@ -230,20 +262,27 @@ void SonarDriver::poll_socket()
         5000,
         "Sonar multicast receive failed: %s",
         error.what());
-      return;
+      // Avoid spinning on a persistent socket error.
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
   }
 }
 
+bool SonarDriver::accepts_source(std::uint32_t source_address) const
+{
+  return !sonar_address_ || source_address == *sonar_address_ ||
+         source_address == fallback_address_;
+}
+
 void SonarDriver::handle_datagram(const Datagram & datagram)
 {
-  if (!sonar_ip_.empty() && datagram.source_address != sonar_ip_) {
+  if (!accepts_source(datagram.source_address)) {
     metrics_.rejected_sources.fetch_add(1, std::memory_order_relaxed);
     if (warned_sources_.insert(datagram.source_address).second) {
       RCLCPP_WARN(
         get_logger(),
         "Ignoring Sonar 3D-15 packets from %s; expected %s",
-        datagram.source_address.c_str(),
+        format_ipv4(datagram.source_address).c_str(),
         sonar_ip_.c_str());
     }
     return;
@@ -373,7 +412,8 @@ void SonarDriver::handle_imu_batch(
   const builtin_interfaces::msg::Time & fallback_stamp)
 {
   observe_sequence(imu_sequence_, batch.sequence_id);
-  // Anchor on the newest sample so a re-anchored batch keeps its sample spacing.
+  // The newest sample has the least transport delay, so it best constrains the
+  // clock offset; every sample shares that offset and keeps its spacing.
   const auto offset = sensor_clock_offset(
     batch.timestamps.empty() ? std::nullopt : std::optional{batch.timestamps.back()},
     fallback_stamp);
@@ -401,7 +441,8 @@ std::int64_t SonarDriver::sensor_clock_offset(
   }
 
   // Both operands are within the int32-second ROS range, so this cannot overflow.
-  const auto offset = rclcpp::Time(receive_stamp).nanoseconds() - *sensor;
+  const auto receive = rclcpp::Time(receive_stamp).nanoseconds();
+  const auto offset = receive - *sensor;
   last_sensor_clock_offset_ns_.store(offset, std::memory_order_relaxed);
   const bool synchronized =
     max_sensor_clock_offset_ns_ == 0 || std::llabs(offset) <= max_sensor_clock_offset_ns_;
@@ -415,17 +456,18 @@ std::int64_t SonarDriver::sensor_clock_offset(
     } else {
       RCLCPP_WARN(
         get_logger(),
-        "Sonar 3D-15 clock differs from ROS time by %.3f s; stamping with receive time until it "
-        "synchronizes. The sonar keeps an arbitrary clock until NTP succeeds, so give it a "
-        "reachable NTP server.",
+        "Sonar 3D-15 clock differs from ROS time by %.3f s; shifting sensor timestamps onto ROS "
+        "time until it synchronizes. The sonar keeps an arbitrary clock until NTP succeeds, so "
+        "give it a reachable NTP server.",
         static_cast<double>(offset) / 1.0e9);
     }
   }
   if (synchronized) {
+    clock_offset_.reset();
     return 0;
   }
   metrics_.sensor_clock_fallbacks.fetch_add(1, std::memory_order_relaxed);
-  return offset;
+  return clock_offset_.update(offset, receive);
 }
 
 void SonarDriver::observe_sequence(SequenceState & state, std::uint32_t sequence_id)
@@ -524,13 +566,13 @@ void SonarDriver::publish_diagnostics()
           1.0e9);
         break;
       case TimestampSource::RECEIVE:
-        timestamp_text = "receive (sensor clock unsynchronized)";
+        timestamp_text = "receive-aligned (sensor clock unsynchronized)";
         add_diagnostic_value(status, "sensor_clock_offset_seconds",
           static_cast<double>(last_sensor_clock_offset_ns_.load(std::memory_order_relaxed)) /
           1.0e9);
         status.level = std::max(status.level, diagnostic_msgs::msg::DiagnosticStatus::WARN);
         if (status.message == "receiving RIP packets") {
-          status.message = "sonar clock unsynchronized; stamping with receive time";
+          status.message = "sonar clock unsynchronized; sensor timestamps aligned to receive time";
         }
         break;
     }

@@ -25,6 +25,9 @@
 #include <vector>
 
 #include <rclcpp/rclcpp.hpp>
+#include <rosbag2_cpp/writer.hpp>
+#include <rosbag2_storage/default_storage_id.hpp>
+#include <rosbag2_storage/storage_options.hpp>
 #include <sensor_msgs/msg/image.hpp>
 #include <sensor_msgs/msg/imu.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
@@ -44,6 +47,8 @@ struct PlaybackOptions
   std::string file;
   std::string frame_id{"sonar3d_link"};
   std::string imu_frame_id{"sonar3d_imu_link"};
+  std::string output;
+  std::string storage_id;
   double realtime_factor{1.0};
   double startup_delay{0.5};
   bool use_sensor_timestamps{true};
@@ -56,10 +61,13 @@ void print_usage(const char * executable)
   std::cout
     << "Usage: " << executable << " --file RECORDING [options]\n"
     << "\n"
-    << "Publish a mixed RIP1/RIP2 .sonar recording using the live driver's topics.\n"
+    << "Publish a mixed RIP1/RIP2 .sonar recording using the live driver's topics,\n"
+    << "or write those topics straight to a rosbag2 bag with --output.\n"
     << "\n"
     << "Options:\n"
     << "  --file PATH                 Recording to play (required)\n"
+    << "  --output BAG               Write every product to a new bag instead of publishing\n"
+    << "  --storage ID               Bag storage plugin, e.g. mcap or sqlite3 (default: mcap)\n"
     << "  --realtime-factor FACTOR   Playback speed multiplier (default: 1.0)\n"
     << "  --frame-id FRAME           Range/image/cloud frame (default: sonar3d_link)\n"
     << "  --imu-frame-id FRAME       IMU frame (default: sonar3d_imu_link)\n"
@@ -108,6 +116,10 @@ void print_usage(const char * executable)
       options.validate_only = true;
     } else if (argument == "--file" || argument.rfind("--file=", 0) == 0) {
       options.file = option_value(arguments, index, "--file");
+    } else if (argument == "--output" || argument.rfind("--output=", 0) == 0) {
+      options.output = option_value(arguments, index, "--output");
+    } else if (argument == "--storage" || argument.rfind("--storage=", 0) == 0) {
+      options.storage_id = option_value(arguments, index, "--storage");
     } else if (argument == "--frame-id" || argument.rfind("--frame-id=", 0) == 0) {
       options.frame_id = option_value(arguments, index, "--frame-id");
     } else if (argument == "--imu-frame-id" || argument.rfind("--imu-frame-id=", 0) == 0) {
@@ -134,6 +146,16 @@ void print_usage(const char * executable)
   }
   if (options.frame_id.empty() || options.imu_frame_id.empty()) {
     throw std::invalid_argument("frame IDs must not be empty");
+  }
+  if (!options.output.empty() && options.validate_only) {
+    throw std::invalid_argument("--output and --validate-only are mutually exclusive");
+  }
+  if (!options.output.empty() && !options.use_sensor_timestamps) {
+    throw std::invalid_argument(
+            "--receive-time cannot be used with --output; bags keep recorded sensor timestamps");
+  }
+  if (options.output.empty() && !options.storage_id.empty()) {
+    throw std::invalid_argument("--storage requires --output");
   }
   return options;
 }
@@ -200,6 +222,13 @@ void interruptible_sleep(double seconds)
   return std::nullopt;
 }
 
+enum class OutputMode
+{
+  PUBLISH,
+  VALIDATE,
+  BAG,
+};
+
 class RecordingPlayer final : public rclcpp::Node
 {
 public:
@@ -208,20 +237,30 @@ public:
     frame_id_(options.frame_id),
     imu_frame_id_(options.imu_frame_id),
     use_sensor_timestamps_(options.use_sensor_timestamps),
-    validate_only_(options.validate_only)
+    mode_(options.validate_only ? OutputMode::VALIDATE :
+      (options.output.empty() ? OutputMode::PUBLISH : OutputMode::BAG))
   {
-    if (validate_only_) {
-      return;
+    range_image_.topic = resolve("sonar_range_image");
+    intensity_image_.topic = resolve("sonar_intensity_image");
+    shaded_image_.topic = resolve("sonar_shaded_image");
+    point_cloud_.topic = resolve("sonar_point_cloud");
+    imu_.topic = resolve("sonar_imu");
+    if (mode_ == OutputMode::BAG) {
+      rosbag2_storage::StorageOptions storage;
+      storage.uri = options.output;
+      storage.storage_id = options.storage_id.empty() ?
+        rosbag2_storage::get_default_storage_id() : options.storage_id;
+      writer_ = std::make_unique<rosbag2_cpp::Writer>();
+      writer_->open(storage);
+    } else if (mode_ == OutputMode::PUBLISH) {
+      auto qos = rclcpp::SensorDataQoS(rclcpp::KeepLast(100));
+      qos.reliable();
+      advertise(range_image_, qos);
+      advertise(intensity_image_, qos);
+      advertise(shaded_image_, qos);
+      advertise(point_cloud_, qos);
+      advertise(imu_, qos);
     }
-    auto qos = rclcpp::SensorDataQoS(rclcpp::KeepLast(100));
-    qos.reliable();
-    range_image_publisher_ = create_publisher<sensor_msgs::msg::Image>("sonar_range_image", qos);
-    intensity_image_publisher_ = create_publisher<sensor_msgs::msg::Image>("sonar_intensity_image",
-          qos);
-    shaded_image_publisher_ = create_publisher<sensor_msgs::msg::Image>("sonar_shaded_image", qos);
-    point_cloud_publisher_ = create_publisher<sensor_msgs::msg::PointCloud2>("sonar_point_cloud",
-          qos);
-    imu_publisher_ = create_publisher<sensor_msgs::msg::Imu>("sonar_imu", qos);
   }
 
   void process_message(const protocol::Message & source)
@@ -236,49 +275,36 @@ public:
             frame_id_,
             fallback_stamp,
             use_sensor_timestamps_);
-          if (validate_only_ || has_subscribers(range_image_publisher_)) {
-            auto image = conversions::make_range_image(message, header);
-            if (!validate_only_) {
-              range_image_publisher_->publish(
-                std::make_unique<sensor_msgs::msg::Image>(std::move(image)));
-              ++publications_[range_image_publisher_->get_topic_name()];
-            }
+          // Build both products before emitting either, so a malformed image
+          // never produces only half of its outputs.
+          std::optional<sensor_msgs::msg::Image> image;
+          std::optional<sensor_msgs::msg::PointCloud2> cloud;
+          if (wanted(range_image_)) {
+            image = conversions::make_range_image(message, header);
           }
-          if (validate_only_ || has_subscribers(point_cloud_publisher_)) {
-            auto cloud = conversions::make_point_cloud(message, header);
-            if (!validate_only_) {
-              point_cloud_publisher_->publish(
-                std::make_unique<sensor_msgs::msg::PointCloud2>(std::move(cloud)));
-              ++publications_[point_cloud_publisher_->get_topic_name()];
-            }
+          if (wanted(point_cloud_)) {
+            cloud = conversions::make_point_cloud(message, header);
+          }
+          if (image) {
+            emit(range_image_, std::move(*image));
+          }
+          if (cloud) {
+            emit(point_cloud_, std::move(*cloud));
           }
         } else if constexpr (std::is_same_v<MessageType, protocol::BitmapImage>) {
-          rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr publisher;
-          if (message.type == protocol::BitmapImageType::SIGNAL_STRENGTH_IMAGE) {
-            publisher = intensity_image_publisher_;
-          } else if (message.type == protocol::BitmapImageType::SHADED_IMAGE) {
-            publisher = shaded_image_publisher_;
-          } else {
-            return;
-          }
-          if (validate_only_ || has_subscribers(publisher)) {
+          auto & output = message.type == protocol::BitmapImageType::SHADED_IMAGE ?
+          shaded_image_ : intensity_image_;
+          if (wanted(output)) {
             const auto header = conversions::make_header(
               message.header, frame_id_, fallback_stamp, use_sensor_timestamps_);
-            auto image = conversions::make_bitmap_image(message, header);
-            if (!validate_only_) {
-              publisher->publish(std::make_unique<sensor_msgs::msg::Image>(std::move(image)));
-              ++publications_[publisher->get_topic_name()];
-            }
+            emit(output, conversions::make_bitmap_image(message, header));
           }
         } else if constexpr (std::is_same_v<MessageType, protocol::ImuBatch>) {
-          if (validate_only_ || has_subscribers(imu_publisher_)) {
+          if (wanted(imu_)) {
             auto messages = conversions::make_imu_messages(
               message, imu_frame_id_, fallback_stamp, use_sensor_timestamps_);
-            if (!validate_only_) {
-              for (auto & imu : messages) {
-                imu_publisher_->publish(std::make_unique<sensor_msgs::msg::Imu>(std::move(imu)));
-                ++publications_[imu_publisher_->get_topic_name()];
-              }
+            for (auto & imu : messages) {
+              emit(imu_, std::move(imu));
             }
           }
         }
@@ -286,19 +312,66 @@ public:
       source);
   }
 
-  const std::map<std::string, std::uint64_t> & publications() const {return publications_;}
+  [[nodiscard]] const std::map<std::string, std::uint64_t> & outputs() const {return outputs_;}
+  [[nodiscard]] OutputMode mode() const {return mode_;}
+
+  // Close the bag so its metadata is complete before the summary is printed.
+  void finish() {writer_.reset();}
 
 private:
+  template<typename MessageT>
+  struct Output
+  {
+    std::string topic;
+    typename rclcpp::Publisher<MessageT>::SharedPtr publisher;
+  };
+
+  [[nodiscard]] std::string resolve(const std::string & topic)
+  {
+    return get_node_topics_interface()->resolve_topic_name(topic);
+  }
+
+  template<typename MessageT>
+  void advertise(Output<MessageT> & output, const rclcpp::QoS & qos)
+  {
+    output.publisher = create_publisher<MessageT>(output.topic, qos);
+  }
+
+  // Playback converts only products with subscribers; validation and bag
+  // conversion handle every product.
+  template<typename MessageT>
+  [[nodiscard]] bool wanted(const Output<MessageT> & output) const
+  {
+    return mode_ != OutputMode::PUBLISH || has_subscribers(output.publisher);
+  }
+
+  template<typename MessageT>
+  void emit(Output<MessageT> & output, MessageT && message)
+  {
+    switch (mode_) {
+      case OutputMode::VALIDATE:
+        return;
+      case OutputMode::BAG:
+        writer_->write(message, output.topic, rclcpp::Time(message.header.stamp));
+        break;
+      case OutputMode::PUBLISH:
+        output.publisher->publish(std::make_unique<MessageT>(std::move(message)));
+        break;
+    }
+    ++outputs_[output.topic];
+  }
+
   std::string frame_id_;
   std::string imu_frame_id_;
   bool use_sensor_timestamps_;
-  bool validate_only_;
-  std::map<std::string, std::uint64_t> publications_;
-  rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr range_image_publisher_;
-  rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr intensity_image_publisher_;
-  rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr shaded_image_publisher_;
-  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr point_cloud_publisher_;
-  rclcpp::Publisher<sensor_msgs::msg::Imu>::SharedPtr imu_publisher_;
+  OutputMode mode_;
+  std::map<std::string, std::uint64_t> outputs_;
+  std::unique_ptr<rosbag2_cpp::Writer> writer_;
+  Output<sensor_msgs::msg::Image> range_image_;
+  Output<sensor_msgs::msg::Image> intensity_image_;
+  Output<sensor_msgs::msg::Image> shaded_image_;
+  Output<sensor_msgs::msg::PointCloud2> point_cloud_;
+  Output<sensor_msgs::msg::Imu> imu_;
 };
 
 [[nodiscard]] int play_recording(const PlaybackOptions & options)
@@ -309,9 +382,10 @@ private:
   }
 
   auto node = std::make_shared<RecordingPlayer>(options);
+  const bool paced = node->mode() == OutputMode::PUBLISH;
   rclcpp::executors::SingleThreadedExecutor executor;
   executor.add_node(node);
-  if (!options.validate_only) {
+  if (paced) {
     interruptible_sleep(options.startup_delay);
   }
 
@@ -352,7 +426,7 @@ private:
       ++unsupported_types[*type];
       continue;
     }
-    if (!options.validate_only) {
+    if (paced) {
       interruptible_sleep_until(playback_clock.deadline(
           sensor_time_nanoseconds(packet->message), std::chrono::steady_clock::now()));
     }
@@ -374,12 +448,13 @@ private:
   }
 
   // Give reliable DDS writers a brief opportunity to flush their final sample.
-  if (!options.validate_only) {
+  if (paced) {
     interruptible_sleep(0.1);
   }
   if (rclcpp::ok()) {
     executor.spin_some();
   }
+  node->finish();
   RCLCPP_INFO(
     node->get_logger(),
     "%s %" PRIu64 " supported packets; unsupported %" PRIu64
@@ -391,8 +466,13 @@ private:
       node->get_logger(), "Unsupported message type %s: %" PRIu64 " packets (payload not decoded)",
       type.c_str(), count);
   }
-  for (const auto & [topic, count] : node->publications()) {
-    RCLCPP_INFO(node->get_logger(), "Published %s: %" PRIu64 " ROS messages", topic.c_str(), count);
+  for (const auto & [topic, count] : node->outputs()) {
+    RCLCPP_INFO(
+      node->get_logger(), "%s %s: %" PRIu64 " ROS messages",
+      node->mode() == OutputMode::BAG ? "Wrote" : "Published", topic.c_str(), count);
+  }
+  if (node->mode() == OutputMode::BAG) {
+    RCLCPP_INFO(node->get_logger(), "Bag written to %s", options.output.c_str());
   }
   if (!reached_eof && !framing_errors) {
     RCLCPP_WARN(node->get_logger(), "Stopped before recording EOF; results are incomplete");

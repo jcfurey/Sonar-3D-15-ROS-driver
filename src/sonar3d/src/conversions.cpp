@@ -105,6 +105,16 @@ constexpr std::int64_t kNanosecondsPerSecond = 1'000'000'000;
   return result;
 }
 
+// Vendor pixel rows run from the lowest elevation (pitch = -fovV/2) upward.
+// sensor_msgs/Image rows run top-down, so published row r is vendor row
+// height - 1 - r: the images appear upright and share one pixel grid.
+[[nodiscard]] std::size_t vendor_row_offset(
+  std::uint32_t width, std::uint32_t height,
+  std::uint32_t image_row)
+{
+  return static_cast<std::size_t>(height - 1U - image_row) * width;
+}
+
 [[nodiscard]] float pixel_angle(
   float field_of_view_radians, std::uint32_t index,
   std::uint32_t count)
@@ -242,12 +252,17 @@ sensor_msgs::msg::Image make_range_image(
   message.is_bigendian = std::endian::native == std::endian::big;
   message.step = source.width * static_cast<std::uint32_t>(sizeof(float));
   message.data.resize(source.pixels.size() * sizeof(float));
-  for (std::size_t index = 0; index < source.pixels.size(); ++index) {
-    const auto range = static_cast<float>(source.pixels[index]) * source.pixel_scale;
-    if (!std::isfinite(range)) {
-      throw std::invalid_argument("range image produces a non-finite distance");
+  auto * output = message.data.data();
+  for (std::uint32_t row = 0; row < source.height; ++row) {
+    const auto * input = source.pixels.data() + vendor_row_offset(source.width, source.height, row);
+    for (std::uint32_t column = 0; column < source.width; ++column) {
+      const auto range = static_cast<float>(input[column]) * source.pixel_scale;
+      if (!std::isfinite(range)) {
+        throw std::invalid_argument("range image produces a non-finite distance");
+      }
+      std::memcpy(output, &range, sizeof(float));
+      output += sizeof(float);
     }
-    std::memcpy(message.data.data() + index * sizeof(float), &range, sizeof(float));
   }
   return message;
 }
@@ -309,7 +324,13 @@ sensor_msgs::msg::Image make_bitmap_image(
   message.encoding = "mono8";
   message.is_bigendian = false;
   message.step = source.width;
-  message.data = source.pixels;
+  message.data.resize(source.pixels.size());
+  for (std::uint32_t row = 0; row < source.height; ++row) {
+    std::memcpy(
+      message.data.data() + static_cast<std::size_t>(row) * source.width,
+      source.pixels.data() + vendor_row_offset(source.width, source.height, row),
+      source.width);
+  }
   return message;
 }
 

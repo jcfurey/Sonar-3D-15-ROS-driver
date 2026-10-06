@@ -1,6 +1,7 @@
-sonar3d_driver:
+/**/sonar3d_driver:
   ros__parameters:
     sonar_ip: "192.168.194.96"
+    fallback_ip: "192.168.194.96"
     frame_id: "sonar3d_link"
     imu_frame_id: "sonar3d_imu_link"
     configure_sonar: true
@@ -10,9 +11,9 @@ sonar3d_driver:
     multicast_port: 4747
     multicast_interface: "0.0.0.0"
     udp_receive_buffer_size: 1048576
-    poll_period: 0.01
-    max_packets_per_spin: 32
     use_sensor_timestamps: true
+    max_sensor_clock_offset: 1.0
+    publish_tf: true
     publish_point_cloud: true
     publish_range_image: true
     publish_bitmap_images: true

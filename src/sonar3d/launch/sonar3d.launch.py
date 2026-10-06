@@ -8,55 +8,107 @@
 """Launch the native Water Linked Sonar 3D-15 ROS 2 driver."""
 
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument
+from launch.actions import DeclareLaunchArgument, OpaqueFunction
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
-from launch_ros.actions import Node
+from launch_ros.actions import LoadComposableNodes, Node
+from launch_ros.descriptions import ComposableNode
 from launch_ros.substitutions import FindPackageShare
 
+# Driver parameters that may be overridden from the command line, with the
+# type each one is declared with. An empty argument keeps the params_file
+# value, so the YAML file stays authoritative unless an override is given.
+PARAMETER_TYPES = {
+    'sonar_ip': str,
+    'fallback_ip': str,
+    'frame_id': str,
+    'imu_frame_id': str,
+    'speed_of_sound': float,
+    'configure_sonar': bool,
+    'http_timeout': float,
+    'multicast_group': str,
+    'multicast_port': int,
+    'multicast_interface': str,
+    'udp_receive_buffer_size': int,
+    'use_sensor_timestamps': bool,
+    'max_sensor_clock_offset': float,
+    'publish_tf': bool,
+    'publish_point_cloud': bool,
+    'publish_range_image': bool,
+    'publish_bitmap_images': bool,
+    'publish_imu': bool,
+    'diagnostics_period': float,
+    'packet_stale_timeout': float,
+}
 
-def generate_launch_description():
-    """Declare platform-facing settings and launch the C++ component executable."""
-    defaults = {
-        'sonar_ip': '192.168.194.96',
-        'frame_id': 'sonar3d_link',
-        'imu_frame_id': 'sonar3d_imu_link',
-        'speed_of_sound': '0.0',
-        'configure_sonar': 'true',
-        'http_timeout': '5.0',
-        'multicast_group': '224.0.0.96',
-        'multicast_port': '4747',
-        'multicast_interface': '0.0.0.0',
-        'udp_receive_buffer_size': '1048576',
-        'poll_period': '0.01',
-        'max_packets_per_spin': '32',
-        'use_sensor_timestamps': 'true',
-        'publish_point_cloud': 'true',
-        'publish_range_image': 'true',
-        'publish_bitmap_images': 'true',
-        'publish_imu': 'true',
-        'diagnostics_period': '1.0',
-        'packet_stale_timeout': '2.0',
-    }
-    arguments = [
-        DeclareLaunchArgument(name, default_value=value)
-        for name, value in defaults.items()
-    ]
-    default_parameters = PathJoinSubstitution([
-        FindPackageShare('sonar3d'),
-        'config',
-        'sonar3d.yaml',
-    ])
-    driver = Node(
+
+def _convert(name, text, declared_type):
+    """Convert an argument to its declared type so rclcpp accepts it."""
+    if declared_type is bool:
+        if text.lower() not in ('true', 'false'):
+            raise ValueError(f'{name} must be true or false, got {text!r}')
+        return text.lower() == 'true'
+    try:
+        return declared_type(text)
+    except ValueError as error:
+        raise ValueError(f'{name} must be a {declared_type.__name__}, got {text!r}') from error
+
+
+def _driver(context):
+    overrides = {}
+    for name, declared_type in PARAMETER_TYPES.items():
+        text = LaunchConfiguration(name).perform(context)
+        if text:
+            overrides[name] = _convert(name, text, declared_type)
+    parameters = [LaunchConfiguration('params_file').perform(context)]
+    if overrides:
+        parameters.append(overrides)
+    namespace = LaunchConfiguration('namespace').perform(context)
+    container = LaunchConfiguration('container').perform(context)
+
+    if container:
+        return [LoadComposableNodes(
+            target_container=container,
+            composable_node_descriptions=[ComposableNode(
+                package='sonar3d',
+                plugin='sonar3d::SonarDriver',
+                name='sonar3d_driver',
+                namespace=namespace,
+                parameters=parameters,
+                extra_arguments=[{'use_intra_process_comms': True}],
+            )],
+        )]
+    return [Node(
         package='sonar3d',
         executable='sonar_publisher',
         name='sonar3d_driver',
+        namespace=namespace,
         output='screen',
-        parameters=[
-            default_parameters,
-            {
-                name: LaunchConfiguration(name)
-                for name in defaults
-            },
-        ],
-    )
-    return LaunchDescription(arguments + [driver])
+        parameters=parameters,
+        ros_arguments=['--log-level', LaunchConfiguration('log_level').perform(context)],
+    )]
+
+
+def generate_launch_description():
+    """Declare the parameter file, optional overrides, and how to run the driver."""
+    arguments = [
+        DeclareLaunchArgument(
+            'params_file',
+            default_value=PathJoinSubstitution(
+                [FindPackageShare('sonar3d'), 'config', 'sonar3d.yaml']),
+            description='Driver parameter file'),
+        DeclareLaunchArgument('namespace', default_value='', description='Driver namespace'),
+        DeclareLaunchArgument(
+            'container', default_value='',
+            description='Load the driver into this component container instead of its own '
+                        'process, with intra-process communication enabled'),
+        DeclareLaunchArgument(
+            'log_level', default_value='info',
+            description='Driver log level when it runs in its own process'),
+    ]
+    arguments += [
+        DeclareLaunchArgument(
+            name, default_value='',
+            description=f'Override {name} from params_file ({declared_type.__name__})')
+        for name, declared_type in PARAMETER_TYPES.items()
+    ]
+    return LaunchDescription(arguments + [OpaqueFunction(function=_driver)])

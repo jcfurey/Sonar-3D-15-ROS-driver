@@ -82,8 +82,10 @@ TEST(Conversions, BuildsRangeImageAndPointCloudContracts)
   EXPECT_EQ(image.header.stamp.nanosec, 456U);
   EXPECT_EQ(image.encoding, "32FC1");
   EXPECT_EQ(image.step, 12U);
-  EXPECT_FLOAT_EQ(read_float(image.data, 0), 1.0F);
-  EXPECT_FLOAT_EQ(read_float(image.data, 5U * sizeof(float)), 5.0F);
+  // The upper vendor row (pixels 300, 400, 500) is published first.
+  EXPECT_FLOAT_EQ(read_float(image.data, 0), 3.0F);
+  EXPECT_FLOAT_EQ(read_float(image.data, 3U * sizeof(float)), 1.0F);
+  EXPECT_FLOAT_EQ(read_float(image.data, 5U * sizeof(float)), 2.0F);
 
   const auto cloud = sonar3d::conversions::make_point_cloud(source, header);
   EXPECT_EQ(cloud.width, 5U);
@@ -112,7 +114,32 @@ TEST(Conversions, PreservesBitmapAndFallsBackToRosClock)
   EXPECT_EQ(image.header.stamp, fallback);
   EXPECT_EQ(image.encoding, "mono8");
   EXPECT_EQ(image.step, 2U);
-  EXPECT_EQ(image.data, source.pixels);
+  EXPECT_EQ(image.data, (std::vector<std::uint8_t>{128, 255, 0, 64}));
+}
+
+TEST(Conversions, ImagesAreUprightWithTheHighestElevationRowFirst)
+{
+  // Water Linked maps pixel row py to pitch = py / (height - 1) * fovV - fovV / 2
+  // with z = -r sin(pitch) in its z-down frame, so the last vendor row looks
+  // upward. Only that row has returns here.
+  auto range = test_range_image();
+  range.pixels = {0, 0, 0, 300, 400, 500};
+  const auto range_message = sonar3d::conversions::make_range_image(range, std_msgs::msg::Header{});
+  EXPECT_FLOAT_EQ(read_float(range_message.data, 0), 3.0F);
+  EXPECT_FLOAT_EQ(read_float(range_message.data, 2U * sizeof(float)), 5.0F);
+  EXPECT_FLOAT_EQ(read_float(range_message.data, 3U * sizeof(float)), 0.0F);
+  for (const auto & point : sonar3d::conversions::range_image_to_points(range)) {
+    EXPECT_GT(point.z, 0.0F);
+    EXPECT_GT(point.elevation, 0.0F);
+  }
+
+  sonar3d::protocol::BitmapImage bitmap;
+  bitmap.width = 3;
+  bitmap.height = 2;
+  bitmap.pixels = {1, 2, 3, 4, 5, 6};
+  EXPECT_EQ(
+    sonar3d::conversions::make_bitmap_image(bitmap, std_msgs::msg::Header{}).data,
+    (std::vector<std::uint8_t>{4, 5, 6, 1, 2, 3}));
 }
 
 TEST(Conversions, ReportsOnlyUsableSensorTimestampsAsNanoseconds)
@@ -242,8 +269,9 @@ TEST(Conversions, DirectBuffersMatchPixelGeometryAtFullResolutionAndDegenerateSi
           for (std::uint32_t row = 0; row < height; ++row) {
             for (std::uint32_t column = 0; column < width; ++column) {
               const auto pixel_index = row * width + column;
+              const auto image_index = (height - 1U - row) * width + column;
               const float distance = source.pixels[pixel_index] * source.pixel_scale;
-              EXPECT_FLOAT_EQ(read_float(image.data, pixel_index * sizeof(float)), distance);
+              EXPECT_FLOAT_EQ(read_float(image.data, image_index * sizeof(float)), distance);
               if (source.pixels[pixel_index] == 0) {
                 continue;
               }

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(sonar3d VERSION 0.3.0 LANGUAGES CXX)
+project(sonar3d VERSION 0.4.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -14,11 +14,15 @@ find_package(builtin_interfaces REQUIRED)
 find_package(CURL REQUIRED)
 find_package(diagnostic_msgs REQUIRED)
 find_package(generate_parameter_library REQUIRED)
+find_package(geometry_msgs REQUIRED)
 find_package(Protobuf REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(rclcpp_components REQUIRED)
+find_package(rosbag2_cpp REQUIRED)
+find_package(rosbag2_storage REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
+find_package(tf2_ros REQUIRED)
 find_package(ZLIB REQUIRED)
 
 # Ubuntu's libsnappy-dev exports Snappy::snappy on newer releases. Retain a
@@ -112,7 +116,10 @@ target_link_libraries(
     ${diagnostic_msgs_TARGETS}
     rclcpp::rclcpp
     ${sensor_msgs_TARGETS}
-  PRIVATE rclcpp_components::component
+    tf2_ros::tf2_ros
+  PRIVATE
+    ${geometry_msgs_TARGETS}
+    rclcpp_components::component
 )
 rclcpp_components_register_node(
   sonar3d_component
@@ -129,6 +136,8 @@ foreach(player_target IN ITEMS sonar_replay sonar_to_bag)
       sonar3d_protocol
       sonar3d_ros
       rclcpp::rclcpp
+      rosbag2_cpp::rosbag2_cpp
+      rosbag2_storage::rosbag2_storage
       ${sensor_msgs_TARGETS}
   )
 endforeach()
@@ -163,6 +172,7 @@ if(BUILD_TESTING)
     test/test_http_client.cpp
     test/test_protocol.cpp
     test/test_playback_clock.cpp
+    test/test_sensor_clock.cpp
     test/test_udp_receiver.cpp
     test/test_driver_stream.cpp
     test/test_recording_player.cpp
@@ -181,6 +191,10 @@ if(BUILD_TESTING)
   ament_add_gtest(test_playback_clock test/test_playback_clock.cpp)
   target_link_libraries(test_playback_clock sonar3d_protocol)
 
+  ament_add_gtest(test_sensor_clock test/test_sensor_clock.cpp)
+  target_include_directories(
+    test_sensor_clock PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+
   ament_add_gtest(test_udp_receiver test/test_udp_receiver.cpp)
   target_link_libraries(test_udp_receiver sonar3d_io)
 
@@ -189,7 +203,8 @@ if(BUILD_TESTING)
 
   ament_add_gtest(test_recording_player test/test_recording_player.cpp TIMEOUT 30)
   target_link_libraries(
-    test_recording_player sonar3d_ros rclcpp::rclcpp protobuf::libprotobuf ZLIB::ZLIB
+    test_recording_player
+    sonar3d_ros rclcpp::rclcpp rosbag2_cpp::rosbag2_cpp protobuf::libprotobuf ZLIB::ZLIB
   )
   target_include_directories(test_recording_player PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
   target_compile_definitions(
@@ -210,5 +225,6 @@ ament_export_dependencies(
   rclcpp
   sensor_msgs
   std_msgs
+  tf2_ros
 )
 ament_package()
