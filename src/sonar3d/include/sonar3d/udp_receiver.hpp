@@ -30,9 +30,22 @@ struct Datagram
 [[nodiscard]] std::optional<std::uint32_t> parse_ipv4(const std::string & text);
 [[nodiscard]] std::string format_ipv4(std::uint32_t address);
 
+struct UdpReceiverOptions
+{
+  std::uint16_t port{4747};
+  // Multicast: the interface that joins the group. Unicast: the local address
+  // to bind; 0.0.0.0 accepts the port on every interface.
+  std::string interface_address{"0.0.0.0"};
+  // Empty receives unicast datagrams instead of joining a group.
+  std::string multicast_group{"224.0.0.96"};
+  // Zero keeps the OS default.
+  int receive_buffer_size{1024 * 1024};
+};
+
 class UdpReceiver
 {
 public:
+  explicit UdpReceiver(const UdpReceiverOptions & options);
   UdpReceiver(
     const std::string & multicast_group, std::uint16_t port,
     const std::string & interface_address, int receive_buffer_size = 1024 * 1024);

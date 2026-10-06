@@ -31,8 +31,64 @@ sonar3d:
 
   speed_of_sound:
     type: double
+    default_value: -1.0
+    description: "Speed of sound to configure in m/s. Negative keeps the device setting; zero selects the sonar's automatic calculation from salinity and water temperature; otherwise 1000-2000 m/s."
+    validation:
+      bounds<>: [-1.0, 2000.0]
+
+  salinity:
+    type: string
+    default_value: ""
+    description: "Water salinity for the automatic speed of sound: fresh or salt (sonar release 1.7.0+). Empty keeps the device setting."
+    validation:
+      one_of<>: [["", "fresh", "salt"]]
+
+  acoustics_mode:
+    type: string
+    default_value: ""
+    description: "low-frequency (5 Hz, 90 x 40 degrees) or high-frequency (20 Hz, 40 x 40 degrees), sonar release 1.7.0+. Empty keeps the device setting."
+    validation:
+      one_of<>: [["", "low-frequency", "high-frequency"]]
+
+  range_min:
+    type: double
     default_value: 0.0
-    description: "Speed of sound to configure in m/s. Zero preserves the device setting; nonzero values must be in [1000, 2000]."
+    description: "Minimum imaging range in metres, applied with range_max."
+    validation:
+      bounds<>: [0.0, 100.0]
+
+  range_max:
+    type: double
+    default_value: 0.0
+    description: "Maximum imaging range in metres. Zero keeps the device range; otherwise it must exceed range_min."
+    validation:
+      bounds<>: [0.0, 100.0]
+
+  ntp_server:
+    type: string
+    default_value: ""
+    description: "NTP server address, or auto, for the sonar clock (sonar release 1.7.1+). Empty keeps the device setting. The setting persists on the sonar."
+
+  ntp_sync_timeout:
+    type: double
+    default_value: 0.0
+    description: "When positive, force an NTP sync during configuration and wait up to this many seconds for it."
+    validation:
+      bounds<>: [0.0, 60.0]
+
+  http_port:
+    type: int
+    default_value: 80
+    description: "TCP port of the sonar HTTP API."
+    validation:
+      bounds<>: [1, 65535]
+
+  device_status_period:
+    type: double
+    default_value: 5.0
+    description: "Seconds between reads of the sonar's status, temperature and time over HTTP while configured; reported as the Device diagnostic. Zero disables polling."
+    validation:
+      bounds<>: [0.0, 3600.0]
 
   http_timeout:
     type: double
@@ -41,22 +97,29 @@ sonar3d:
     validation:
       bounds<>: [0.1, 60.0]
 
+  udp_mode:
+    type: string
+    default_value: "multicast"
+    description: "multicast receives the sonar's multicast group; unicast receives datagrams addressed to interface_address and, with configure_sonar, points the sonar's output there."
+    validation:
+      one_of<>: [["multicast", "unicast"]]
+
   multicast_group:
     type: string
     default_value: "224.0.0.96"
-    description: "IPv4 multicast group carrying RIP packets."
+    description: "IPv4 multicast group carrying RIP packets in multicast mode."
 
-  multicast_port:
+  udp_port:
     type: int
     default_value: 4747
     description: "UDP port carrying RIP packets."
     validation:
       bounds<>: [1, 65535]
 
-  multicast_interface:
+  interface_address:
     type: string
     default_value: "0.0.0.0"
-    description: "Local IPv4 interface address used for multicast membership."
+    description: "Local IPv4 address. Multicast: the interface that joins the group. Unicast: the address the socket binds and, with configure_sonar, where the sonar sends; it must then be this computer's address on the sonar network."
 
   udp_receive_buffer_size:
     type: int
@@ -81,6 +144,11 @@ sonar3d:
     type: bool
     default_value: true
     description: "Broadcast the documented static transform from frame_id to imu_frame_id on /tf_static."
+
+  point_cloud_intensity:
+    type: bool
+    default_value: true
+    description: "Add an intensity field with linear signal strength from the same shot's signal-strength image to the point cloud."
 
   publish_point_cloud:
     type: bool

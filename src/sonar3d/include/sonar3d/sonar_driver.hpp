@@ -8,7 +8,9 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -25,10 +27,13 @@
 #include <sensor_msgs/msg/image.hpp>
 #include <sensor_msgs/msg/imu.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
+#include <std_msgs/msg/header.hpp>
 #include <tf2_ros/static_transform_broadcaster.hpp>
 
 #include "sonar3d/conversions.hpp"
+#include "sonar3d/http_client.hpp"
 #include "sonar3d/protocol.hpp"
+#include "sonar3d/range_signal_pairing.hpp"
 #include "sonar3d/sensor_clock.hpp"
 #include "sonar3d/sonar3d_parameters.hpp"
 #include "sonar3d/udp_receiver.hpp"
@@ -37,11 +42,12 @@ namespace sonar3d
 {
 
 // Managed (lifecycle) Sonar 3D-15 driver.
-//   configure:  validate parameters, open the multicast socket, create
-//               publishers, broadcast the IMU transform, start HTTP setup.
+//   configure:  validate parameters, open the UDP socket, create publishers,
+//               broadcast the IMU transform, start HTTP setup and device
+//               status polling.
 //   activate:   discard queued datagrams and start streaming.
 //   deactivate: stop streaming; the socket and device setup are kept.
-//   cleanup:    release the socket, publishers and HTTP setup.
+//   cleanup:    release the socket, publishers, HTTP setup and polling.
 // /diagnostics is published in every state.
 class SonarDriver final : public rclcpp_lifecycle::LifecycleNode
 {
@@ -85,6 +91,7 @@ private:
     std::atomic<std::uint64_t> sequence_resets{0};
     std::atomic<std::uint64_t> socket_errors{0};
     std::atomic<std::uint64_t> sensor_clock_fallbacks{0};
+    std::atomic<std::uint64_t> unpaired_range_images{0};
   };
 
   // Which clock stamps the products: no sensor timestamp seen yet, the sonar's
@@ -118,6 +125,29 @@ private:
     std::int64_t max_sensor_clock_offset_ns{0};
     conversions::ImuNoise imu_noise;
     double packet_stale_timeout{2.0};
+    bool point_cloud_intensity{true};
+    std::uint16_t http_port{80};
+    std::chrono::milliseconds http_timeout{5000};
+  };
+
+  // A range image waiting for its signal-strength image.
+  struct CloudContext
+  {
+    std_msgs::msg::Header header;
+    std::chrono::steady_clock::time_point arrived;
+  };
+  using CloudPairing = RangeSignalPairing<CloudContext>;
+
+  // Latest sonar HTTP API readings, written by device_status_thread_.
+  struct DeviceStatus
+  {
+    std::optional<DeviceInfo> info;
+    std::map<std::string, StatusEntry> components;
+    std::optional<double> temperature;
+    std::optional<TimeStatus> time;
+    // Empty after a successful poll.
+    std::string error;
+    std::int64_t last_success_steady_ns{-1};
   };
 
   void configure_driver();
@@ -131,11 +161,15 @@ private:
   [[nodiscard]] bool accepts_source(std::uint32_t source_address) const;
   void handle_datagram(const Datagram & datagram);
   void handle_range_image(
-    const protocol::RangeImage & image,
+    protocol::RangeImage && image,
     const builtin_interfaces::msg::Time & fallback_stamp);
   void handle_bitmap_image(
-    const protocol::BitmapImage & image,
+    protocol::BitmapImage && image,
     const builtin_interfaces::msg::Time & fallback_stamp);
+  void publish_cloud(CloudPairing::Pair && pair);
+  // Publish a waiting range image without intensity once its signal image is
+  // overdue; returns how long the receive thread may wait.
+  [[nodiscard]] std::chrono::milliseconds release_overdue_cloud();
   void handle_imu_batch(
     const protocol::ImuBatch & batch,
     const builtin_interfaces::msg::Time & fallback_stamp);
@@ -147,8 +181,12 @@ private:
     const builtin_interfaces::msg::Time & receive_stamp);
   void observe_sequence(SequenceState & state, std::uint32_t sequence_id);
   void diagnose_stream(diagnostic_updater::DiagnosticStatusWrapper & status);
+  void diagnose_device(diagnostic_updater::DiagnosticStatusWrapper & status);
   void publish_imu_transform();
-  void start_configuration(double speed_of_sound, bool imu_output, double timeout_seconds);
+  void start_configuration(const ConfigurationRequest & request);
+  void start_device_polling(std::chrono::milliseconds period);
+  void poll_device(const std::stop_token & stop, std::chrono::milliseconds period);
+  void stop_device_polling();
 
   std::shared_ptr<ParamListener> parameter_listener_;
   // Driver parameters may change only while unconfigured; configure applies them.
@@ -175,6 +213,7 @@ private:
   // jump above the estimate is treated as a sonar clock step.
   SensorClockOffset clock_offset_{10'000'000'000, 1'000'000'000};
   std::unordered_set<std::uint32_t> warned_sources_;
+  CloudPairing pairing_;
 
   // Shared with the diagnostics timer.
   Metrics metrics_;
@@ -189,6 +228,12 @@ private:
   std::string configuration_error_;
   std::vector<std::string> configuration_unsupported_;
   std::jthread configuration_thread_;
+
+  std::mutex device_mutex_;
+  DeviceStatus device_;
+  bool device_polling_{false};
+  std::string device_hardware_id_;
+  std::jthread device_status_thread_;
 
   // The sonar images at 5 Hz (low frequency mode) or 20 Hz (high frequency).
   double minimum_range_rate_{5.0};

@@ -5,15 +5,25 @@
     frame_id: "sonar3d_link"
     imu_frame_id: "sonar3d_imu_link"
     configure_sonar: true
-    speed_of_sound: 0.0
+    speed_of_sound: -1.0
+    salinity: ""
+    acoustics_mode: ""
+    range_min: 0.0
+    range_max: 0.0
+    ntp_server: ""
+    ntp_sync_timeout: 0.0
+    http_port: 80
     http_timeout: 5.0
+    device_status_period: 5.0
+    udp_mode: "multicast"
     multicast_group: "224.0.0.96"
-    multicast_port: 4747
-    multicast_interface: "0.0.0.0"
+    udp_port: 4747
+    interface_address: "0.0.0.0"
     udp_receive_buffer_size: 1048576
     use_sensor_timestamps: true
     max_sensor_clock_offset: 1.0
     publish_tf: true
+    point_cloud_intensity: true
     publish_point_cloud: true
     publish_range_image: true
     publish_bitmap_images: true

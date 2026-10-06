@@ -85,13 +85,19 @@ UdpReceiver::UdpReceiver(
   std::uint16_t port,
   const std::string & interface_address,
   int receive_buffer_size)
+: UdpReceiver(UdpReceiverOptions{port, interface_address, multicast_group, receive_buffer_size})
 {
-  if (port == 0) {
-    throw std::invalid_argument("multicast_port must be greater than zero");
+}
+
+UdpReceiver::UdpReceiver(const UdpReceiverOptions & options)
+{
+  if (options.port == 0) {
+    throw std::invalid_argument("udp_port must be greater than zero");
   }
-  if (receive_buffer_size < 0) {
+  if (options.receive_buffer_size < 0) {
     throw std::invalid_argument("receive_buffer_size must not be negative");
   }
+  const bool multicast = !options.multicast_group.empty();
 
   socket_ = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC | SOCK_NONBLOCK, IPPROTO_UDP);
   if (socket_ < 0) {
@@ -102,21 +108,27 @@ UdpReceiver::UdpReceiver(
     close_and_throw(socket_, -1, "create receiver wake event");
   }
 
-  const auto group = parse_ipv4_parameter(multicast_group, "multicast_group", socket_,
-      wake_event_);
-  if (!IN_MULTICAST(ntohl(group.s_addr))) {
-    close_descriptors(socket_, wake_event_);
-    throw std::invalid_argument("multicast_group is not an IPv4 multicast address");
-  }
   const auto interface = parse_ipv4_parameter(
-    interface_address, "multicast_interface", socket_, wake_event_);
-
-  const int reuse_address = 1;
-  if (setsockopt(socket_, SOL_SOCKET, SO_REUSEADDR, &reuse_address, sizeof(reuse_address)) < 0) {
-    close_and_throw(socket_, wake_event_, "enable SO_REUSEADDR");
+    options.interface_address, "interface_address", socket_, wake_event_);
+  in_addr group{};
+  if (multicast) {
+    group = parse_ipv4_parameter(options.multicast_group, "multicast_group", socket_, wake_event_);
+    if (!IN_MULTICAST(ntohl(group.s_addr))) {
+      close_descriptors(socket_, wake_event_);
+      throw std::invalid_argument("multicast_group is not an IPv4 multicast address");
+    }
+    // Several programs may listen to one multicast group. Unicast sockets do
+    // not share a port: Linux would deliver each datagram to only one of them.
+    const int reuse_address = 1;
+    if (setsockopt(socket_, SOL_SOCKET, SO_REUSEADDR, &reuse_address,
+      sizeof(reuse_address)) < 0)
+    {
+      close_and_throw(socket_, wake_event_, "enable SO_REUSEADDR");
+    }
   }
-  if (receive_buffer_size > 0 && setsockopt(
-      socket_, SOL_SOCKET, SO_RCVBUF, &receive_buffer_size, sizeof(receive_buffer_size)) < 0)
+  if (options.receive_buffer_size > 0 && setsockopt(
+      socket_, SOL_SOCKET, SO_RCVBUF, &options.receive_buffer_size,
+      sizeof(options.receive_buffer_size)) < 0)
   {
     close_and_throw(socket_, wake_event_, "set UDP receive buffer size");
   }
@@ -129,17 +141,20 @@ UdpReceiver::UdpReceiver(
 
   sockaddr_in bind_address{};
   bind_address.sin_family = AF_INET;
-  bind_address.sin_port = htons(port);
-  bind_address.sin_addr.s_addr = htonl(INADDR_ANY);
+  bind_address.sin_port = htons(options.port);
+  bind_address.sin_addr = multicast ? in_addr{htonl(INADDR_ANY)} : interface;
   if (bind(socket_, reinterpret_cast<const sockaddr *>(&bind_address), sizeof(bind_address)) < 0) {
-    close_and_throw(socket_, wake_event_, "bind multicast UDP socket");
+    close_and_throw(socket_, wake_event_, multicast ? "bind multicast UDP socket" :
+      "bind unicast UDP socket");
   }
 
-  ip_mreq membership{};
-  membership.imr_multiaddr = group;
-  membership.imr_interface = interface;
-  if (setsockopt(socket_, IPPROTO_IP, IP_ADD_MEMBERSHIP, &membership, sizeof(membership)) < 0) {
-    close_and_throw(socket_, wake_event_, "join multicast group");
+  if (multicast) {
+    ip_mreq membership{};
+    membership.imr_multiaddr = group;
+    membership.imr_interface = interface;
+    if (setsockopt(socket_, IPPROTO_IP, IP_ADD_MEMBERSHIP, &membership, sizeof(membership)) < 0) {
+      close_and_throw(socket_, wake_event_, "join multicast group");
+    }
   }
 }
 
@@ -167,7 +182,7 @@ std::optional<Datagram> UdpReceiver::receive()
     return std::nullopt;
   }
   if (received < 0) {
-    throw std::system_error(errno, std::generic_category(), "receive multicast UDP packet");
+    throw std::system_error(errno, std::generic_category(), "receive UDP packet");
   }
 
   Datagram datagram;
@@ -189,7 +204,7 @@ bool UdpReceiver::wait(std::chrono::milliseconds timeout)
     ready = poll(descriptors.data(), descriptors.size(), timeout_ms);
   } while (ready < 0 && errno == EINTR);
   if (ready < 0) {
-    throw std::system_error(errno, std::generic_category(), "wait for multicast UDP packet");
+    throw std::system_error(errno, std::generic_category(), "wait for UDP packet");
   }
   // The wake event is never drained, so an interrupt is permanent.
   if (descriptors[1].revents != 0) {

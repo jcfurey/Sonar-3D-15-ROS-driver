@@ -163,7 +163,8 @@ void for_each_range_point(const protocol::RangeImage & image, Output output)
     const auto cosine_pitch = std::cos(pitch);
     const auto sine_pitch = std::sin(pitch);
     for (std::uint32_t column = 0; column < image.width; ++column) {
-      const auto pixel = image.pixels[static_cast<std::size_t>(row) * image.width + column];
+      const auto index = static_cast<std::size_t>(row) * image.width + column;
+      const auto pixel = image.pixels[index];
       if (pixel == 0) {
         continue;
       }
@@ -179,9 +180,48 @@ void for_each_range_point(const protocol::RangeImage & image, Output output)
             distance,
             -direction.yaw,
             pitch,
-        });
+        }, index);
     }
   }
+}
+
+// Water Linked encodes signal strength as pixel = 100 log10(strength / 30);
+// zero means no return. Decoded as by wlsonar's strength_linear helper.
+[[nodiscard]] const std::array<float, 256> & linear_strength_table()
+{
+  static const auto table = [] {
+      std::array<float, 256> values{};
+      for (std::size_t pixel = 1; pixel < values.size(); ++pixel) {
+        values[pixel] = static_cast<float>(
+          std::round(30.0 * std::pow(10.0, static_cast<double>(pixel) / 100.0)));
+      }
+      return values;
+    }();
+  return table;
+}
+
+// A compile-time layout keeps the per-point copy a fixed-size store.
+template<bool kIntensity>
+void fill_cloud(
+  const protocol::RangeImage & source, const protocol::BitmapImage * signal,
+  std::uint8_t * output)
+{
+  constexpr std::size_t kFieldCount = kIntensity ? 7U : 6U;
+  const auto & strength = linear_strength_table();
+  for_each_range_point(
+    source, [&](const RangePoint & point, std::size_t index) {
+      std::array<float, kFieldCount> values{};
+      if constexpr (kIntensity) {
+        // Both images share the vendor pixel grid; no signal means unknown.
+        const auto intensity = signal != nullptr ? strength[signal->pixels[index]] : 0.0F;
+        values = {point.x, point.y, point.z, intensity, point.range, point.azimuth,
+          point.elevation};
+      } else {
+        values = {point.x, point.y, point.z, point.range, point.azimuth, point.elevation};
+      }
+      std::memcpy(output, values.data(), sizeof(values));
+      output += sizeof(values);
+    });
 }
 
 }  // namespace
@@ -206,7 +246,8 @@ std::vector<RangePoint> range_image_to_points(const protocol::RangeImage & image
   validate_range_image(image, true);
   std::vector<RangePoint> points;
   points.reserve(image.pixels.size());
-  for_each_range_point(image, [&points](const RangePoint & point) {points.push_back(point);});
+  for_each_range_point(
+    image, [&points](const RangePoint & point, std::size_t) {points.push_back(point);});
   return points;
 }
 
@@ -267,16 +308,39 @@ sensor_msgs::msg::Image make_range_image(
   return message;
 }
 
+void validate_point_cloud_source(const protocol::RangeImage & image)
+{
+  validate_range_image(image, true);
+}
+
+float linear_signal_strength(std::uint8_t pixel)
+{
+  return linear_strength_table()[pixel];
+}
+
 sensor_msgs::msg::PointCloud2 make_point_cloud(
   const protocol::RangeImage & source,
-  const std_msgs::msg::Header & header)
+  const std_msgs::msg::Header & header,
+  bool with_intensity,
+  const protocol::BitmapImage * signal)
 {
-  constexpr std::uint32_t kFieldCount = 6;
-  constexpr std::uint32_t kPointStep = kFieldCount * sizeof(float);
   validate_range_image(source, true);
+  if (signal != nullptr) {
+    if (!with_intensity) {
+      throw std::invalid_argument("a signal image needs the intensity field");
+    }
+    if (signal->type != protocol::BitmapImageType::SIGNAL_STRENGTH_IMAGE ||
+      signal->width != source.width || signal->height != source.height ||
+      signal->pixels.size() != source.pixels.size())
+    {
+      throw std::invalid_argument("signal-strength image does not match the range image");
+    }
+  }
+  const std::uint32_t field_count = with_intensity ? 7U : 6U;
+  const auto point_step = field_count * static_cast<std::uint32_t>(sizeof(float));
   const auto point_count = static_cast<std::size_t>(std::count_if(
       source.pixels.begin(), source.pixels.end(), [](std::uint32_t pixel) {return pixel != 0;}));
-  if (point_count > std::numeric_limits<std::uint32_t>::max()) {
+  if (point_count > std::numeric_limits<std::uint32_t>::max() / point_step) {
     throw std::length_error("point cloud contains too many points for PointCloud2");
   }
 
@@ -284,29 +348,28 @@ sensor_msgs::msg::PointCloud2 make_point_cloud(
   message.header = header;
   message.height = 1;
   message.width = static_cast<std::uint32_t>(point_count);
-  message.fields = {
-    point_field("x", 0),
-    point_field("y", 4),
-    point_field("z", 8),
-    point_field("range", 12),
-    point_field("azimuth", 16),
-    point_field("elevation", 20),
-  };
+  if (with_intensity) {
+    message.fields = {
+      point_field("x", 0), point_field("y", 4), point_field("z", 8),
+      point_field("intensity", 12), point_field("range", 16), point_field("azimuth", 20),
+      point_field("elevation", 24),
+    };
+  } else {
+    message.fields = {
+      point_field("x", 0), point_field("y", 4), point_field("z", 8),
+      point_field("range", 12), point_field("azimuth", 16), point_field("elevation", 20),
+    };
+  }
   message.is_bigendian = std::endian::native == std::endian::big;
-  message.point_step = kPointStep;
+  message.point_step = point_step;
   message.row_step = message.point_step * message.width;
   message.is_dense = true;
   message.data.resize(static_cast<std::size_t>(message.row_step));
 
-  if (point_count != 0) {
-    std::size_t offset = 0;
-    for_each_range_point(source, [&message, &offset](const RangePoint & point) {
-        const std::array<float, kFieldCount> values{
-          point.x, point.y, point.z, point.range, point.azimuth, point.elevation,
-        };
-        std::memcpy(message.data.data() + offset, values.data(), kPointStep);
-        offset += kPointStep;
-      });
+  if (point_count != 0 && with_intensity) {
+    fill_cloud<true>(source, signal, message.data.data());
+  } else if (point_count != 0) {
+    fill_cloud<false>(source, signal, message.data.data());
   }
   return message;
 }

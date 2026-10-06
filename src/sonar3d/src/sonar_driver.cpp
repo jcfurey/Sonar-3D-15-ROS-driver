@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
 #include <optional>
@@ -37,6 +38,9 @@ namespace
 
 using diagnostic_msgs::msg::DiagnosticStatus;
 
+// The sonar sends a shot's range and signal-strength images back to back.
+constexpr std::chrono::milliseconds kSignalImageWait{25};
+
 [[nodiscard]] std::int64_t steady_time_nanoseconds()
 {
   return std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -58,6 +62,19 @@ using diagnostic_msgs::msg::DiagnosticStatus;
 [[nodiscard]] std::uint64_t value(const std::atomic<std::uint64_t> & counter)
 {
   return counter.load(std::memory_order_relaxed);
+}
+
+[[nodiscard]] std::chrono::milliseconds seconds_to_milliseconds(double seconds)
+{
+  return std::chrono::milliseconds(static_cast<std::int64_t>(std::llround(seconds * 1000.0)));
+}
+
+[[nodiscard]] unsigned char diagnostic_level(const StatusEntry & entry)
+{
+  if (!entry.operational || entry.status == "error") {
+    return DiagnosticStatus::ERROR;
+  }
+  return entry.status == "ok" ? DiagnosticStatus::OK : DiagnosticStatus::WARN;
 }
 
 }  // namespace
@@ -98,6 +115,7 @@ SonarDriver::SonarDriver(const rclcpp::NodeOptions & options)
     });
   diagnostics_.setHardwareID("Sonar 3D-15");
   diagnostics_.add("RIP stream", this, &SonarDriver::diagnose_stream);
+  diagnostics_.add("Device", this, &SonarDriver::diagnose_device);
 
   if (parameter_listener_->get_params().autostart) {
     // Transition once the executor spins the node, so a component container
@@ -115,6 +133,7 @@ SonarDriver::~SonarDriver()
 {
   stop_streaming();
   stop_configuration();
+  stop_device_polling();
 }
 
 SonarDriver::CallbackReturn SonarDriver::on_configure(const rclcpp_lifecycle::State &)
@@ -132,9 +151,26 @@ SonarDriver::CallbackReturn SonarDriver::on_configure(const rclcpp_lifecycle::St
 void SonarDriver::configure_driver()
 {
   const auto parameters = parameter_listener_->get_params();
-  validate_configuration(parameters.speed_of_sound, parameters.http_timeout);
-  if (parameters.configure_sonar && parameters.sonar_ip.empty()) {
-    throw std::invalid_argument("sonar_ip must not be empty when configure_sonar is true");
+  const bool unicast = parameters.udp_mode == "unicast";
+  ConfigurationRequest request;
+  request.speed_of_sound = parameters.speed_of_sound;
+  request.salinity = parameters.salinity;
+  request.acoustics_mode = parameters.acoustics_mode;
+  request.range_min = parameters.range_min;
+  request.range_max = parameters.range_max;
+  if (unicast) {
+    request.udp_output = {
+      UdpOutputMode::UNICAST, parameters.interface_address,
+      static_cast<std::uint16_t>(parameters.udp_port)};
+  }
+  request.imu_output = parameters.publish_imu;
+  request.ntp_server = parameters.ntp_server;
+  request.ntp_sync_timeout = parameters.ntp_sync_timeout;
+  if (parameters.configure_sonar) {
+    if (parameters.sonar_ip.empty()) {
+      throw std::invalid_argument("sonar_ip must not be empty when configure_sonar is true");
+    }
+    validate_configuration(request, parameters.http_timeout);
   }
 
   Settings settings;
@@ -162,13 +198,17 @@ void SonarDriver::configure_driver()
   settings.max_sensor_clock_offset_ns = std::llround(parameters.max_sensor_clock_offset * 1.0e9);
   settings.imu_noise = {parameters.linear_acceleration_stddev, parameters.angular_velocity_stddev};
   settings.packet_stale_timeout = parameters.packet_stale_timeout;
+  settings.point_cloud_intensity = parameters.point_cloud_intensity;
+  settings.http_port = static_cast<std::uint16_t>(parameters.http_port);
+  settings.http_timeout = seconds_to_milliseconds(parameters.http_timeout);
   settings_ = std::move(settings);
 
-  receiver_ = std::make_unique<UdpReceiver>(
-    parameters.multicast_group,
-    static_cast<std::uint16_t>(parameters.multicast_port),
-    parameters.multicast_interface,
-    static_cast<int>(parameters.udp_receive_buffer_size));
+  UdpReceiverOptions receiver;
+  receiver.port = static_cast<std::uint16_t>(parameters.udp_port);
+  receiver.interface_address = parameters.interface_address;
+  receiver.multicast_group = unicast ? "" : parameters.multicast_group;
+  receiver.receive_buffer_size = static_cast<int>(parameters.udp_receive_buffer_size);
+  receiver_ = std::make_unique<UdpReceiver>(receiver);
 
   // REP-2003: drivers publish with SystemDefaultsQoS (reliable) so that both
   // reliable subscribers and SensorDataQoS (best-effort) subscribers connect.
@@ -195,14 +235,20 @@ void SonarDriver::configure_driver()
     static_transform_broadcaster_ = std::make_unique<tf2_ros::StaticTransformBroadcaster>(*this);
     publish_imu_transform();
   }
+  device_hardware_id_.clear();
   diagnostics_.setHardwareID(settings_.sonar_ip.empty() ? "any Sonar 3D-15" : settings_.sonar_ip);
 
-  RCLCPP_INFO(
-    get_logger(),
-    "Listening for Sonar 3D-15 RIP1/RIP2 packets on %s:%ld via interface %s",
-    parameters.multicast_group.c_str(),
-    parameters.multicast_port,
-    parameters.multicast_interface.c_str());
+  if (unicast) {
+    RCLCPP_INFO(
+      get_logger(), "Listening for Sonar 3D-15 RIP1/RIP2 unicast packets on %s:%ld",
+      parameters.interface_address.c_str(), parameters.udp_port);
+  } else {
+    RCLCPP_INFO(
+      get_logger(),
+      "Listening for Sonar 3D-15 RIP1/RIP2 packets on %s:%ld via interface %s",
+      parameters.multicast_group.c_str(), parameters.udp_port,
+      parameters.interface_address.c_str());
+  }
   if (settings_.sonar_address && settings_.fallback_address &&
     *settings_.sonar_address != *settings_.fallback_address)
   {
@@ -214,8 +260,10 @@ void SonarDriver::configure_driver()
   }
 
   if (parameters.configure_sonar) {
-    start_configuration(parameters.speed_of_sound, parameters.publish_imu,
-      parameters.http_timeout);
+    start_configuration(request);
+  }
+  if (!settings_.sonar_ip.empty() && parameters.device_status_period > 0.0) {
+    start_device_polling(seconds_to_milliseconds(parameters.device_status_period));
   }
 }
 
@@ -230,6 +278,7 @@ SonarDriver::CallbackReturn SonarDriver::on_activate(const rclcpp_lifecycle::Sta
   clock_offset_.reset();
   timestamp_source_.store(TimestampSource::NONE);
   last_valid_packet_steady_ns_.store(-1);
+  pairing_.clear();
   // Datagrams queued while inactive are stale; start from the live stream.
   receiver_->clear_interrupt();
   const auto discarded = receiver_->discard_pending();
@@ -296,6 +345,7 @@ void SonarDriver::stop_configuration()
 void SonarDriver::release()
 {
   stop_configuration();
+  stop_device_polling();
   configuration_state_.store(ConfigurationState::DISABLED);
   static_transform_broadcaster_.reset();
   range_image_publisher_.reset();
@@ -322,8 +372,7 @@ void SonarDriver::publish_imu_transform()
   static_transform_broadcaster_->sendTransform(transform);
 }
 
-void SonarDriver::start_configuration(
-  double speed_of_sound, bool imu_output, double timeout_seconds)
+void SonarDriver::start_configuration(const ConfigurationRequest & request)
 {
   {
     std::lock_guard<std::mutex> lock(configuration_mutex_);
@@ -331,17 +380,13 @@ void SonarDriver::start_configuration(
     configuration_unsupported_.clear();
   }
   configuration_state_.store(ConfigurationState::PENDING);
-  const auto timeout = std::chrono::milliseconds(
-    static_cast<std::int64_t>(std::llround(timeout_seconds * 1000.0)));
   configuration_thread_ = std::jthread(
-    [this, speed_of_sound, imu_output, timeout, sonar_ip = settings_.sonar_ip](
-      std::stop_token stop_token) {
+    [this, request, sonar_ip = settings_.sonar_ip, port = settings_.http_port,
+    timeout = settings_.http_timeout](std::stop_token stop_token) {
+      const auto stopping = [&stop_token]() {return stop_token.stop_requested();};
       try {
-        HttpSonarApi api(sonar_ip, timeout);
-        const auto result = configure_sonar(
-          api,
-          {speed_of_sound, imu_output},
-          [&stop_token]() {return stop_token.stop_requested();});
+        HttpSonarApi api(sonar_ip, timeout, stopping, port);
+        const auto result = configure_sonar(api, request, stopping);
         if (stop_token.stop_requested()) {
           configuration_state_.store(ConfigurationState::DISABLED);
           return;
@@ -355,9 +400,19 @@ void SonarDriver::start_configuration(
         if (!result.unsupported.empty()) {
           RCLCPP_WARN(
             get_logger(),
-            "The sonar firmware does not provide public ImuBatch output (sonar release 1.8.0 or "
-            "newer is required), so imu/data_raw stays silent. Set publish_imu:=false to "
-            "silence this warning.");
+            "The sonar firmware does not provide %s; update the sonar or stop requesting them. "
+            "Salinity and acoustics mode need release 1.7.0, NTP 1.7.1 and ImuBatch output "
+            "(imu/data_raw) 1.8.0.",
+            join(result.unsupported).c_str());
+        }
+        if (result.ntp_sync && result.ntp_sync->success) {
+          RCLCPP_INFO(
+            get_logger(), "Sonar clock synchronized to %s",
+            result.ntp_sync->status.ntp_synced_to.c_str());
+        } else if (result.ntp_sync) {
+          RCLCPP_WARN(
+            get_logger(), "Sonar NTP sync did not complete: %s",
+            result.ntp_sync->message.c_str());
         }
       } catch (const std::exception & error) {
         {
@@ -372,33 +427,150 @@ void SonarDriver::start_configuration(
     });
 }
 
+void SonarDriver::start_device_polling(std::chrono::milliseconds period)
+{
+  {
+    std::lock_guard<std::mutex> lock(device_mutex_);
+    device_ = {};
+    device_polling_ = true;
+  }
+  device_status_thread_ = std::jthread(
+    [this, period](std::stop_token stop) {poll_device(stop, period);});
+}
+
+void SonarDriver::stop_device_polling()
+{
+  if (device_status_thread_.joinable()) {
+    device_status_thread_.request_stop();
+    device_status_thread_.join();
+  }
+  std::lock_guard<std::mutex> lock(device_mutex_);
+  device_polling_ = false;
+}
+
+void SonarDriver::poll_device(const std::stop_token & stop, std::chrono::milliseconds period)
+{
+  const auto stopping = [&stop]() {return stop.stop_requested();};
+  HttpSonarApi api(settings_.sonar_ip, settings_.http_timeout, stopping, settings_.http_port);
+  // Status needs release 1.7.0 and time status 1.7.1; older firmware answers 404.
+  bool status_supported = true;
+  bool time_supported = true;
+  std::mutex wait_mutex;
+  std::condition_variable_any wake;
+  while (!stop.stop_requested()) {
+    DeviceStatus reading;
+    {
+      std::lock_guard<std::mutex> lock(device_mutex_);
+      reading.info = device_.info;
+    }
+    try {
+      if (!reading.info) {
+        reading.info = api.about();
+        RCLCPP_INFO(
+          get_logger(), "Connected to %s release %s (chip %s, hardware revision %ld)",
+          reading.info->product_name.c_str(), reading.info->version_short.c_str(),
+          reading.info->chip_id.c_str(), static_cast<long>(reading.info->hardware_revision));  // NOLINT
+      }
+      reading.temperature = api.temperature();
+      if (status_supported) {
+        try {
+          reading.components = api.status();
+        } catch (const HttpStatusError & error) {
+          if (error.status() != 404) {
+            throw;
+          }
+          status_supported = false;
+        }
+      }
+      if (time_supported) {
+        try {
+          reading.time = api.time_status();
+        } catch (const HttpStatusError & error) {
+          if (error.status() != 404) {
+            throw;
+          }
+          time_supported = false;
+        }
+      }
+      reading.last_success_steady_ns = steady_time_nanoseconds();
+    } catch (const std::exception & error) {
+      if (stop.stop_requested()) {
+        return;
+      }
+      reading.error = error.what();
+    }
+    {
+      std::lock_guard<std::mutex> lock(device_mutex_);
+      if (!reading.error.empty()) {
+        if (device_.error.empty()) {
+          RCLCPP_WARN(
+            get_logger(), "Could not read Sonar 3D-15 status from %s: %s",
+            settings_.sonar_ip.c_str(), reading.error.c_str());
+        }
+        // Keep the last good readings for diagnostics alongside the error.
+        device_.error = reading.error;
+        device_.info = reading.info;
+      } else {
+        device_ = std::move(reading);
+      }
+    }
+    std::unique_lock<std::mutex> lock(wait_mutex);
+    wake.wait_for(lock, stop, period, [] {return false;});
+  }
+}
+
 void SonarDriver::receive_loop(const std::stop_token & stop)
 {
+  auto timeout = std::chrono::milliseconds(-1);
   while (!stop.stop_requested()) {
     try {
-      if (!receiver_->wait(std::chrono::milliseconds(-1))) {
-        continue;
-      }
-      while (!stop.stop_requested()) {
-        const auto datagram = receiver_->receive();
-        if (!datagram) {
-          break;
+      if (receiver_->wait(timeout)) {
+        while (!stop.stop_requested()) {
+          auto datagram = receiver_->receive();
+          if (!datagram) {
+            break;
+          }
+          metrics_.datagrams.fetch_add(1, std::memory_order_relaxed);
+          handle_datagram(*datagram);
         }
-        metrics_.datagrams.fetch_add(1, std::memory_order_relaxed);
-        handle_datagram(*datagram);
       }
+      timeout = release_overdue_cloud();
     } catch (const std::exception & error) {
       metrics_.socket_errors.fetch_add(1, std::memory_order_relaxed);
       RCLCPP_ERROR_THROTTLE(
         get_logger(),
         *get_clock(),
         5000,
-        "Sonar multicast receive failed: %s",
+        "Sonar UDP receive failed: %s",
         error.what());
       // Avoid spinning on a persistent socket error.
       std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
   }
+}
+
+std::chrono::milliseconds SonarDriver::release_overdue_cloud()
+{
+  const auto * waiting = pairing_.pending_context();
+  if (waiting == nullptr) {
+    return std::chrono::milliseconds(-1);
+  }
+  const auto due = waiting->arrived + kSignalImageWait;
+  const auto now = std::chrono::steady_clock::now();
+  if (now < due) {
+    return std::chrono::ceil<std::chrono::milliseconds>(due - now);
+  }
+  if (auto pair = pairing_.release()) {
+    try {
+      publish_cloud(std::move(*pair));
+    } catch (const std::exception & error) {
+      metrics_.malformed_packets.fetch_add(1, std::memory_order_relaxed);
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 5000, "Rejected malformed Sonar 3D-15 range image: %s",
+        error.what());
+    }
+  }
+  return std::chrono::milliseconds(-1);
 }
 
 bool SonarDriver::accepts_source(std::uint32_t source_address) const
@@ -444,12 +616,12 @@ void SonarDriver::handle_datagram(const Datagram & datagram)
 
   try {
     std::visit(
-      [this, &fallback_stamp](const auto & message) {
+      [this, &fallback_stamp](auto & message) {
         using MessageType = std::decay_t<decltype(message)>;
         if constexpr (std::is_same_v<MessageType, protocol::RangeImage>) {
-          handle_range_image(message, fallback_stamp);
+          handle_range_image(std::move(message), fallback_stamp);
         } else if constexpr (std::is_same_v<MessageType, protocol::BitmapImage>) {
-          handle_bitmap_image(message, fallback_stamp);
+          handle_bitmap_image(std::move(message), fallback_stamp);
         } else if constexpr (std::is_same_v<MessageType, protocol::ImuBatch>) {
           handle_imu_batch(message, fallback_stamp);
         } else {
@@ -471,7 +643,7 @@ void SonarDriver::handle_datagram(const Datagram & datagram)
 }
 
 void SonarDriver::handle_range_image(
-  const protocol::RangeImage & image,
+  protocol::RangeImage && image,
   const builtin_interfaces::msg::Time & fallback_stamp)
 {
   observe_sequence(range_sequence_, image.header.sequence_id);
@@ -483,27 +655,41 @@ void SonarDriver::handle_range_image(
     settings_.use_sensor_timestamps,
     sensor_clock_offset(image.header.timestamp, fallback_stamp));
 
-  std::optional<sensor_msgs::msg::Image> range_message;
-  std::optional<sensor_msgs::msg::PointCloud2> cloud_message;
   if (has_subscribers(range_image_publisher_)) {
-    range_message = conversions::make_range_image(image, header);
+    range_image_publisher_->publish(
+      std::make_unique<sensor_msgs::msg::Image>(conversions::make_range_image(image, header)));
   }
   if (has_subscribers(point_cloud_publisher_)) {
-    cloud_message = conversions::make_point_cloud(image, header);
-  }
-  if (range_message) {
-    range_image_publisher_->publish(
-      std::make_unique<sensor_msgs::msg::Image>(std::move(*range_message)));
-  }
-  if (cloud_message) {
-    point_cloud_publisher_->publish(
-      std::make_unique<sensor_msgs::msg::PointCloud2>(std::move(*cloud_message)));
+    if (settings_.point_cloud_intensity) {
+      // Reject a malformed image now rather than when its pair completes.
+      conversions::validate_point_cloud_source(image);
+      for (auto & pair : pairing_.add_range(
+          std::move(image), CloudContext{header, std::chrono::steady_clock::now()}))
+      {
+        publish_cloud(std::move(pair));
+      }
+    } else {
+      point_cloud_publisher_->publish(
+        std::make_unique<sensor_msgs::msg::PointCloud2>(
+          conversions::make_point_cloud(image, header)));
+    }
   }
   metrics_.range_images.fetch_add(1, std::memory_order_relaxed);
 }
 
+void SonarDriver::publish_cloud(CloudPairing::Pair && pair)
+{
+  auto cloud = conversions::make_point_cloud(
+    pair.range, pair.context.header, true, pair.signal ? &*pair.signal : nullptr);
+  if (!pair.signal) {
+    metrics_.unpaired_range_images.fetch_add(1, std::memory_order_relaxed);
+  }
+  point_cloud_publisher_->publish(
+    std::make_unique<sensor_msgs::msg::PointCloud2>(std::move(cloud)));
+}
+
 void SonarDriver::handle_bitmap_image(
-  const protocol::BitmapImage & image,
+  protocol::BitmapImage && image,
   const builtin_interfaces::msg::Time & fallback_stamp)
 {
   Publisher<sensor_msgs::msg::Image> publisher;
@@ -534,6 +720,13 @@ void SonarDriver::handle_bitmap_image(
         conversions::make_bitmap_image(image, header)));
   }
   metrics_.bitmap_images.fetch_add(1, std::memory_order_relaxed);
+  if (image.type == protocol::BitmapImageType::SIGNAL_STRENGTH_IMAGE &&
+    settings_.point_cloud_intensity && has_subscribers(point_cloud_publisher_))
+  {
+    for (auto & pair : pairing_.add_signal(std::move(image))) {
+      publish_cloud(std::move(pair));
+    }
+  }
 }
 
 void SonarDriver::handle_imu_batch(
@@ -701,6 +894,7 @@ void SonarDriver::diagnose_stream(diagnostic_updater::DiagnosticStatusWrapper & 
     }
   }
   status.add("sensor_clock_fallbacks", value(metrics_.sensor_clock_fallbacks));
+  status.add("unpaired_range_images", value(metrics_.unpaired_range_images));
   if (receiver_) {
     status.add("udp_receive_buffer_bytes", receiver_->receive_buffer_size());
   }
@@ -718,6 +912,65 @@ void SonarDriver::diagnose_stream(diagnostic_updater::DiagnosticStatusWrapper & 
   status.add("out_of_order", value(metrics_.out_of_order_messages));
   status.add("sequence_resets", value(metrics_.sequence_resets));
   status.add("socket_errors", value(metrics_.socket_errors));
+}
+
+void SonarDriver::diagnose_device(diagnostic_updater::DiagnosticStatusWrapper & status)
+{
+  std::lock_guard<std::mutex> lock(device_mutex_);
+  if (!device_polling_) {
+    status.summary(DiagnosticStatus::OK, "device status polling disabled");
+    return;
+  }
+  if (device_.info && !device_.info->chip_id.empty()) {
+    const auto hardware_id = "Sonar 3D-15 " + device_.info->chip_id;
+    if (hardware_id != device_hardware_id_) {
+      // Applies from the next update; the IP is used until the sonar answers.
+      device_hardware_id_ = hardware_id;
+      diagnostics_.setHardwareID(hardware_id);
+    }
+  }
+  if (!device_.info && device_.error.empty()) {
+    status.summary(DiagnosticStatus::OK, "waiting for the sonar HTTP API");
+    return;
+  }
+
+  status.summary(DiagnosticStatus::OK, "ok");
+  if (device_.info) {
+    status.add("product", device_.info->product_name);
+    status.add("firmware_version", device_.info->version);
+    status.add("chip_id", device_.info->chip_id);
+    status.add("hardware_revision", device_.info->hardware_revision);
+    status.add("ready", device_.info->ready ? "true" : "false");
+  }
+  if (!device_.error.empty()) {
+    status.add("poll_error", device_.error);
+    status.mergeSummary(DiagnosticStatus::WARN, "sonar HTTP API unreachable");
+  } else if (device_.info && !device_.info->ready) {
+    status.mergeSummary(DiagnosticStatus::WARN, "sonar not ready");
+  }
+  for (const auto & [component, entry] : device_.components) {
+    status.add(component, entry.status + ": " + entry.message);
+    const auto level = diagnostic_level(entry);
+    if (level != DiagnosticStatus::OK) {
+      status.mergeSummary(level, entry.message);
+    }
+  }
+  if (device_.temperature) {
+    status.add("temperature_celsius", *device_.temperature);
+  }
+  if (device_.time) {
+    status.add("sonar_system_time", device_.time->system_time);
+    status.add("ntp_synced", device_.time->ntp_synced ? "true" : "false");
+    status.add("ntp_synced_to", device_.time->ntp_synced_to);
+    if (device_.time->seconds_since_last_sync) {
+      status.add("ntp_seconds_since_last_sync", *device_.time->seconds_since_last_sync);
+    }
+  }
+  if (device_.last_success_steady_ns >= 0) {
+    status.add(
+      "last_poll_age_seconds",
+      static_cast<double>(steady_time_nanoseconds() - device_.last_success_steady_ns) / 1.0e9);
+  }
 }
 
 }  // namespace sonar3d
