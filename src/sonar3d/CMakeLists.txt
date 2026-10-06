@@ -188,7 +188,10 @@ if(BUILD_TESTING)
   target_link_libraries(test_driver_stream sonar3d_component)
 
   ament_add_gtest(test_recording_player test/test_recording_player.cpp TIMEOUT 30)
-  target_link_libraries(test_recording_player sonar3d_ros rclcpp::rclcpp)
+  target_link_libraries(
+    test_recording_player sonar3d_ros rclcpp::rclcpp protobuf::libprotobuf ZLIB::ZLIB
+  )
+  target_include_directories(test_recording_player PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
   target_compile_definitions(
     test_recording_player PRIVATE TEST_SONAR_REPLAY_PATH="$<TARGET_FILE:sonar_replay>"
   )

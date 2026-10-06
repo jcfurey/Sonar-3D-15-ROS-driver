@@ -1,0 +1,84 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+  - Class: rviz_common/Views
+    Name: Views
+Visualization Manager:
+  Class: ''
+  Displays:
+    - Class: rviz_default_plugins/Grid
+      Name: Grid (metres)
+      Enabled: true
+      Cell Size: 1
+      Plane: XY
+      Plane Cell Count: 20
+      Reference Frame: <Fixed Frame>
+      Value: true
+    - Class: rviz_default_plugins/Axes
+      Name: Sonar axes
+      Enabled: true
+      Length: 1
+      Radius: 0.02
+      Reference Frame: <Fixed Frame>
+      Value: true
+    - Class: rviz_default_plugins/PointCloud2
+      Name: Sonar returns
+      Enabled: true
+      Topic:
+        Value: sonar_point_cloud
+        Reliability Policy: Reliable
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Depth: 5
+      Position Transformer: XYZ
+      Color Transformer: AxisColor
+      Axis: Z
+      Autocompute Value Bounds:
+        Value: true
+      Decay Time: 0
+      Style: Points
+      Size (Pixels): 3
+      Value: true
+    - Class: rviz_default_plugins/Image
+      Name: Signal strength
+      Enabled: true
+      Topic:
+        Value: sonar_intensity_image
+        Reliability Policy: Reliable
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Depth: 5
+      Value: true
+    - Class: rviz_default_plugins/Image
+      Name: Shaded depth
+      Enabled: false
+      Topic:
+        Value: sonar_shaded_image
+        Reliability Policy: Reliable
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Depth: 5
+      Value: false
+  Enabled: true
+  Name: root
+  Global Options:
+    Background Color: 24; 28; 36
+    Fixed Frame: sonar3d_link
+    Frame Rate: 30
+  Tools:
+    - Class: rviz_default_plugins/Interact
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/Select
+  Views:
+    Current:
+      Class: rviz_default_plugins/Orbit
+      Distance: 15
+      Focal Point:
+        X: 5
+        Y: 0
+        Z: 0
+      Pitch: 0.6
+      Yaw: 3.14
+Window Geometry:
+  Width: 1400
+  Height: 900

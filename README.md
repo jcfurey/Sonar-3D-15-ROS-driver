@@ -148,6 +148,83 @@ delay. A backward clock jump exceeding one second starts a new timing segment.
 stamps while retaining recorded pacing. Start subscribers (including rosbag)
 before playback and allow enough startup delay for discovery.
 
+The summary separates supported packets, unsupported message types, damaged
+packets (CRC, decompression, or protobuf envelope errors), malformed supported
+products, and lost framing. Each unsupported type is listed with its count;
+each published topic is listed with its ROS message count. A processed packet
+does not imply publication or full conversion validation: normal playback
+converts only products with subscribers.
+
+Validate all supported image, point-cloud, and public IMU conversions without
+subscribers or recorded delays:
+
+```bash
+ros2 run sonar3d sonar_replay --file survey.sonar --validate-only
+```
+
+This mode creates no data publishers, ignores startup delay and playback pacing,
+and returns a nonzero status for damaged packets, malformed supported products,
+or lost framing. Unsupported types are counted separately and do not fail
+validation. Interrupted validation also returns a nonzero status.
+For unsupported types, only packet framing, CRC, and protobuf envelopes are checked.
+Normal playback continues past recoverable damaged/malformed packets and fails
+if framing is lost.
+
+Some GUI recordings contain private `waterlinked.sonar.internal.ImuOrientation`
+and `ImuRaw` messages. Their payload schemas are absent from the public vendor
+protocol. They are reported as unsupported and are not converted into
+`sonar_imu`; that topic supports the documented public `ImuBatch` format.
+Keep the original recordings to retain private telemetry. For future recordings,
+enable public raw IMU output through the sonar's integration HTTP API before
+recording. The vendor manual (Integration API, pages 36–38) describes 100 Hz
+`ImuBatch` output, disabled by default. Its linked
+[HTTP specification](https://docs.waterlinked.com/sonar-3d/sonar-3d-15-api-swagger/swagger.json)
+defines a boolean POST to `/api/v1/integration/output/imu-batch/enabled`:
+
+```bash
+SONAR_IP=192.168.194.96  # Set this to your sonar's address.
+curl --fail --show-error \
+  -X POST -H 'Content-Type: application/json' --data 'true' \
+  "http://${SONAR_IP}/api/v1/integration/output/imu-batch/enabled"
+```
+
+`publish_imu` controls ROS publication of received samples; it does not enable
+the device's IMU output. Configure that output separately, with acoustics and
+UDP output enabled. Existing recordings need recorded public `ImuBatch` packets
+to replay samples on `sonar_imu`; enabling device output later cannot add them.
+
+### Standalone RViz playback
+
+```bash
+ros2 launch sonar3d sonar_replay.launch.py file:=/absolute/path/survey.sonar
+```
+
+The included layout shows the current cloud and signal-strength image on the
+driver's native topic names. Enable the optional Shaded depth display for
+recordings containing shaded images. Its fixed frame is `sonar3d_link`,
+so no vehicle model or identity `odom` transform is needed. The viewer publishes
+the documented sensor-to-IMU static transform to provide a complete sensor TF
+tree and avoid RViz's missing-frame warning. Message stamps use
+the current ROS clock while pacing follows the recording. No vehicle motion or
+private IMU orientation is applied to the cloud.
+
+Optional launch arguments are `realtime_factor`, `startup_delay`, `frame_id`,
+`imu_frame_id`, `namespace`, and `rviz` (`false` for headless replay). Closing RViz stops replay;
+after recording EOF, RViz stays open with the last frame.
+
+In the Nautilus workspace, the host helper stages a recording into the shared
+`/tmp` mount and passes the current display credentials to the GPU container:
+
+```bash
+./scripts/sonar3d_replay_gpu.sh '/home/jcfurey/Downloads/recording (1).sonar'
+```
+
+Run it from the host graphical session with `DISPLAY` and `XAUTHORITY` set.
+It uses the existing Xauthority cookie rather than changing X-server access
+control. `SONAR3D_CONTAINER` and `SONAR3D_CONTAINER_WS` override the default
+Nautilus container name and workspace path. Press Ctrl+C to stop the launch
+and remove its staged copy.
+
 Record the replay with standard rosbag tooling:
 
 ```bash
@@ -172,6 +249,10 @@ contracts, REP-103 geometry, IMU conversion, and configuration sequencing.
 It also exercises full-resolution dense/sparse conversions, UDP burst retention,
 single-sonar RIP1/RIP2 delivery through DDS and intra-process subscriptions,
 subscriber join/leave, and mixed recording playback with both timestamp modes.
+Replay regressions also check subscriber-free validation, unsupported private
+telemetry counts, CRC failures, malformed image/IMU products, per-topic
+publication counts, fatal framing summaries, and clean interruption with an
+explicit incomplete-results warning.
 Deterministic clock tests cover processing time, interleaved IMU batches, speed
 factors, and recorded clock resets. Live stream tests check that an
 unsynchronized sonar clock is re-anchored to receive time with IMU spacing
