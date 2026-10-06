@@ -145,6 +145,9 @@ int live(int rate, int count, const std::string & products, ProtocolVersion vers
   options.append_parameter_override("multicast_port", port);
   options.append_parameter_override("multicast_interface", "127.0.0.1");
   options.append_parameter_override("diagnostics_period", 0.1);
+  // Latency is measured by mapping fixed fixture stamps back to frame indices,
+  // so the sensor clock must be trusted rather than re-anchored to receipt.
+  options.append_parameter_override("max_sensor_clock_offset", 0.0);
   auto driver = std::make_shared<sonar3d::SonarDriver>(options);
   rclcpp::NodeOptions observer_options;
   observer_options.use_intra_process_comms(ipc);
