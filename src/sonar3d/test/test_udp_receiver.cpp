@@ -7,8 +7,10 @@
 
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <cstdint>
 #include <stdexcept>
+#include <thread>
 
 #include "sonar3d/udp_receiver.hpp"
 #include "stream_test_support.hpp"
@@ -33,7 +35,7 @@ TEST(UdpReceiver, NonblockingReceivePreservesPacketOwnershipAndSource)
   ASSERT_TRUE(received_second);
   EXPECT_EQ(received_first->bytes, first);
   EXPECT_EQ(received_second->bytes, second);
-  EXPECT_EQ(received_first->source_address, "127.0.0.1");
+  EXPECT_EQ(sonar3d::format_ipv4(received_first->source_address), "127.0.0.1");
   EXPECT_FALSE(receiver.receive());
 }
 
@@ -61,6 +63,32 @@ TEST(UdpReceiver, DefaultBufferRetainsABurstOfFullResolutionRangePackets)
         sequence);
   }
   EXPECT_FALSE(receiver.receive());
+}
+
+TEST(UdpReceiver, WaitWakesForDataAndInterruptsPermanently)
+{
+  using namespace std::chrono_literals;
+  const auto port = sonar3d::testing::unused_udp_port();
+  sonar3d::UdpReceiver receiver("239.255.96.15", port, "127.0.0.1");
+  EXPECT_FALSE(receiver.wait(1ms));
+  const sonar3d::testing::UdpSender sender;
+  sender.send(port, sonar3d::protocol::encode_packet(sonar3d::testing::range_image(1)));
+  EXPECT_TRUE(receiver.wait(1s));
+  EXPECT_TRUE(receiver.receive());
+
+  std::thread waiter([&receiver] {EXPECT_FALSE(receiver.wait(-1ms));});
+  std::this_thread::sleep_for(10ms);
+  receiver.interrupt();
+  waiter.join();
+  EXPECT_FALSE(receiver.wait(-1ms));
+}
+
+TEST(UdpReceiver, ParsesAndFormatsIpv4InHostOrder)
+{
+  EXPECT_EQ(sonar3d::parse_ipv4("192.168.194.96"), 0xC0A8C260U);
+  EXPECT_EQ(sonar3d::format_ipv4(0xC0A8C260U), "192.168.194.96");
+  EXPECT_FALSE(sonar3d::parse_ipv4("sonar.local"));
+  EXPECT_FALSE(sonar3d::parse_ipv4(""));
 }
 
 TEST(UdpReceiver, RejectsNegativeBufferRequests)

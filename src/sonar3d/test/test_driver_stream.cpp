@@ -38,7 +38,9 @@ protected:
 
   // The fixtures carry fixed 2023 sensor timestamps, so exact-stamp tests turn
   // the sensor clock check off; the clock tests enable it explicitly.
-  void start(bool enable_products = true, double max_sensor_clock_offset = 0.0)
+  void start(
+    bool enable_products = true, double max_sensor_clock_offset = 0.0,
+    const std::vector<rclcpp::Parameter> & overrides = {})
   {
     port_ = sonar3d::testing::unused_udp_port();
     rclcpp::NodeOptions options;
@@ -57,6 +59,9 @@ protected:
         "publish_bitmap_images", "publish_imu"})
     {
       options.append_parameter_override(parameter, enable_products);
+    }
+    for (const auto & parameter : overrides) {
+      options.parameter_overrides().push_back(parameter);
     }
     driver_ = std::make_shared<sonar3d::SonarDriver>(options);
     rclcpp::NodeOptions observer_options;
@@ -289,7 +294,7 @@ TEST_P(DriverStream, UnsynchronizedSonarClockIsReanchoredToReceiveTime)
   }
 
   ASSERT_TRUE(wait_for([this] {return metric("sensor_clock_fallbacks") == 4;}));
-  EXPECT_EQ(value("timestamp_source"), "receive (sensor clock unsynchronized)");
+  EXPECT_EQ(value("timestamp_source"), "receive-aligned (sensor clock unsynchronized)");
   EXPECT_EQ(status_.level, diagnostic_msgs::msg::DiagnosticStatus::WARN);
   EXPECT_GT(std::stod(value("sensor_clock_offset_seconds")), 1.0e7);
 }
@@ -317,6 +322,59 @@ TEST_P(DriverStream, SynchronizedSonarClockKeepsSensorTimestamps)
   const auto offset = std::stod(value("sensor_clock_offset_seconds"));
   EXPECT_GT(offset, 0.0);
   EXPECT_LT(offset, 1.0);
+}
+
+TEST_P(DriverStream, FallbackSourceIsAcceptedAlongsideTheConfiguredSonar)
+{
+  // The loopback sender stands in for the sonar's fixed fallback address.
+  start(true, 0.0, {
+      rclcpp::Parameter("sonar_ip", "10.255.255.1"),
+      rclcpp::Parameter("fallback_ip", "127.0.0.1")});
+  subscribe();
+  ASSERT_TRUE(discovered());
+  send_frame(0, ProtocolVersion::RIP2);
+  ASSERT_TRUE(wait_for([this] {
+      return ranges_.size() == 1 && clouds_.size() == 1 && imus_.size() == 5;
+    }));
+  ASSERT_TRUE(wait_for([this] {return metric("valid_packets") == 4;}));
+  EXPECT_EQ(metric("rejected_sources"), 0U);
+}
+
+TEST_P(DriverStream, OtherSourcesAreRejectedWithoutAFallback)
+{
+  start(true, 0.0, {
+      rclcpp::Parameter("sonar_ip", "10.255.255.1"),
+      rclcpp::Parameter("fallback_ip", "")});
+  subscribe();
+  ASSERT_TRUE(discovered());
+  send_frame(0, ProtocolVersion::RIP2);
+  ASSERT_TRUE(wait_for([this] {return metric("rejected_sources") == 4;}));
+  EXPECT_EQ(metric("valid_packets"), 0U);
+  EXPECT_TRUE(ranges_.empty());
+}
+
+TEST_P(DriverStream, UnsynchronizedClockKeepsSensorSpacingAcrossProducts)
+{
+  start(true, 1.0);
+  subscribe();
+  ASSERT_TRUE(discovered());
+  const auto batch = sonar3d::testing::imu_batch(0);
+  sender_.send(port_, sonar3d::protocol::encode_packet(batch), "239.255.96.15");
+  ASSERT_TRUE(wait_for([this] {return imus_.size() == 5;}));
+
+  // Deliver the image well after its acquisition. Receive-time stamping
+  // would add that delay; the shared offset keeps the sonar's 30 ms spacing.
+  std::this_thread::sleep_for(100ms);
+  auto image = sonar3d::testing::range_image(0);
+  image.header.timestamp = sonar3d::testing::timestamp(
+    *sonar3d::conversions::sensor_nanoseconds(batch.timestamps.back()) + 30'000'000);
+  sender_.send(port_, sonar3d::protocol::encode_packet(image), "239.255.96.15");
+  ASSERT_TRUE(wait_for([this] {return ranges_.size() == 1 && clouds_.size() == 1;}));
+
+  EXPECT_EQ(
+    (rclcpp::Time(ranges_[0]->header.stamp) - rclcpp::Time(imus_[4]->header.stamp)).nanoseconds(),
+    30'000'000);
+  EXPECT_EQ(clouds_[0]->header.stamp, ranges_[0]->header.stamp);
 }
 
 INSTANTIATE_TEST_SUITE_P(Transport, DriverStream, ::testing::Bool());

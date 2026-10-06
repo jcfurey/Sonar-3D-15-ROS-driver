@@ -36,6 +36,7 @@ struct RangePoint
   bool operator==(const RangePoint &) const = default;
 };
 
+// Ranges in the vendor's pixel order (row 0 is the lowest elevation).
 [[nodiscard]] std::vector<float> range_image_to_meters(const protocol::RangeImage & image);
 [[nodiscard]] std::vector<RangePoint> range_image_to_points(const protocol::RangeImage & image);
 
@@ -45,7 +46,7 @@ struct RangePoint
   const std::optional<protocol::Timestamp> & stamp);
 
 // sensor_offset_nanoseconds is added to a valid sensor timestamp. A driver uses
-// it to re-anchor messages from an unsynchronized sonar clock to receive time.
+// it to map an unsynchronized sonar clock onto ROS time.
 [[nodiscard]] std_msgs::msg::Header make_header(
   const protocol::MessageHeader & source,
   const std::string & frame_id,
@@ -53,6 +54,8 @@ struct RangePoint
   bool use_sensor_timestamp = true,
   std::int64_t sensor_offset_nanoseconds = 0);
 
+// ROS images are upright: row 0 is the highest elevation, so published row r
+// holds vendor row height - 1 - r. Columns keep the vendor's left-to-right order.
 [[nodiscard]] sensor_msgs::msg::Image make_range_image(
   const protocol::RangeImage & source,
   const std_msgs::msg::Header & header);

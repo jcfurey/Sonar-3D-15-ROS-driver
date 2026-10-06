@@ -15,7 +15,9 @@
 
 #include <chrono>
 #include <cstdio>
+#include <filesystem>
 #include <fstream>
+#include <map>
 #include <iterator>
 #include <memory>
 #include <stdexcept>
@@ -24,6 +26,8 @@
 #include <vector>
 
 #include <rclcpp/rclcpp.hpp>
+#include <rclcpp/serialization.hpp>
+#include <rosbag2_cpp/reader.hpp>
 
 #include "sonar3d/conversions.hpp"
 #include "stream_test_support.hpp"
@@ -341,6 +345,77 @@ TEST_F(ReplayTest, InterruptStopsPlaybackCleanlyWithAnIncompleteSummary)
   EXPECT_EQ(process.output().find("failed to create guard condition"), std::string::npos);
 }
 
+TEST_F(ReplayTest, OutputWritesEveryProductToABagWithoutPacing)
+{
+  const Recording recording;
+  char pattern[] = "/tmp/sonar3d-bag-XXXXXX";
+  ASSERT_NE(mkdtemp(pattern), nullptr);
+  const std::filesystem::path directory(pattern);
+  const auto bag = (directory / "converted").string();
+  {
+    // Neither the startup delay nor the 1000x slower pacing may apply.
+    PlayerProcess process(recording.path(), std::vector<std::string>{
+        "--output", bag, "--startup-delay", "60", "--realtime-factor", "0.001"});
+    ASSERT_TRUE(process.wait()) << process.output();
+    ASSERT_TRUE(process.succeeded()) << process.output();
+    EXPECT_NE(process.output().find(
+        "Wrote /sonar3d_replay_test/sonar_point_cloud: 12 ROS messages"), std::string::npos)
+      << process.output();
+  }
+
+  // Messages borrow memory from the storage plugin, so they must be released
+  // before the reader unloads it.
+  rosbag2_cpp::Reader reader;
+  reader.open(bag);
+  std::map<std::string, std::vector<std::shared_ptr<rosbag2_storage::SerializedBagMessage>>>
+  topics;
+  while (reader.has_next()) {
+    const auto message = reader.read_next();
+    topics[message->topic_name].push_back(message);
+  }
+  std::filesystem::remove_all(directory);
+
+  ASSERT_EQ(topics["/sonar3d_replay_test/sonar_range_image"].size(), 12U);
+  ASSERT_EQ(topics["/sonar3d_replay_test/sonar_point_cloud"].size(), 12U);
+  ASSERT_EQ(topics["/sonar3d_replay_test/sonar_intensity_image"].size(), 12U);
+  ASSERT_EQ(topics["/sonar3d_replay_test/sonar_shaded_image"].size(), 12U);
+  ASSERT_EQ(topics["/sonar3d_replay_test/sonar_imu"].size(), 60U);
+
+  rclcpp::Serialization<Cloud> cloud_serialization;
+  rclcpp::Serialization<Imu> imu_serialization;
+  for (std::uint32_t sequence = 0; sequence < 12; ++sequence) {
+    const auto source = sonar3d::testing::range_image(sequence, sequence % 2 != 0);
+    const auto header = sonar3d::conversions::make_header(
+      source.header, "sonar3d_link", builtin_interfaces::msg::Time{});
+    const auto & stored = topics["/sonar3d_replay_test/sonar_point_cloud"][sequence];
+    Cloud cloud;
+    const rclcpp::SerializedMessage serialized(*stored->serialized_data);
+    cloud_serialization.deserialize_message(&serialized, &cloud);
+    EXPECT_EQ(cloud, sonar3d::conversions::make_point_cloud(source, header));
+    EXPECT_EQ(stored->recv_timestamp, rclcpp::Time(header.stamp).nanoseconds());
+  }
+  const auto expected_imu = sonar3d::conversions::make_imu_messages(
+    sonar3d::testing::imu_batch(3), "sonar3d_imu_link", builtin_interfaces::msg::Time{});
+  for (std::size_t sample = 0; sample < expected_imu.size(); ++sample) {
+    Imu imu;
+    const rclcpp::SerializedMessage serialized(
+      *topics["/sonar3d_replay_test/sonar_imu"][15 + sample]->serialized_data);
+    imu_serialization.deserialize_message(&serialized, &imu);
+    EXPECT_EQ(imu, expected_imu[sample]);
+  }
+}
+
+TEST_F(ReplayTest, OutputRejectsReceiveTimeStamps)
+{
+  const Recording recording;
+  PlayerProcess process(recording.path(), std::vector<std::string>{
+      "--output", "/tmp/sonar3d-unused-bag", "--receive-time"});
+  ASSERT_TRUE(process.wait()) << process.output();
+  EXPECT_FALSE(process.succeeded());
+  EXPECT_NE(process.output().find("--receive-time cannot be used with --output"),
+    std::string::npos) << process.output();
+}
+
 TEST_P(RecordingPlayer, MixedRecordingDeliversAllProductsWithSensorOrReceiveTimes)
 {
   const Recording recording;
@@ -402,10 +477,11 @@ TEST_P(RecordingPlayer, MixedRecordingDeliversAllProductsWithSensorOrReceiveTime
         builtin_interfaces::msg::Time{});
     EXPECT_EQ(ranges[sequence]->data, sonar3d::conversions::make_range_image(source, header).data);
     EXPECT_EQ(clouds[sequence]->data, sonar3d::conversions::make_point_cloud(source, header).data);
-    EXPECT_EQ(intensities[sequence]->data, sonar3d::testing::bitmap_image(
-        sequence, BitmapImageType::SIGNAL_STRENGTH_IMAGE).pixels);
-    EXPECT_EQ(shaded[sequence]->data, sonar3d::testing::bitmap_image(
-        sequence, BitmapImageType::SHADED_IMAGE).pixels);
+    EXPECT_EQ(intensities[sequence]->data, sonar3d::conversions::make_bitmap_image(
+        sonar3d::testing::bitmap_image(sequence, BitmapImageType::SIGNAL_STRENGTH_IMAGE),
+        header).data);
+    EXPECT_EQ(shaded[sequence]->data, sonar3d::conversions::make_bitmap_image(
+        sonar3d::testing::bitmap_image(sequence, BitmapImageType::SHADED_IMAGE), header).data);
     for (const auto & actual : {ranges[sequence]->header, clouds[sequence]->header,
         intensities[sequence]->header, shaded[sequence]->header})
     {

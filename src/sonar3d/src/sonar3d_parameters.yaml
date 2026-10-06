@@ -5,6 +5,12 @@ sonar3d:
     description: "Literal IPv4 address used as the expected packet source and Sonar 3D-15 HTTP API address. Empty accepts packets from any source when configure_sonar is false."
     read_only: true
 
+  fallback_ip:
+    type: string
+    default_value: "192.168.194.96"
+    description: "Additional literal IPv4 packet source to accept, by default the Sonar 3D-15 fixed fallback address. Some vehicles (for example Blueye) deliver sonar output from it even when sonar_ip is a DHCP address. Empty accepts sonar_ip only."
+    read_only: true
+
   frame_id:
     type: string
     default_value: "sonar3d_link"
@@ -65,34 +71,25 @@ sonar3d:
     validation:
       bounds<>: [0, 67108864]
 
-  poll_period:
-    type: double
-    default_value: 0.01
-    description: "Wall-clock interval in seconds between nonblocking socket polls."
-    read_only: true
-    validation:
-      bounds<>: [0.001, 1.0]
-
-  max_packets_per_spin:
-    type: int
-    default_value: 32
-    description: "Maximum datagrams drained in one executor callback."
-    read_only: true
-    validation:
-      bounds<>: [1, 4096]
-
   use_sensor_timestamps:
     type: bool
     default_value: true
     description: "Use valid protobuf timestamps; otherwise stamp products from the ROS clock on receipt."
     read_only: true
+
   max_sensor_clock_offset:
     type: double
     default_value: 1.0
-    description: "Largest accepted difference in seconds between a sensor timestamp and ROS receive time. The sonar clock starts at an arbitrary time and stays there until NTP succeeds; beyond this offset a message is re-anchored to receive time, keeping IMU sample spacing. Zero trusts sensor timestamps unconditionally."
+    description: "Largest accepted difference in seconds between a sensor timestamp and ROS receive time. The sonar clock starts at an arbitrary time and stays there until NTP succeeds; beyond this offset, sensor timestamps are shifted onto ROS time by one offset shared by all products (the minimum observed receive delay), keeping the sonar's own spacing between images and IMU samples. Zero trusts sensor timestamps unconditionally."
     read_only: true
     validation:
       bounds<>: [0.0, 3600.0]
+
+  publish_tf:
+    type: bool
+    default_value: true
+    description: "Broadcast the documented static transform from frame_id to imu_frame_id on /tf_static."
+    read_only: true
 
   publish_point_cloud:
     type: bool
