@@ -143,8 +143,9 @@ int live(int rate, int count, const std::string & products, ProtocolVersion vers
   options.append_parameter_override("configure_sonar", false);
   options.append_parameter_override("sonar_ip", "127.0.0.1");
   options.append_parameter_override("multicast_group", "239.255.96.15");
-  options.append_parameter_override("multicast_port", port);
-  options.append_parameter_override("multicast_interface", "127.0.0.1");
+  options.append_parameter_override("udp_port", port);
+  options.append_parameter_override("interface_address", "127.0.0.1");
+  options.append_parameter_override("device_status_period", 0.0);
   options.append_parameter_override("diagnostic_updater.period", 0.1);
   // Latency is measured by mapping fixed fixture stamps back to frame indices,
   // so the sensor clock must be trusted rather than re-anchored to receipt.

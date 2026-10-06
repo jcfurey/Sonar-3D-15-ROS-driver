@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(sonar3d VERSION 0.5.0 LANGUAGES CXX)
+project(sonar3d VERSION 0.6.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -17,6 +17,7 @@ find_package(diagnostic_updater REQUIRED)
 find_package(generate_parameter_library REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(lifecycle_msgs REQUIRED)
+find_package(nlohmann_json 3 REQUIRED)
 find_package(Protobuf REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(rclcpp_components REQUIRED)
@@ -93,7 +94,9 @@ target_include_directories(
     "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
     "$<INSTALL_INTERFACE:include>"
 )
-target_link_libraries(sonar3d_io PUBLIC sonar3d_protocol PRIVATE CURL::libcurl)
+target_link_libraries(
+  sonar3d_io PUBLIC sonar3d_protocol PRIVATE CURL::libcurl nlohmann_json::nlohmann_json
+)
 
 generate_parameter_library(
   sonar3d_parameters
@@ -127,11 +130,10 @@ target_link_libraries(
     ${lifecycle_msgs_TARGETS}
     rclcpp_components::component
 )
-rclcpp_components_register_node(
-  sonar3d_component
-  PLUGIN "sonar3d::SonarDriver"
-  EXECUTABLE sonar_publisher
-)
+rclcpp_components_register_nodes(sonar3d_component "sonar3d::SonarDriver")
+
+add_executable(sonar_publisher src/sonar_publisher.cpp)
+target_link_libraries(sonar_publisher PRIVATE sonar3d_component)
 
 foreach(player_target IN ITEMS sonar_replay sonar_to_bag)
   add_executable(${player_target} src/recording_player.cpp)
@@ -160,7 +162,9 @@ install(
   LIBRARY DESTINATION lib
   RUNTIME DESTINATION lib/${PROJECT_NAME}
 )
-install(TARGETS sonar_replay sonar_to_bag RUNTIME DESTINATION lib/${PROJECT_NAME})
+install(
+  TARGETS sonar_publisher sonar_replay sonar_to_bag RUNTIME DESTINATION lib/${PROJECT_NAME}
+)
 install(DIRECTORY include/ DESTINATION include)
 install(DIRECTORY config launch DESTINATION share/${PROJECT_NAME})
 install(DIRECTORY proto/ DESTINATION share/${PROJECT_NAME}/proto)
@@ -178,6 +182,7 @@ if(BUILD_TESTING)
     test/test_http_client.cpp
     test/test_protocol.cpp
     test/test_playback_clock.cpp
+    test/test_range_signal_pairing.cpp
     test/test_sensor_clock.cpp
     test/test_udp_receiver.cpp
     test/test_driver_stream.cpp
@@ -196,6 +201,9 @@ if(BUILD_TESTING)
 
   ament_add_gtest(test_playback_clock test/test_playback_clock.cpp)
   target_link_libraries(test_playback_clock sonar3d_protocol)
+
+  ament_add_gtest(test_range_signal_pairing test/test_range_signal_pairing.cpp)
+  target_link_libraries(test_range_signal_pairing sonar3d_protocol)
 
   ament_add_gtest(test_sensor_clock test/test_sensor_clock.cpp)
   target_include_directories(

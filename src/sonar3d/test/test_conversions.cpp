@@ -221,6 +221,63 @@ TEST(Conversions, TransformsImuVectorsIntoRosBodyAxes)
   EXPECT_DOUBLE_EQ(messages[0].orientation_covariance[0], -1.0);
 }
 
+TEST(Conversions, LinearSignalStrengthFollowsTheVendorEncoding)
+{
+  using sonar3d::conversions::linear_signal_strength;
+  EXPECT_FLOAT_EQ(linear_signal_strength(0), 0.0F);
+  EXPECT_FLOAT_EQ(linear_signal_strength(1), 31.0F);
+  EXPECT_FLOAT_EQ(linear_signal_strength(100), 300.0F);
+  EXPECT_FLOAT_EQ(linear_signal_strength(200), 3000.0F);
+  // 30 * 10^2.55 = 10644.4.
+  EXPECT_FLOAT_EQ(linear_signal_strength(255), 10644.0F);
+}
+
+TEST(Conversions, PointCloudCarriesIntensityFromTheSameShot)
+{
+  const auto source = test_range_image();
+  sonar3d::protocol::BitmapImage signal;
+  signal.width = source.width;
+  signal.height = source.height;
+  signal.pixels = {100, 77, 200, 0, 1, 255};
+  const auto header = sonar3d::conversions::make_header(
+    source.header, "sonar_link", builtin_interfaces::msg::Time{});
+
+  const auto cloud = sonar3d::conversions::make_point_cloud(source, header, true, &signal);
+  ASSERT_EQ(cloud.fields.size(), 7U);
+  EXPECT_EQ(cloud.fields[3].name, "intensity");
+  EXPECT_EQ(cloud.fields[3].offset, 12U);
+  EXPECT_EQ(cloud.fields[6].name, "elevation");
+  EXPECT_EQ(cloud.point_step, 28U);
+  ASSERT_EQ(cloud.width, 5U);
+  // Pixel 1 has no return, so the points use signal pixels 0, 2, 3, 4, 5.
+  const float expected[] = {300.0F, 3000.0F, 0.0F, 31.0F,
+    sonar3d::conversions::linear_signal_strength(255)};
+  const auto plain = sonar3d::conversions::make_point_cloud(source, header);
+  for (std::size_t point = 0; point < 5; ++point) {
+    EXPECT_FLOAT_EQ(read_float(cloud.data, point * 28 + 12), expected[point]);
+    // The other fields match the cloud without intensity.
+    for (const std::size_t field : {0U, 1U, 2U}) {
+      EXPECT_FLOAT_EQ(
+        read_float(cloud.data, point * 28 + field * 4),
+        read_float(plain.data, point * 24 + field * 4));
+    }
+    for (const std::size_t field : {3U, 4U, 5U}) {
+      EXPECT_FLOAT_EQ(
+        read_float(cloud.data, point * 28 + (field + 1) * 4),
+        read_float(plain.data, point * 24 + field * 4));
+    }
+  }
+
+  const auto unpaired = sonar3d::conversions::make_point_cloud(source, header, true);
+  ASSERT_EQ(unpaired.fields.size(), 7U);
+  EXPECT_FLOAT_EQ(read_float(unpaired.data, 12), 0.0F);
+
+  signal.pixels.pop_back();
+  EXPECT_THROW(
+    static_cast<void>(sonar3d::conversions::make_point_cloud(source, header, true, &signal)),
+    std::invalid_argument);
+}
+
 TEST(Conversions, ImuCovarianceFollowsRep145)
 {
   sonar3d::protocol::ImuBatch batch;

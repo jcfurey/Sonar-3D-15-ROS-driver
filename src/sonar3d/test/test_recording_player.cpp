@@ -391,7 +391,9 @@ TEST_F(ReplayTest, OutputWritesEveryProductToABagWithoutPacing)
     Cloud cloud;
     const rclcpp::SerializedMessage serialized(*stored->serialized_data);
     cloud_serialization.deserialize_message(&serialized, &cloud);
-    EXPECT_EQ(cloud, sonar3d::conversions::make_point_cloud(source, header));
+    const auto signal = sonar3d::testing::bitmap_image(
+      sequence, BitmapImageType::SIGNAL_STRENGTH_IMAGE);
+    EXPECT_EQ(cloud, sonar3d::conversions::make_point_cloud(source, header, true, &signal));
     EXPECT_EQ(stored->recv_timestamp, rclcpp::Time(header.stamp).nanoseconds());
   }
   const auto expected_imu = sonar3d::conversions::make_imu_messages(
@@ -476,7 +478,11 @@ TEST_P(RecordingPlayer, MixedRecordingDeliversAllProductsWithSensorOrReceiveTime
     const auto header = sonar3d::conversions::make_header(source.header, "sonar3d_link",
         builtin_interfaces::msg::Time{});
     EXPECT_EQ(ranges[sequence]->data, sonar3d::conversions::make_range_image(source, header).data);
-    EXPECT_EQ(clouds[sequence]->data, sonar3d::conversions::make_point_cloud(source, header).data);
+    const auto signal = sonar3d::testing::bitmap_image(
+      sequence, BitmapImageType::SIGNAL_STRENGTH_IMAGE);
+    EXPECT_EQ(
+      clouds[sequence]->data,
+      sonar3d::conversions::make_point_cloud(source, header, true, &signal).data);
     EXPECT_EQ(intensities[sequence]->data, sonar3d::conversions::make_bitmap_image(
         sonar3d::testing::bitmap_image(sequence, BitmapImageType::SIGNAL_STRENGTH_IMAGE),
         header).data);

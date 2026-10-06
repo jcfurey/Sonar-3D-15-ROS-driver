@@ -10,7 +10,7 @@ The driver is split into small reusable libraries:
   and decodes the vendor protobuf. RIP1 remains supported for old recordings.
 - `sonar3d_ros` validates images and converts them to ROS messages and REP-103
   geometry.
-- `sonar3d_io` owns the multicast socket and bounded HTTP client.
+- `sonar3d_io` owns the multicast or unicast UDP socket and the cancellable sonar HTTP API client.
 - `sonar3d_component` is a composable managed (lifecycle) node. The installed
   `sonar_publisher` executable runs that same component.
 
@@ -28,10 +28,10 @@ or remapped normally.
 | `range_image` | `sensor_msgs/Image` | Upright `32FC1` range in metres; zero means no return |
 | `intensity_image` | `sensor_msgs/Image` | Upright `mono8` signal-strength bitmap |
 | `shaded_image` | `sensor_msgs/Image` | Upright `mono8` vendor shaded-depth bitmap |
-| `points` | `sensor_msgs/PointCloud2` | Valid returns with `x,y,z,range,azimuth,elevation` float32 fields |
+| `points` | `sensor_msgs/PointCloud2` | Valid returns with `x,y,z,intensity,range,azimuth,elevation` float32 fields |
 | `imu/data_raw` | `sensor_msgs/Imu` | REP-145 specific force and angular rate without orientation, one message per sample |
 | `/tf_static` | `tf2_msgs/TFMessage` | Documented `frame_id` to `imu_frame_id` offset (`publish_tf`) |
-| `/diagnostics` | `diagnostic_msgs/DiagnosticArray` | `diagnostic_updater` statuses: stream health, lifecycle and configuration state, clock source, counters, and the range image rate |
+| `/diagnostics` | `diagnostic_msgs/DiagnosticArray` | `diagnostic_updater` statuses: stream health, lifecycle and configuration state, clock source, counters, range image rate, and the sonar's own status (temperature, self-check, NTP sync, firmware) |
 
 Following REP-2003, data topics are published with `SystemDefaultsQoS`
 (reliable), so reliable subscribers such as RViz's default and best-effort
@@ -44,19 +44,37 @@ in:=/sonar3d/intensity_image -r out/compressed:=/sonar3d/intensity_image/compres
 
 Topic names before version 0.5 carried a `sonar_` prefix. To keep old
 consumers working, remap the new names back, e.g. `-r points:=sonar_point_cloud
--r range_image:=sonar_range_image -r imu/data_raw:=sonar_imu`:
+-r range_image:=sonar_range_image -r imu/data_raw:=sonar_imu`. Version 0.6
+renamed two parameters, changed the meaning of `speed_of_sound: 0` to match
+the sonar's own API, and added `intensity` to the cloud:
 
-| Before 0.5 | Now |
+| Before | Now |
 | --- | --- |
-| `sonar_point_cloud` | `points` |
-| `sonar_range_image` | `range_image` |
-| `sonar_intensity_image` | `intensity_image` |
-| `sonar_shaded_image` | `shaded_image` |
-| `sonar_imu` | `imu/data_raw` |
+| topic `sonar_point_cloud` | `points` (with `intensity`; `point_cloud_intensity: false` restores the 6-field layout) |
+| topic `sonar_range_image` | `range_image` |
+| topic `sonar_intensity_image` | `intensity_image` |
+| topic `sonar_shaded_image` | `shaded_image` |
+| topic `sonar_imu` | `imu/data_raw` |
+| `multicast_port` | `udp_port` |
+| `multicast_interface` | `interface_address` |
+| `speed_of_sound: 0.0` (keep the device setting) | `speed_of_sound: -1.0`; `0.0` now selects the sonar's automatic speed of sound |
 
 The point cloud is x-forward, y-left, z-up (REP-103). The device's native
 x-forward, y-right, z-down coordinates are converted when points and IMU
 vectors are built.
+
+Each point's `intensity` is the linear signal strength of its return, from
+the signal-strength image of the same shot: Water Linked encodes it as
+`pixel = 100 log10(strength / 30)`, so `intensity = round(30 * 10^(pixel / 100))`,
+about 31 to 10644, as in wlsonar's `bitmap_image_to_strength_linear`. The two
+images share one pixel grid; in Water Linked's sample recording their return
+masks agree on every pixel. The sonar sends a shot's range and signal images
+back to back with the same sequence ID, so the cloud waits for the signal
+image; if it does not arrive within 25 ms (or the next shot starts first),
+the cloud is published with zero intensity and diagnostics count it in
+`unpaired_range_images`. The range image itself is never delayed. Set
+`point_cloud_intensity: false` to publish the cloud as soon as the range
+image arrives, without the field.
 
 The three images share one upright pixel grid: row 0 is the highest
 elevation and column 0 the leftmost azimuth, as an image viewer expects.
@@ -126,7 +144,7 @@ HTTP configuration client uses libcurl.
 ros2 launch sonar3d sonar3d.launch.py \
   sonar_ip:=192.168.194.96 \
   frame_id:=sonar3d_link \
-  multicast_interface:=0.0.0.0
+  interface_address:=0.0.0.0
 ```
 
 The launch file loads `params_file` (default `config/sonar3d.yaml`, written for
@@ -144,8 +162,56 @@ accepted as a double. Other launch arguments:
 | `log_level` | `info` | Log level of the standalone driver process |
 
 HTTP configuration runs on a bounded background thread, so a missing sonar
-does not block the executor or multicast receive path. Setting
-`configure_sonar:=false` makes the node listen without changing device state.
+does not block the executor or receive path, and cleanup cancels requests in
+flight within about a second. Setting `configure_sonar:=false` makes the node
+listen without changing device state.
+
+### Sonar settings
+
+On configure, with `configure_sonar` true, the driver applies the requested
+settings through the sonar's HTTP API in dependency order, then enables
+acoustics and UDP output. Every optional setting defaults to "keep the
+device's value", and the sonar persists what it is given:
+
+| Parameter | Effect | Sonar release |
+| --- | --- | --- |
+| `ntp_server` | NTP server for the sonar clock, an address or `auto` | 1.7.1 |
+| `salinity` | `fresh` or `salt`, used by the automatic speed of sound | 1.7.0 |
+| `speed_of_sound` | `0` automatic (from salinity and water temperature), or 1000–2000 m/s | all |
+| `acoustics_mode` | `low-frequency` (5 Hz, 90°×40°) or `high-frequency` (20 Hz, 40°×40°) | 1.7.0 |
+| `range_min`, `range_max` | Imaging range in metres; applied when `range_max` > 0 | all |
+| `udp_mode` | Multicast, or unicast to `interface_address`:`udp_port` | all |
+| `publish_imu` | Also enables `ImuBatch` output | 1.8.0 |
+| `ntp_sync_timeout` | When positive, forces an NTP sync and waits up to that many seconds | 1.7.1 |
+
+Releases older than a setting answer 404; the driver then logs which
+settings the firmware lacks and diagnostics list them in
+`configuration_unsupported` as a warning, while imaging continues. Other
+failures mark the configuration failed with the error. A wrong speed of sound
+scales every range (1491 instead of 1530 m/s is a 2.6% error), so prefer
+`speed_of_sound: 0` with the right `salinity`, or a measured value. Giving the
+sonar an NTP server (for example the vehicle computer) lets the driver use
+its acquisition timestamps directly instead of the offset estimate described
+above.
+
+### Unicast output
+
+Multicast is the default. On routed networks or when multicast is filtered,
+set `udp_mode: unicast` and `interface_address` to this computer's address on
+the sonar's network: the driver binds `interface_address:udp_port` and, with
+`configure_sonar`, tells the sonar to send there. Unicast sockets are opened
+without `SO_REUSEADDR`, as in wlsonar, because Linux would deliver each
+datagram to only one of several listeners; a second driver on the same port
+fails to configure instead of silently stealing packets.
+
+### Device status
+
+While configured, the driver reads the sonar's `/about`, `/status`,
+`/temperature` and `/time/status` every `device_status_period` seconds (5 by
+default; 0 disables) and publishes them as the `Device` diagnostic: firmware
+version, chip ID, readiness, temperature, each component's status
+(`ok`/`warning`/`error` map to OK/WARN/ERROR), and NTP sync state. Once the
+sonar answers, its chip ID becomes the diagnostics `hardware_id`.
 
 ### Lifecycle
 
@@ -184,9 +250,9 @@ ros2 component load /ComponentManager sonar3d sonar3d::SonarDriver -p autostart:
 
 `/diagnostics` is published in every state. The `RIP stream` status reports
 the lifecycle state and is OK with "not streaming" while inactive; the
-`Range image rate` status (5–20 Hz expected) is added while active. The
-update period is `diagnostic_updater`'s standard `diagnostic_updater.period`
-parameter.
+`Range image rate` status (5–20 Hz expected) is added while active, and the
+`Device` status is filled while configured. The update period is
+`diagnostic_updater`'s standard `diagnostic_updater.period` parameter.
 
 | Parameter | Default | Meaning |
 | --- | --- | --- |
@@ -195,16 +261,26 @@ parameter.
 | `fallback_ip` | `192.168.194.96` | Additional accepted packet source, by default the sonar's fixed fallback address; empty accepts `sonar_ip` only |
 | `frame_id` | `sonar3d_link` | Frame for range, bitmap, and point-cloud products |
 | `imu_frame_id` | `sonar3d_imu_link` | Frame at the internal IMU origin |
-| `speed_of_sound` | `0.0` | m/s to configure; zero preserves the device setting |
-| `configure_sonar` | `true` | On configure, enable acoustics, multicast and (with `publish_imu`) IMU output through the HTTP API |
-| `http_timeout` | `5.0` | Ordinary HTTP timeout in seconds |
-| `multicast_group` | `224.0.0.96` | RIP multicast group |
-| `multicast_port` | `4747` | RIP UDP port |
-| `multicast_interface` | `0.0.0.0` | Local IPv4 interface used to join multicast |
+| `configure_sonar` | `true` | On configure, apply the sonar settings above and enable acoustics, UDP output and (with `publish_imu`) IMU output |
+| `speed_of_sound` | `-1.0` | Negative keeps the device setting; `0` automatic; otherwise 1000–2000 m/s |
+| `salinity` | empty | `fresh` or `salt`; empty keeps the device setting |
+| `acoustics_mode` | empty | `low-frequency` or `high-frequency`; empty keeps the device setting |
+| `range_min` | `0.0` | Minimum imaging range in metres, applied with `range_max` |
+| `range_max` | `0.0` | Maximum imaging range in metres; zero keeps the device range |
+| `ntp_server` | empty | NTP server address or `auto`; empty keeps the device setting |
+| `ntp_sync_timeout` | `0.0` | Positive: force an NTP sync during configure and wait up to this long |
+| `http_port` | `80` | Sonar HTTP API port |
+| `http_timeout` | `5.0` | Ordinary HTTP timeout in seconds; acoustics settings are allowed at least 30 s |
+| `device_status_period` | `5.0` | Seconds between device status reads; zero disables |
+| `udp_mode` | `multicast` | `multicast` or `unicast` |
+| `multicast_group` | `224.0.0.96` | RIP multicast group (multicast mode) |
+| `udp_port` | `4747` | RIP UDP port |
+| `interface_address` | `0.0.0.0` | Multicast: interface joining the group. Unicast: local address to bind and, with `configure_sonar`, the sonar's destination |
 | `udp_receive_buffer_size` | `1048576` | Requested socket receive buffer in bytes; zero keeps the OS default |
 | `use_sensor_timestamps` | `true` | Prefer valid device timestamps over receive time |
 | `max_sensor_clock_offset` | `1.0` | Seconds a sensor timestamp may differ from receive time before sensor timestamps are shifted onto ROS time; zero trusts the sensor clock unconditionally |
 | `publish_tf` | `true` | Broadcast the static `frame_id` to `imu_frame_id` transform |
+| `point_cloud_intensity` | `true` | Add linear signal strength from the paired signal image as `intensity` |
 | `publish_point_cloud` | `true` | Enable the derived cloud |
 | `publish_range_image` | `true` | Enable the scaled range image |
 | `publish_bitmap_images` | `true` | Enable signal-strength and shaded bitmap topics |
@@ -239,8 +315,10 @@ ros2 run sonar3d sonar_replay \
 ```
 
 The player reads mixed RIP1/RIP2 recordings using declared packet lengths,
-validates CRCs, and skips damaged packets when framing remains recoverable. The
-old `sonar_to_bag` executable name remains as an alias.
+validates CRCs, and skips damaged packets when framing remains recoverable. It
+pairs range and signal images for the cloud's `intensity` like the live driver
+(`--no-intensity` omits the field) and reports range images without a signal
+image. The old `sonar_to_bag` executable name remains as an alias.
 
 ### Converting a recording to a bag
 
@@ -403,7 +481,14 @@ false sequence gaps, that parameters change only while unconfigured and apply
 on the next configure, that invalid parameters fail configure recoverably, and
 that the `autostart` parameter activates the node. A reliable subscriber test
 guards REP-2003 compatibility, HTTP tests cover the IMU output step and its
-404 fallback, and IMU tests cover REP-145 covariances.
+404 fallback, and IMU tests cover REP-145 covariances. Sonar API tests run
+the real HTTP client against an in-process server to check the JSON body of
+every setting, status parsing, 404 handling for older firmware, and
+cancellation of a hung request; a driver test configures a stand-in sonar end
+to end and checks the `Device` diagnostic and its chip-ID `hardware_id`.
+Pairing tests cover either arrival order, lost and stale signal images, and
+sequence wraparound; stream tests cover unicast delivery, unpaired release
+after the wait, and the cloud without intensity.
 
 For repeatable performance measurements, build the optional benchmark from the
 workspace root after an optimized build with testing enabled:
@@ -430,8 +515,9 @@ Use an unused `ROS_DOMAIN_ID` to isolate these ROS topics from other tests.
 
 The wire definition and behavior follow Water Linked's
 [Sonar 3D-15 integration API](https://docs.waterlinked.com/sonar-3d/sonar-3d-15-api/)
-and the tagged
-[`wlsonar` 0.5.4 implementation](https://github.com/waterlinked/wlsonar/tree/v0.5.4).
+its [HTTP specification](https://docs.waterlinked.com/sonar-3d/sonar-3d-15-api-swagger/swagger.json),
+and [`wlsonar` 0.5.5](https://github.com/waterlinked/wlsonar/tree/v0.5.5), whose
+protocol definition is unchanged since 0.5.4.
 Both the driver and vendored protocol definition are MIT licensed. Recording
 playback history retains attribution to Marios Xanthidis (SINTEF Ocean), the
 Research Council of Norway EchoNav project, and Alberto Quattrini Li's earlier

@@ -60,9 +60,23 @@ struct RangePoint
   const protocol::RangeImage & source,
   const std_msgs::msg::Header & header);
 
+// Throws std::invalid_argument unless the image can be converted to a point
+// cloud; lets callers that defer the cloud reject a malformed image at once.
+void validate_point_cloud_source(const protocol::RangeImage & image);
+
+// Linear signal strength (about 30 to 10600) for a SIGNAL_STRENGTH_IMAGE
+// pixel, which Water Linked encodes as 100 log10(strength / 30); zero is no
+// return.
+[[nodiscard]] float linear_signal_strength(std::uint8_t pixel);
+
+// Valid returns as x, y, z, [intensity,] range, azimuth, elevation float32
+// fields. with_intensity adds linear signal strength from the same shot's
+// SIGNAL_STRENGTH_IMAGE; without that image (lost or late) intensity is 0.
 [[nodiscard]] sensor_msgs::msg::PointCloud2 make_point_cloud(
   const protocol::RangeImage & source,
-  const std_msgs::msg::Header & header);
+  const std_msgs::msg::Header & header,
+  bool with_intensity = false,
+  const protocol::BitmapImage * signal = nullptr);
 
 [[nodiscard]] sensor_msgs::msg::Image make_bitmap_image(
   const protocol::BitmapImage & source,

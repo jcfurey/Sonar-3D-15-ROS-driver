@@ -17,6 +17,7 @@
 #include <lifecycle_msgs/msg/state.hpp>
 #include <rclcpp/rclcpp.hpp>
 
+#include "http_test_server.hpp"
 #include "sonar3d/conversions.hpp"
 #include "sonar3d/sonar_driver.hpp"
 #include "stream_test_support.hpp"
@@ -50,8 +51,9 @@ protected:
     options.append_parameter_override("configure_sonar", false);
     options.append_parameter_override("sonar_ip", "127.0.0.1");
     options.append_parameter_override("multicast_group", "239.255.96.15");
-    options.append_parameter_override("multicast_port", port_);
-    options.append_parameter_override("multicast_interface", "127.0.0.1");
+    options.append_parameter_override("udp_port", port_);
+    options.append_parameter_override("interface_address", "127.0.0.1");
+    options.append_parameter_override("device_status_period", 0.0);
     options.append_parameter_override("frame_id", "test_sonar");
     options.append_parameter_override("imu_frame_id", "test_imu");
     options.append_parameter_override("diagnostic_updater.period", 0.1);
@@ -76,6 +78,8 @@ protected:
             status_ = status;
           } else if (status.name.ends_with("sonar3d_driver: Range image rate")) {
             rate_status_ = status;
+          } else if (status.name.ends_with("sonar3d_driver: Device")) {
+            device_status_ = status;
           }
         }
       });
@@ -102,6 +106,16 @@ protected:
   std::string value(const std::string & key) const
   {
     for (const auto & item : status_.values) {
+      if (item.key == key) {
+        return item.value;
+      }
+    }
+    return {};
+  }
+
+  std::string device_value(const std::string & key) const
+  {
+    for (const auto & item : device_status_.values) {
       if (item.key == key) {
         return item.value;
       }
@@ -159,13 +173,13 @@ protected:
   void send_frame(std::uint32_t sequence, ProtocolVersion version)
   {
     sender_.send(port_, sonar3d::protocol::encode_packet(
-        sonar3d::testing::range_image(sequence, sequence % 2 != 0), version), "239.255.96.15");
+        sonar3d::testing::range_image(sequence, sequence % 2 != 0), version), destination_.c_str());
     sender_.send(port_, sonar3d::protocol::encode_packet(sonar3d::testing::bitmap_image(
-          sequence, BitmapImageType::SIGNAL_STRENGTH_IMAGE), version), "239.255.96.15");
+          sequence, BitmapImageType::SIGNAL_STRENGTH_IMAGE), version), destination_.c_str());
     sender_.send(port_, sonar3d::protocol::encode_packet(sonar3d::testing::bitmap_image(
-          sequence, BitmapImageType::SHADED_IMAGE), version), "239.255.96.15");
+          sequence, BitmapImageType::SHADED_IMAGE), version), destination_.c_str());
     sender_.send(port_, sonar3d::protocol::encode_packet(sonar3d::testing::imu_batch(sequence)),
-      "239.255.96.15");
+      destination_.c_str());
   }
 
   void check_frame(std::uint32_t sequence, std::size_t index)
@@ -174,7 +188,10 @@ protected:
     const auto header = sonar3d::conversions::make_header(source.header, "test_sonar",
         builtin_interfaces::msg::Time{});
     EXPECT_EQ(*ranges_.at(index), sonar3d::conversions::make_range_image(source, header));
-    EXPECT_EQ(*clouds_.at(index), sonar3d::conversions::make_point_cloud(source, header));
+    const auto signal = sonar3d::testing::bitmap_image(
+      sequence, BitmapImageType::SIGNAL_STRENGTH_IMAGE);
+    EXPECT_EQ(
+      *clouds_.at(index), sonar3d::conversions::make_point_cloud(source, header, true, &signal));
     EXPECT_EQ(*intensities_.at(index), sonar3d::conversions::make_bitmap_image(
         sonar3d::testing::bitmap_image(sequence, BitmapImageType::SIGNAL_STRENGTH_IMAGE), header));
     EXPECT_EQ(*shaded_.at(index), sonar3d::conversions::make_bitmap_image(
@@ -196,6 +213,8 @@ protected:
   std::vector<Imu::ConstSharedPtr> imus_;
   diagnostic_msgs::msg::DiagnosticStatus status_;
   diagnostic_msgs::msg::DiagnosticStatus rate_status_;
+  diagnostic_msgs::msg::DiagnosticStatus device_status_;
+  std::string destination_{"239.255.96.15"};
   std::vector<rclcpp::SubscriptionBase::SharedPtr> subscriptions_;
   rclcpp::Subscription<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr diagnostics_;
 };
@@ -476,8 +495,8 @@ TEST_P(DriverStream, AutostartParameterActivatesOnceSpinning)
   options.append_parameter_override("autostart", true);
   options.append_parameter_override("configure_sonar", false);
   options.append_parameter_override("multicast_group", "239.255.96.15");
-  options.append_parameter_override("multicast_port", sonar3d::testing::unused_udp_port());
-  options.append_parameter_override("multicast_interface", "127.0.0.1");
+  options.append_parameter_override("udp_port", sonar3d::testing::unused_udp_port());
+  options.append_parameter_override("interface_address", "127.0.0.1");
   const auto driver = std::make_shared<sonar3d::SonarDriver>(options);
   EXPECT_EQ(
     driver->get_current_state().id(), lifecycle_msgs::msg::State::PRIMARY_STATE_UNCONFIGURED);
@@ -491,6 +510,110 @@ TEST_P(DriverStream, AutostartParameterActivatesOnceSpinning)
     std::this_thread::sleep_for(2ms);
   }
   EXPECT_EQ(driver->get_current_state().id(), lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE);
+}
+
+TEST_P(DriverStream, UnicastModeReceivesDatagramsAddressedToTheDriver)
+{
+  start(true, 0.0, {rclcpp::Parameter("udp_mode", "unicast")});
+  destination_ = "127.0.0.1";
+  subscribe();
+  ASSERT_TRUE(discovered());
+  send_frame(0, ProtocolVersion::RIP2);
+  ASSERT_TRUE(wait_for([this] {
+      return ranges_.size() == 1 && clouds_.size() == 1 && intensities_.size() == 1 &&
+             imus_.size() == 5;
+    }));
+  check_frame(0, 0);
+}
+
+TEST_P(DriverStream, RangeImageWithoutSignalImageIsPublishedAfterAShortWait)
+{
+  start();
+  subscribe();
+  ASSERT_TRUE(discovered());
+  const auto source = sonar3d::testing::range_image(4);
+  const auto sent = std::chrono::steady_clock::now();
+  sender_.send(port_, sonar3d::protocol::encode_packet(source), destination_.c_str());
+  ASSERT_TRUE(wait_for([this] {return clouds_.size() == 1;}));
+  EXPECT_LT(std::chrono::steady_clock::now() - sent, 1s);
+  const auto header = sonar3d::conversions::make_header(
+    source.header, "test_sonar", builtin_interfaces::msg::Time{});
+  EXPECT_EQ(*clouds_[0], sonar3d::conversions::make_point_cloud(source, header, true));
+  ASSERT_TRUE(wait_for([this] {return metric("unpaired_range_images") == 1;}));
+}
+
+TEST_P(DriverStream, IntensityCanBeLeftOutOfThePointCloud)
+{
+  start(true, 0.0, {rclcpp::Parameter("point_cloud_intensity", false)});
+  subscribe();
+  ASSERT_TRUE(discovered());
+  const auto source = sonar3d::testing::range_image(2);
+  sender_.send(port_, sonar3d::protocol::encode_packet(source), destination_.c_str());
+  ASSERT_TRUE(wait_for([this] {return clouds_.size() == 1;}));
+  const auto header = sonar3d::conversions::make_header(
+    source.header, "test_sonar", builtin_interfaces::msg::Time{});
+  EXPECT_EQ(*clouds_[0], sonar3d::conversions::make_point_cloud(source, header));
+  EXPECT_EQ(clouds_[0]->fields.size(), 6U);
+}
+
+TEST_P(DriverStream, ConfiguresTheSonarAndReportsDeviceStatus)
+{
+  sonar3d::testing::HttpServer sonar;
+  const std::string api = "/api/v1/integration";
+  for (const auto * path : {"/time/ntp", "/acoustics/salinity", "/acoustics/speed_of_sound",
+      "/acoustics/mode", "/acoustics/range", "/acoustics/enabled", "/udp"})
+  {
+    sonar.respond("POST " + api + path, {});
+  }
+  // Firmware before 1.8.0: no public ImuBatch output.
+  sonar.respond("GET " + api + "/about", {200,
+      R"json({"chipid":"0xC0FFEE","hardware_revision":6,"is_ready":true,"product_id":21045,)json"
+      R"json("product_name":"Sonar 3D-15","variant":"","version":"1.7.1 (test)",)json"
+      R"json("version_short":"1.7.1"})json", 0ms});
+  sonar.respond("GET " + api + "/status", {200,
+      R"({"api":{"id":"api","message":"API ok","operational":true,"status":"ok"},)"
+      R"("temperature":{"id":"temp","message":"Sonar is warm","operational":true,)"
+      R"("status":"warning"},"systems_check":{"id":"sys","message":"OK","operational":true,)"
+      R"("status":"ok"},"time":{"id":"time","message":"Not synchronized","operational":true,)"
+      R"("status":"ok"}})", 0ms});
+  sonar.respond("GET " + api + "/temperature", {200, "41.5", 0ms});
+  sonar.respond("GET " + api + "/time/status", {200,
+      R"({"system_time":"2026-10-06T19:00:00Z","ntp_synced":false,"ntp_synced_to":"",)"
+      R"("ntp_seconds_since_last_sync":null})", 0ms});
+
+  start(true, 0.0, {
+      rclcpp::Parameter("configure_sonar", true),
+      rclcpp::Parameter("http_port", static_cast<int>(sonar.port())),
+      rclcpp::Parameter("speed_of_sound", 0.0),
+      rclcpp::Parameter("salinity", "salt"),
+      rclcpp::Parameter("acoustics_mode", "high-frequency"),
+      rclcpp::Parameter("range_min", 0.5),
+      rclcpp::Parameter("range_max", 12.0),
+      rclcpp::Parameter("ntp_server", "auto"),
+      rclcpp::Parameter("device_status_period", 0.1)});
+
+  ASSERT_TRUE(wait_for([this] {
+      return value("configuration") == "successful" && device_value("chip_id") == "0xC0FFEE";
+    }));
+  EXPECT_EQ(value("configuration_unsupported"), "imu_output");
+  EXPECT_EQ(device_status_.level, diagnostic_msgs::msg::DiagnosticStatus::WARN);
+  EXPECT_EQ(device_status_.message, "Sonar is warm");
+  EXPECT_EQ(device_value("firmware_version"), "1.7.1 (test)");
+  EXPECT_EQ(device_value("temperature_celsius"), "41.5");
+  EXPECT_EQ(device_value("ntp_synced"), "false");
+  ASSERT_TRUE(wait_for([this] {return device_status_.hardware_id == "Sonar 3D-15 0xC0FFEE";}));
+
+  std::map<std::string, std::string> posted;
+  for (const auto & request : sonar.requests()) {
+    if (request.method == "POST") {
+      posted[request.path.substr(api.size())] = request.body;
+    }
+  }
+  EXPECT_EQ(posted["/acoustics/salinity"], R"("salt")");
+  EXPECT_EQ(posted["/acoustics/speed_of_sound"], "0.0");
+  EXPECT_EQ(posted["/acoustics/mode"], R"("high-frequency")");
+  EXPECT_EQ(posted["/time/ntp"], R"({"ntp_address":"auto"})");
+  EXPECT_EQ(posted["/output/imu-batch/enabled"], "true");
 }
 
 INSTANTIATE_TEST_SUITE_P(Transport, DriverStream, ::testing::Bool());

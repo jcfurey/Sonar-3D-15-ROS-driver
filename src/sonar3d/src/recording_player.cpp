@@ -31,11 +31,13 @@
 #include <sensor_msgs/msg/image.hpp>
 #include <sensor_msgs/msg/imu.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
+#include <std_msgs/msg/header.hpp>
 
 #include "sonar3d/conversions.hpp"
 #include "sonar3d/playback_clock.hpp"
 #include "sonar3d/protocol.hpp"
 #include "sonar3d/publisher_demand.hpp"
+#include "sonar3d/range_signal_pairing.hpp"
 
 namespace sonar3d
 {
@@ -52,6 +54,7 @@ struct PlaybackOptions
   double realtime_factor{1.0};
   double startup_delay{0.5};
   bool use_sensor_timestamps{true};
+  bool intensity{true};
   bool validate_only{false};
   bool help{false};
 };
@@ -73,6 +76,7 @@ void print_usage(const char * executable)
     << "  --imu-frame-id FRAME       IMU frame (default: sonar3d_imu_link)\n"
     << "  --startup-delay SECONDS    DDS discovery delay (default: 0.5)\n"
     << "  --receive-time             Stamp products from the replay ROS clock\n"
+    << "  --no-intensity             Omit the point cloud intensity field\n"
     << "  --validate-only            Check all supported conversions without publishing or pacing\n"
     << "  -h, --help                 Show this help\n";
 }
@@ -112,6 +116,8 @@ void print_usage(const char * executable)
       options.help = true;
     } else if (argument == "--receive-time") {
       options.use_sensor_timestamps = false;
+    } else if (argument == "--no-intensity") {
+      options.intensity = false;
     } else if (argument == "--validate-only") {
       options.validate_only = true;
     } else if (argument == "--file" || argument.rfind("--file=", 0) == 0) {
@@ -237,6 +243,7 @@ public:
     frame_id_(options.frame_id),
     imu_frame_id_(options.imu_frame_id),
     use_sensor_timestamps_(options.use_sensor_timestamps),
+    intensity_(options.intensity),
     mode_(options.validate_only ? OutputMode::VALIDATE :
       (options.output.empty() ? OutputMode::PUBLISH : OutputMode::BAG))
   {
@@ -264,11 +271,11 @@ public:
     }
   }
 
-  void process_message(const protocol::Message & source)
+  void process_message(protocol::Message && source)
   {
     const builtin_interfaces::msg::Time fallback_stamp = now();
     std::visit(
-      [this, &fallback_stamp](const auto & message) {
+      [this, &fallback_stamp](auto & message) {
         using MessageType = std::decay_t<decltype(message)>;
         if constexpr (std::is_same_v<MessageType, protocol::RangeImage>) {
           const auto header = conversions::make_header(
@@ -276,21 +283,26 @@ public:
             frame_id_,
             fallback_stamp,
             use_sensor_timestamps_);
-          // Build both products before emitting either, so a malformed image
-          // never produces only half of its outputs.
+          // Validate everything before emitting, so a malformed image never
+          // produces only part of its outputs.
           std::optional<sensor_msgs::msg::Image> image;
-          std::optional<sensor_msgs::msg::PointCloud2> cloud;
           if (wanted(range_image_)) {
             image = conversions::make_range_image(message, header);
           }
-          if (wanted(point_cloud_)) {
-            cloud = conversions::make_point_cloud(message, header);
+          const bool cloud = wanted(point_cloud_);
+          if (cloud) {
+            conversions::validate_point_cloud_source(message);
           }
           if (image) {
             emit(range_image_, std::move(*image));
           }
-          if (cloud) {
-            emit(point_cloud_, std::move(*cloud));
+          if (cloud && intensity_) {
+            // The cloud waits for this shot's signal-strength image.
+            for (auto & pair : pairing_.add_range(std::move(message), header)) {
+              emit_cloud(std::move(pair));
+            }
+          } else if (cloud) {
+            emit(point_cloud_, conversions::make_point_cloud(message, header));
           }
         } else if constexpr (std::is_same_v<MessageType, protocol::BitmapImage>) {
           auto & output = message.type == protocol::BitmapImageType::SHADED_IMAGE ?
@@ -299,6 +311,13 @@ public:
             const auto header = conversions::make_header(
               message.header, frame_id_, fallback_stamp, use_sensor_timestamps_);
             emit(output, conversions::make_bitmap_image(message, header));
+          }
+          if (message.type == protocol::BitmapImageType::SIGNAL_STRENGTH_IMAGE && intensity_ &&
+          wanted(point_cloud_))
+          {
+            for (auto & pair : pairing_.add_signal(std::move(message))) {
+              emit_cloud(std::move(pair));
+            }
           }
         } else if constexpr (std::is_same_v<MessageType, protocol::ImuBatch>) {
           if (wanted(imu_)) {
@@ -312,6 +331,16 @@ public:
       },
       source);
   }
+
+  // Emit a cloud still waiting for a signal-strength image at end of input.
+  void flush()
+  {
+    if (auto pair = pairing_.release()) {
+      emit_cloud(std::move(*pair));
+    }
+  }
+
+  [[nodiscard]] std::uint64_t unpaired_range_images() const {return unpaired_range_images_;}
 
   [[nodiscard]] const std::map<std::string, std::uint64_t> & outputs() const {return outputs_;}
   [[nodiscard]] OutputMode mode() const {return mode_;}
@@ -346,6 +375,15 @@ private:
     return mode_ != OutputMode::PUBLISH || has_subscribers(output.publisher);
   }
 
+  void emit_cloud(RangeSignalPairing<std_msgs::msg::Header>::Pair && pair)
+  {
+    if (!pair.signal) {
+      ++unpaired_range_images_;
+    }
+    emit(point_cloud_, conversions::make_point_cloud(
+        pair.range, pair.context, true, pair.signal ? &*pair.signal : nullptr));
+  }
+
   template<typename MessageT>
   void emit(Output<MessageT> & output, MessageT && message)
   {
@@ -365,7 +403,10 @@ private:
   std::string frame_id_;
   std::string imu_frame_id_;
   bool use_sensor_timestamps_;
+  bool intensity_;
   OutputMode mode_;
+  RangeSignalPairing<std_msgs::msg::Header> pairing_;
+  std::uint64_t unpaired_range_images_{};
   std::map<std::string, std::uint64_t> outputs_;
   std::unique_ptr<rosbag2_cpp::Writer> writer_;
   Output<sensor_msgs::msg::Image> range_image_;
@@ -436,7 +477,7 @@ private:
     }
 
     try {
-      node->process_message(packet->message);
+      node->process_message(std::move(packet->message));
     } catch (const std::exception & error) {
       ++malformed;
       RCLCPP_WARN(node->get_logger(), "Skipping malformed decoded message: %s", error.what());
@@ -448,6 +489,12 @@ private:
     }
   }
 
+  try {
+    node->flush();
+  } catch (const std::exception & error) {
+    ++malformed;
+    RCLCPP_WARN(node->get_logger(), "Skipping malformed decoded message: %s", error.what());
+  }
   // Give reliable DDS writers a brief opportunity to flush their final sample.
   if (paced) {
     interruptible_sleep(0.1);
@@ -462,6 +509,12 @@ private:
     "; damaged %" PRIu64 "; malformed %" PRIu64 "; framing errors %" PRIu64,
     options.validate_only ? "Validated" : "Processed",
     supported, unsupported, damaged, malformed, framing_errors);
+  if (node->unpaired_range_images() != 0) {
+    RCLCPP_INFO(
+      node->get_logger(),
+      "%" PRIu64 " range images had no signal-strength image; their points have zero intensity",
+      node->unpaired_range_images());
+  }
   for (const auto & [type, count] : unsupported_types) {
     RCLCPP_INFO(
       node->get_logger(), "Unsupported message type %s: %" PRIu64 " packets (payload not decoded)",

@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cstdint>
 #include <stdexcept>
+#include <system_error>
 #include <thread>
 
 #include "sonar3d/udp_receiver.hpp"
@@ -89,6 +90,24 @@ TEST(UdpReceiver, ParsesAndFormatsIpv4InHostOrder)
   EXPECT_EQ(sonar3d::format_ipv4(0xC0A8C260U), "192.168.194.96");
   EXPECT_FALSE(sonar3d::parse_ipv4("sonar.local"));
   EXPECT_FALSE(sonar3d::parse_ipv4(""));
+}
+
+TEST(UdpReceiver, UnicastReceivesOnItsAddressAndDoesNotSharePorts)
+{
+  const auto port = sonar3d::testing::unused_udp_port();
+  sonar3d::UdpReceiver receiver(sonar3d::UdpReceiverOptions{port, "127.0.0.1", "", 0});
+  const sonar3d::testing::UdpSender sender;
+  const auto packet = sonar3d::protocol::encode_packet(sonar3d::testing::range_image(3));
+  sender.send(port, packet, "127.0.0.1");
+  ASSERT_TRUE(receiver.wait(std::chrono::seconds(1)));
+  const auto received = receiver.receive();
+  ASSERT_TRUE(received);
+  EXPECT_EQ(received->bytes, packet);
+  EXPECT_EQ(sonar3d::format_ipv4(received->source_address), "127.0.0.1");
+  // A second unicast listener would silently take the stream; refuse it.
+  EXPECT_THROW(
+    sonar3d::UdpReceiver(sonar3d::UdpReceiverOptions{port, "127.0.0.1", "", 0}),
+    std::system_error);
 }
 
 TEST(UdpReceiver, RejectsNegativeBufferRequests)
