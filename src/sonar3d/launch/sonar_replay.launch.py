@@ -25,7 +25,7 @@ def generate_launch_description():
         DeclareLaunchArgument('startup_delay', default_value='2.0'),
         DeclareLaunchArgument('frame_id', default_value='sonar3d_link'),
         DeclareLaunchArgument('imu_frame_id', default_value='sonar3d_imu_link'),
-        DeclareLaunchArgument('namespace', default_value=''),
+        DeclareLaunchArgument('namespace', default_value='sonar3d'),
         DeclareLaunchArgument('rviz', default_value='true'),
     ]
     replay = Node(

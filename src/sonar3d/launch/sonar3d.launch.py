@@ -10,8 +10,8 @@
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, OpaqueFunction
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
-from launch_ros.actions import LoadComposableNodes, Node
-from launch_ros.descriptions import ComposableNode
+from launch_ros.actions import LifecycleNode, LoadComposableNodes
+from launch_ros.descriptions import ComposableLifecycleNode
 from launch_ros.substitutions import FindPackageShare
 
 # Driver parameters that may be overridden from the command line, with the
@@ -36,7 +36,8 @@ PARAMETER_TYPES = {
     'publish_range_image': bool,
     'publish_bitmap_images': bool,
     'publish_imu': bool,
-    'diagnostics_period': float,
+    'linear_acceleration_stddev': float,
+    'angular_velocity_stddev': float,
     'packet_stale_timeout': float,
 }
 
@@ -54,21 +55,23 @@ def _convert(name, text, declared_type):
 
 
 def _driver(context):
-    overrides = {}
+    # The driver's autostart parameter configures and activates it once it
+    # spins. launch_ros's own composable-node autostart mis-resolves
+    # namespaced node names in Jazzy, so it is not used.
+    autostart = LaunchConfiguration('autostart').perform(context)
+    overrides = {'autostart': _convert('autostart', autostart, bool)}
     for name, declared_type in PARAMETER_TYPES.items():
         text = LaunchConfiguration(name).perform(context)
         if text:
             overrides[name] = _convert(name, text, declared_type)
-    parameters = [LaunchConfiguration('params_file').perform(context)]
-    if overrides:
-        parameters.append(overrides)
+    parameters = [LaunchConfiguration('params_file').perform(context), overrides]
     namespace = LaunchConfiguration('namespace').perform(context)
     container = LaunchConfiguration('container').perform(context)
 
     if container:
         return [LoadComposableNodes(
             target_container=container,
-            composable_node_descriptions=[ComposableNode(
+            composable_node_descriptions=[ComposableLifecycleNode(
                 package='sonar3d',
                 plugin='sonar3d::SonarDriver',
                 name='sonar3d_driver',
@@ -77,7 +80,7 @@ def _driver(context):
                 extra_arguments=[{'use_intra_process_comms': True}],
             )],
         )]
-    return [Node(
+    return [LifecycleNode(
         package='sonar3d',
         executable='sonar_publisher',
         name='sonar3d_driver',
@@ -96,7 +99,13 @@ def generate_launch_description():
             default_value=PathJoinSubstitution(
                 [FindPackageShare('sonar3d'), 'config', 'sonar3d.yaml']),
             description='Driver parameter file'),
-        DeclareLaunchArgument('namespace', default_value='', description='Driver namespace'),
+        DeclareLaunchArgument(
+            'namespace', default_value='sonar3d',
+            description='Namespace for the driver and its topics'),
+        DeclareLaunchArgument(
+            'autostart', default_value='true',
+            description='Configure and activate the managed driver on start; false leaves it '
+                        'unconfigured for a lifecycle manager'),
         DeclareLaunchArgument(
             'container', default_value='',
             description='Load the driver into this component container instead of its own '

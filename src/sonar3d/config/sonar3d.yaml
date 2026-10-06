@@ -18,5 +18,8 @@
     publish_range_image: true
     publish_bitmap_images: true
     publish_imu: true
-    diagnostics_period: 1.0
+    linear_acceleration_stddev: 0.0
+    angular_velocity_stddev: 0.0
+    diagnostic_updater:
+      period: 1.0
     packet_stale_timeout: 2.0

@@ -18,6 +18,7 @@
 #include <thread>
 #include <vector>
 
+#include <lifecycle_msgs/msg/state.hpp>
 #include <rclcpp/rclcpp.hpp>
 
 #include "sonar3d/conversions.hpp"
@@ -144,7 +145,7 @@ int live(int rate, int count, const std::string & products, ProtocolVersion vers
   options.append_parameter_override("multicast_group", "239.255.96.15");
   options.append_parameter_override("multicast_port", port);
   options.append_parameter_override("multicast_interface", "127.0.0.1");
-  options.append_parameter_override("diagnostics_period", 0.1);
+  options.append_parameter_override("diagnostic_updater.period", 0.1);
   // Latency is measured by mapping fixed fixture stamps back to frame indices,
   // so the sensor clock must be trusted rather than re-anchored to receipt.
   options.append_parameter_override("max_sensor_clock_offset", 0.0);
@@ -154,13 +155,17 @@ int live(int rate, int count, const std::string & products, ProtocolVersion vers
   auto observer = std::make_shared<rclcpp::Node>(
     "observer", "/sonar3d_benchmark", observer_options);
   rclcpp::executors::SingleThreadedExecutor executor;
-  executor.add_node(driver);
+  executor.add_node(driver->get_node_base_interface());
+  driver->configure();
+  if (driver->activate().id() != lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE) {
+    throw std::runtime_error("driver did not activate");
+  }
   executor.add_node(observer);
   std::uint64_t valid = 0, gaps = 0;
   const auto diagnostic_sub = observer->create_subscription<diagnostic_msgs::msg::DiagnosticArray>(
     "/diagnostics", 10, [&](diagnostic_msgs::msg::DiagnosticArray::ConstSharedPtr message) {
       for (const auto & status : message->status) {
-        if (status.name != "/sonar3d_benchmark/sonar3d_driver: RIP stream") {
+        if (!status.name.ends_with("sonar3d_driver: RIP stream")) {
           continue;
         }
         for (const auto & value : status.values) {
@@ -185,25 +190,25 @@ int live(int rate, int count, const std::string & products, ProtocolVersion vers
   std::vector<rclcpp::SubscriptionBase::SharedPtr> subscriptions;
   if (want_range) {
     subscriptions.push_back(observer->create_subscription<sensor_msgs::msg::Image>(
-        "sonar_range_image", qos, [&](sensor_msgs::msg::Image::ConstSharedPtr message) {
+        "range_image", qos, [&](sensor_msgs::msg::Image::ConstSharedPtr message) {
           ++ranges;
           latency(message->header);
         }));
   }
   if (want_cloud) {
     subscriptions.push_back(observer->create_subscription<sensor_msgs::msg::PointCloud2>(
-        "sonar_point_cloud", qos, [&](sensor_msgs::msg::PointCloud2::ConstSharedPtr message) {
+        "points", qos, [&](sensor_msgs::msg::PointCloud2::ConstSharedPtr message) {
           ++clouds;
           latency(message->header);
         }));
   }
   if (want_other) {
-    for (const auto * topic : {"sonar_intensity_image", "sonar_shaded_image"}) {
+    for (const auto * topic : {"intensity_image", "shaded_image"}) {
       subscriptions.push_back(observer->create_subscription<sensor_msgs::msg::Image>(
           topic, qos, [&](sensor_msgs::msg::Image::ConstSharedPtr) {++bitmaps;}));
     }
     subscriptions.push_back(observer->create_subscription<sensor_msgs::msg::Imu>(
-        "sonar_imu", qos, [&](sensor_msgs::msg::Imu::ConstSharedPtr) {++samples;}));
+        "imu/data_raw", qos, [&](sensor_msgs::msg::Imu::ConstSharedPtr) {++samples;}));
   }
   const auto discovery_deadline = Clock::now() + 5s;
   while (true) {

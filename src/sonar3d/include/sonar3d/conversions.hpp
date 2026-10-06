@@ -68,11 +68,20 @@ struct RangePoint
   const protocol::BitmapImage & source,
   const std_msgs::msg::Header & header);
 
+// REP-145 noise parameters. Zero leaves a covariance at all zeros, meaning
+// "unknown"; otherwise its diagonal is the squared standard deviation.
+struct ImuNoise
+{
+  double linear_acceleration_stddev{0.0};
+  double angular_velocity_stddev{0.0};
+};
+
 [[nodiscard]] std::vector<sensor_msgs::msg::Imu> make_imu_messages(
   const protocol::ImuBatch & source,
   const std::string & frame_id,
   const builtin_interfaces::msg::Time & fallback_stamp,
   bool use_sensor_timestamp = true,
-  std::int64_t sensor_offset_nanoseconds = 0);
+  std::int64_t sensor_offset_nanoseconds = 0,
+  const ImuNoise & noise = {});
 
 }  // namespace sonar3d::conversions

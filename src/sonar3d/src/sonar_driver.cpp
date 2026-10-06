@@ -12,7 +12,6 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
-#include <functional>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
@@ -24,11 +23,10 @@
 #include <vector>
 
 #include <diagnostic_msgs/msg/diagnostic_status.hpp>
-#include <diagnostic_msgs/msg/key_value.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
+#include <lifecycle_msgs/msg/state.hpp>
 #include <rclcpp_components/register_node_macro.hpp>
 
-#include "sonar3d/conversions.hpp"
 #include "sonar3d/http_client.hpp"
 #include "sonar3d/publisher_demand.hpp"
 
@@ -36,6 +34,8 @@ namespace sonar3d
 {
 namespace
 {
+
+using diagnostic_msgs::msg::DiagnosticStatus;
 
 [[nodiscard]] std::int64_t steady_time_nanoseconds()
 {
@@ -55,66 +55,114 @@ namespace
   return stream.str();
 }
 
-void add_diagnostic_value(
-  diagnostic_msgs::msg::DiagnosticStatus & status,
-  const std::string & key,
-  const std::string & value)
+[[nodiscard]] std::uint64_t value(const std::atomic<std::uint64_t> & counter)
 {
-  diagnostic_msgs::msg::KeyValue item;
-  item.key = key;
-  item.value = value;
-  status.values.push_back(std::move(item));
-}
-
-template<typename Value>
-void add_diagnostic_value(
-  diagnostic_msgs::msg::DiagnosticStatus & status,
-  const std::string & key,
-  Value value)
-{
-  add_diagnostic_value(status, key, std::to_string(value));
+  return counter.load(std::memory_order_relaxed);
 }
 
 }  // namespace
 
 SonarDriver::SonarDriver(const rclcpp::NodeOptions & options)
-: Node("sonar3d_driver", options)
+: rclcpp_lifecycle::LifecycleNode("sonar3d_driver", options),
+  range_rate_(
+    diagnostic_updater::FrequencyStatusParam(&minimum_range_rate_, &maximum_range_rate_),
+    "Range image rate"),
+  diagnostics_(this)
 {
+  // Parameters are declared here so they can be set before configure, as the
+  // lifecycle pattern expects; they are read and validated in on_configure.
+  const auto inherited = list_parameters({}, 0).names;
   parameter_listener_ = std::make_shared<ParamListener>(get_node_parameters_interface());
-  const auto parameters = parameter_listener_->get_params();
+  for (const auto & name : list_parameters({}, 0).names) {
+    if (std::find(inherited.begin(), inherited.end(), name) == inherited.end()) {
+      driver_parameters_.insert(name);
+    }
+  }
+  parameter_guard_ = add_on_set_parameters_callback(
+    [this](const std::vector<rclcpp::Parameter> & parameters) {
+      rcl_interfaces::msg::SetParametersResult result;
+      result.successful = true;
+      const auto state = get_current_state().id();
+      if (state == lifecycle_msgs::msg::State::PRIMARY_STATE_UNCONFIGURED) {
+        return result;
+      }
+      for (const auto & parameter : parameters) {
+        if (driver_parameters_.contains(parameter.get_name())) {
+          result.successful = false;
+          result.reason = parameter.get_name() + " can only change while the driver is "
+          "unconfigured; deactivate and clean up the driver, set it, then configure";
+          break;
+        }
+      }
+      return result;
+    });
+  diagnostics_.setHardwareID("Sonar 3D-15");
+  diagnostics_.add("RIP stream", this, &SonarDriver::diagnose_stream);
 
+  if (parameter_listener_->get_params().autostart) {
+    // Transition once the executor spins the node, so a component container
+    // has finished loading it first.
+    autostart_timer_ = create_wall_timer(std::chrono::nanoseconds(0), [this]() {
+          autostart_timer_->cancel();
+          if (configure().id() == lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE) {
+            activate();
+          }
+        });
+  }
+}
+
+SonarDriver::~SonarDriver()
+{
+  stop_streaming();
+  stop_configuration();
+}
+
+SonarDriver::CallbackReturn SonarDriver::on_configure(const rclcpp_lifecycle::State &)
+{
+  try {
+    configure_driver();
+  } catch (const std::exception & error) {
+    RCLCPP_ERROR(get_logger(), "Could not configure the Sonar 3D-15 driver: %s", error.what());
+    release();
+    return CallbackReturn::FAILURE;
+  }
+  return CallbackReturn::SUCCESS;
+}
+
+void SonarDriver::configure_driver()
+{
+  const auto parameters = parameter_listener_->get_params();
   validate_configuration(parameters.speed_of_sound, parameters.http_timeout);
   if (parameters.configure_sonar && parameters.sonar_ip.empty()) {
     throw std::invalid_argument("sonar_ip must not be empty when configure_sonar is true");
   }
-  if (!parameters.sonar_ip.empty()) {
-    sonar_address_ = parse_ipv4(parameters.sonar_ip);
-    if (!sonar_address_) {
+
+  Settings settings;
+  settings.sonar_ip = parameters.sonar_ip;
+  settings.fallback_ip = parameters.fallback_ip;
+  if (!settings.sonar_ip.empty()) {
+    settings.sonar_address = parse_ipv4(settings.sonar_ip);
+    if (!settings.sonar_address) {
       throw std::invalid_argument(
               "sonar_ip must be a literal IPv4 address so UDP source filtering is unambiguous");
     }
   }
-  if (!parameters.fallback_ip.empty()) {
-    fallback_address_ = parse_ipv4(parameters.fallback_ip);
-    if (!fallback_address_) {
+  if (!settings.fallback_ip.empty()) {
+    settings.fallback_address = parse_ipv4(settings.fallback_ip);
+    if (!settings.fallback_address) {
       throw std::invalid_argument("fallback_ip must be empty or a literal IPv4 address");
     }
   }
   if (parameters.frame_id.empty() || parameters.imu_frame_id.empty()) {
     throw std::invalid_argument("frame_id and imu_frame_id must not be empty");
   }
-
-  sonar_ip_ = parameters.sonar_ip;
-  fallback_ip_ = parameters.fallback_ip;
-  frame_id_ = parameters.frame_id;
-  imu_frame_id_ = parameters.imu_frame_id;
-  use_sensor_timestamps_ = parameters.use_sensor_timestamps;
-  max_sensor_clock_offset_ns_ = std::llround(parameters.max_sensor_clock_offset * 1.0e9);
-  publish_point_cloud_ = parameters.publish_point_cloud;
-  publish_range_image_ = parameters.publish_range_image;
-  publish_bitmap_images_ = parameters.publish_bitmap_images;
-  publish_imu_ = parameters.publish_imu;
-  packet_stale_timeout_ = parameters.packet_stale_timeout;
+  settings.frame_id = parameters.frame_id;
+  settings.imu_frame_id = parameters.imu_frame_id;
+  settings.use_sensor_timestamps = parameters.use_sensor_timestamps;
+  settings.max_sensor_clock_offset_ns = std::llround(parameters.max_sensor_clock_offset * 1.0e9);
+  settings.imu_noise = {parameters.linear_acceleration_stddev, parameters.angular_velocity_stddev};
+  settings.packet_stale_timeout = parameters.packet_stale_timeout;
+  settings_ = std::move(settings);
 
   receiver_ = std::make_unique<UdpReceiver>(
     parameters.multicast_group,
@@ -122,34 +170,32 @@ SonarDriver::SonarDriver(const rclcpp::NodeOptions & options)
     parameters.multicast_interface,
     static_cast<int>(parameters.udp_receive_buffer_size));
 
-  const auto sensor_qos = rclcpp::SensorDataQoS();
-  if (publish_range_image_) {
-    range_image_publisher_ = create_publisher<sensor_msgs::msg::Image>("sonar_range_image",
-        sensor_qos);
+  // REP-2003: drivers publish with SystemDefaultsQoS (reliable) so that both
+  // reliable subscribers and SensorDataQoS (best-effort) subscribers connect.
+  // IMU samples arrive in batches of up to 20, so keep a second of history.
+  const auto product_qos = rclcpp::SystemDefaultsQoS().keep_last(5);
+  if (parameters.publish_range_image) {
+    range_image_publisher_ = create_publisher<sensor_msgs::msg::Image>("range_image", product_qos);
   }
-  if (publish_point_cloud_) {
-    point_cloud_publisher_ =
-      create_publisher<sensor_msgs::msg::PointCloud2>("sonar_point_cloud", sensor_qos);
+  if (parameters.publish_point_cloud) {
+    point_cloud_publisher_ = create_publisher<sensor_msgs::msg::PointCloud2>("points", product_qos);
   }
-  if (publish_bitmap_images_) {
+  if (parameters.publish_bitmap_images) {
     intensity_image_publisher_ =
-      create_publisher<sensor_msgs::msg::Image>("sonar_intensity_image", sensor_qos);
-    shaded_image_publisher_ = create_publisher<sensor_msgs::msg::Image>("sonar_shaded_image",
-        sensor_qos);
+      create_publisher<sensor_msgs::msg::Image>("intensity_image", product_qos);
+    shaded_image_publisher_ =
+      create_publisher<sensor_msgs::msg::Image>("shaded_image", product_qos);
   }
-  if (publish_imu_) {
-    imu_publisher_ = create_publisher<sensor_msgs::msg::Imu>("sonar_imu", sensor_qos);
+  if (parameters.publish_imu) {
+    // REP-145: accelerometer and gyroscope samples without orientation.
+    imu_publisher_ = create_publisher<sensor_msgs::msg::Imu>(
+      "imu/data_raw", rclcpp::SystemDefaultsQoS().keep_last(100));
   }
-  diagnostics_publisher_ =
-    create_publisher<diagnostic_msgs::msg::DiagnosticArray>("/diagnostics", rclcpp::QoS(10));
   if (parameters.publish_tf) {
     static_transform_broadcaster_ = std::make_unique<tf2_ros::StaticTransformBroadcaster>(*this);
     publish_imu_transform();
   }
-
-  diagnostics_timer_ = create_wall_timer(
-    std::chrono::duration<double>(parameters.diagnostics_period),
-    [this]() {publish_diagnostics();});
+  diagnostics_.setHardwareID(settings_.sonar_ip.empty() ? "any Sonar 3D-15" : settings_.sonar_ip);
 
   RCLCPP_INFO(
     get_logger(),
@@ -157,35 +203,106 @@ SonarDriver::SonarDriver(const rclcpp::NodeOptions & options)
     parameters.multicast_group.c_str(),
     parameters.multicast_port,
     parameters.multicast_interface.c_str());
-  if (sonar_address_ && fallback_address_ && *sonar_address_ != *fallback_address_) {
+  if (settings_.sonar_address && settings_.fallback_address &&
+    *settings_.sonar_address != *settings_.fallback_address)
+  {
     RCLCPP_INFO(
       get_logger(), "Accepting packets only from %s and the fallback address %s",
-      sonar_ip_.c_str(), fallback_ip_.c_str());
-  } else if (sonar_address_) {
-    RCLCPP_INFO(get_logger(), "Accepting packets only from %s", sonar_ip_.c_str());
+      settings_.sonar_ip.c_str(), settings_.fallback_ip.c_str());
+  } else if (settings_.sonar_address) {
+    RCLCPP_INFO(get_logger(), "Accepting packets only from %s", settings_.sonar_ip.c_str());
   }
 
   if (parameters.configure_sonar) {
-    start_configuration(parameters.speed_of_sound, parameters.http_timeout);
+    start_configuration(parameters.speed_of_sound, parameters.publish_imu,
+      parameters.http_timeout);
   }
-  receive_thread_ = std::jthread([this](std::stop_token stop) {receive_loop(stop);});
 }
 
-SonarDriver::~SonarDriver()
+SonarDriver::CallbackReturn SonarDriver::on_activate(const rclcpp_lifecycle::State & state)
 {
-  // Stop the publishing thread before any member it uses is destroyed.
+  // Activate the publishers before the receive thread can use them.
+  rclcpp_lifecycle::LifecycleNode::on_activate(state);
+  range_sequence_ = {};
+  intensity_sequence_ = {};
+  shaded_sequence_ = {};
+  imu_sequence_ = {};
+  clock_offset_.reset();
+  timestamp_source_.store(TimestampSource::NONE);
+  last_valid_packet_steady_ns_.store(-1);
+  // Datagrams queued while inactive are stale; start from the live stream.
+  receiver_->clear_interrupt();
+  const auto discarded = receiver_->discard_pending();
+  if (discarded != 0) {
+    RCLCPP_DEBUG(get_logger(), "Discarded %zu datagrams queued while inactive", discarded);
+  }
+  range_rate_.clear();
+  diagnostics_.add(range_rate_);
+  streaming_.store(true);
+  receive_thread_ = std::jthread([this](std::stop_token stop) {receive_loop(stop);});
+  return CallbackReturn::SUCCESS;
+}
+
+SonarDriver::CallbackReturn SonarDriver::on_deactivate(const rclcpp_lifecycle::State & state)
+{
+  // Stop publishing before the publishers are deactivated.
+  stop_streaming();
+  diagnostics_.removeByName(range_rate_.getName());
+  rclcpp_lifecycle::LifecycleNode::on_deactivate(state);
+  return CallbackReturn::SUCCESS;
+}
+
+SonarDriver::CallbackReturn SonarDriver::on_cleanup(const rclcpp_lifecycle::State &)
+{
+  release();
+  return CallbackReturn::SUCCESS;
+}
+
+SonarDriver::CallbackReturn SonarDriver::on_shutdown(const rclcpp_lifecycle::State &)
+{
+  stop_streaming();
+  diagnostics_.removeByName(range_rate_.getName());
+  release();
+  return CallbackReturn::SUCCESS;
+}
+
+SonarDriver::CallbackReturn SonarDriver::on_error(const rclcpp_lifecycle::State &)
+{
+  stop_streaming();
+  diagnostics_.removeByName(range_rate_.getName());
+  release();
+  // Recovered: the node returns to unconfigured.
+  return CallbackReturn::SUCCESS;
+}
+
+void SonarDriver::stop_streaming()
+{
   if (receive_thread_.joinable()) {
     receive_thread_.request_stop();
     receiver_->interrupt();
     receive_thread_.join();
   }
-  if (diagnostics_timer_) {
-    diagnostics_timer_->cancel();
-  }
+  streaming_.store(false);
+}
+
+void SonarDriver::stop_configuration()
+{
   if (configuration_thread_.joinable()) {
     configuration_thread_.request_stop();
     configuration_thread_.join();
   }
+}
+
+void SonarDriver::release()
+{
+  stop_configuration();
+  configuration_state_.store(ConfigurationState::DISABLED);
+  static_transform_broadcaster_.reset();
+  range_image_publisher_.reset();
+  intensity_image_publisher_.reset();
+  shaded_image_publisher_.reset();
+  point_cloud_publisher_.reset();
+  imu_publisher_.reset();
   receiver_.reset();
 }
 
@@ -196,8 +313,8 @@ void SonarDriver::publish_imu_transform()
   // axes here, so y and z change sign and no rotation is needed.
   geometry_msgs::msg::TransformStamped transform;
   transform.header.stamp = now();
-  transform.header.frame_id = frame_id_;
-  transform.child_frame_id = imu_frame_id_;
+  transform.header.frame_id = settings_.frame_id;
+  transform.child_frame_id = settings_.imu_frame_id;
   transform.transform.translation.x = -0.022;
   transform.transform.translation.y = 0.046;
   transform.transform.translation.z = 0.003;
@@ -205,35 +322,51 @@ void SonarDriver::publish_imu_transform()
   static_transform_broadcaster_->sendTransform(transform);
 }
 
-void SonarDriver::start_configuration(double speed_of_sound, double timeout_seconds)
+void SonarDriver::start_configuration(
+  double speed_of_sound, bool imu_output, double timeout_seconds)
 {
-  configuration_state_.store(1);
+  {
+    std::lock_guard<std::mutex> lock(configuration_mutex_);
+    configuration_error_.clear();
+    configuration_unsupported_.clear();
+  }
+  configuration_state_.store(ConfigurationState::PENDING);
   const auto timeout = std::chrono::milliseconds(
     static_cast<std::int64_t>(std::llround(timeout_seconds * 1000.0)));
   configuration_thread_ = std::jthread(
-    [this, speed_of_sound, timeout](std::stop_token stop_token) {
+    [this, speed_of_sound, imu_output, timeout, sonar_ip = settings_.sonar_ip](
+      std::stop_token stop_token) {
       try {
-        HttpSonarApi api(sonar_ip_, timeout);
-        const auto applied = configure_sonar(
+        HttpSonarApi api(sonar_ip, timeout);
+        const auto result = configure_sonar(
           api,
-          speed_of_sound,
+          {speed_of_sound, imu_output},
           [&stop_token]() {return stop_token.stop_requested();});
         if (stop_token.stop_requested()) {
-          configuration_state_.store(0);
+          configuration_state_.store(ConfigurationState::DISABLED);
           return;
         }
-        configuration_state_.store(2);
-        RCLCPP_INFO(get_logger(), "Configured sonar settings: %s", join(applied).c_str());
+        {
+          std::lock_guard<std::mutex> lock(configuration_mutex_);
+          configuration_unsupported_ = result.unsupported;
+        }
+        configuration_state_.store(ConfigurationState::SUCCESSFUL);
+        RCLCPP_INFO(get_logger(), "Configured sonar settings: %s", join(result.applied).c_str());
+        if (!result.unsupported.empty()) {
+          RCLCPP_WARN(
+            get_logger(),
+            "The sonar firmware does not provide public ImuBatch output (sonar release 1.8.0 or "
+            "newer is required), so imu/data_raw stays silent. Set publish_imu:=false to "
+            "silence this warning.");
+        }
       } catch (const std::exception & error) {
         {
-          std::lock_guard<std::mutex> lock(configuration_error_mutex_);
+          std::lock_guard<std::mutex> lock(configuration_mutex_);
           configuration_error_ = error.what();
         }
-        configuration_state_.store(3);
+        configuration_state_.store(ConfigurationState::FAILED);
         RCLCPP_WARN(
-          get_logger(),
-          "Could not configure Sonar 3D-15 at %s: %s",
-          sonar_ip_.c_str(),
+          get_logger(), "Could not configure Sonar 3D-15 at %s: %s", sonar_ip.c_str(),
           error.what());
       }
     });
@@ -270,8 +403,8 @@ void SonarDriver::receive_loop(const std::stop_token & stop)
 
 bool SonarDriver::accepts_source(std::uint32_t source_address) const
 {
-  return !sonar_address_ || source_address == *sonar_address_ ||
-         source_address == fallback_address_;
+  return !settings_.sonar_address || source_address == *settings_.sonar_address ||
+         source_address == settings_.fallback_address;
 }
 
 void SonarDriver::handle_datagram(const Datagram & datagram)
@@ -283,7 +416,7 @@ void SonarDriver::handle_datagram(const Datagram & datagram)
         get_logger(),
         "Ignoring Sonar 3D-15 packets from %s; expected %s",
         format_ipv4(datagram.source_address).c_str(),
-        sonar_ip_.c_str());
+        settings_.sonar_ip.c_str());
     }
     return;
   }
@@ -342,11 +475,12 @@ void SonarDriver::handle_range_image(
   const builtin_interfaces::msg::Time & fallback_stamp)
 {
   observe_sequence(range_sequence_, image.header.sequence_id);
+  range_rate_.tick();
   const auto header = conversions::make_header(
     image.header,
-    frame_id_,
+    settings_.frame_id,
     fallback_stamp,
-    use_sensor_timestamps_,
+    settings_.use_sensor_timestamps,
     sensor_clock_offset(image.header.timestamp, fallback_stamp));
 
   std::optional<sensor_msgs::msg::Image> range_message;
@@ -372,12 +506,7 @@ void SonarDriver::handle_bitmap_image(
   const protocol::BitmapImage & image,
   const builtin_interfaces::msg::Time & fallback_stamp)
 {
-  if (!publish_bitmap_images_) {
-    metrics_.bitmap_images.fetch_add(1, std::memory_order_relaxed);
-    return;
-  }
-
-  rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr publisher;
+  Publisher<sensor_msgs::msg::Image> publisher;
   switch (image.type) {
     case protocol::BitmapImageType::SIGNAL_STRENGTH_IMAGE:
       observe_sequence(intensity_sequence_, image.header.sequence_id);
@@ -400,7 +529,7 @@ void SonarDriver::handle_bitmap_image(
   const auto offset = sensor_clock_offset(image.header.timestamp, fallback_stamp);
   if (has_subscribers(publisher)) {
     const auto header = conversions::make_header(
-      image.header, frame_id_, fallback_stamp, use_sensor_timestamps_, offset);
+      image.header, settings_.frame_id, fallback_stamp, settings_.use_sensor_timestamps, offset);
     publisher->publish(std::make_unique<sensor_msgs::msg::Image>(
         conversions::make_bitmap_image(image, header)));
   }
@@ -420,10 +549,11 @@ void SonarDriver::handle_imu_batch(
   if (has_subscribers(imu_publisher_)) {
     auto messages = conversions::make_imu_messages(
       batch,
-      imu_frame_id_,
+      settings_.imu_frame_id,
       fallback_stamp,
-      use_sensor_timestamps_,
-      offset);
+      settings_.use_sensor_timestamps,
+      offset,
+      settings_.imu_noise);
     for (auto & message : messages) {
       imu_publisher_->publish(std::make_unique<sensor_msgs::msg::Imu>(std::move(message)));
     }
@@ -436,7 +566,7 @@ std::int64_t SonarDriver::sensor_clock_offset(
   const builtin_interfaces::msg::Time & receive_stamp)
 {
   const auto sensor = conversions::sensor_nanoseconds(reference);
-  if (!use_sensor_timestamps_ || !sensor) {
+  if (!settings_.use_sensor_timestamps || !sensor) {
     return 0;
   }
 
@@ -444,8 +574,8 @@ std::int64_t SonarDriver::sensor_clock_offset(
   const auto receive = rclcpp::Time(receive_stamp).nanoseconds();
   const auto offset = receive - *sensor;
   last_sensor_clock_offset_ns_.store(offset, std::memory_order_relaxed);
-  const bool synchronized =
-    max_sensor_clock_offset_ns_ == 0 || std::llabs(offset) <= max_sensor_clock_offset_ns_;
+  const bool synchronized = settings_.max_sensor_clock_offset_ns == 0 ||
+    std::llabs(offset) <= settings_.max_sensor_clock_offset_ns;
   const auto source = synchronized ? TimestampSource::SENSOR : TimestampSource::RECEIVE;
   if (timestamp_source_.exchange(source) != source) {
     if (synchronized) {
@@ -499,118 +629,95 @@ void SonarDriver::observe_sequence(SequenceState & state, std::uint32_t sequence
   }
 }
 
-void SonarDriver::publish_diagnostics()
+void SonarDriver::diagnose_stream(diagnostic_updater::DiagnosticStatusWrapper & status)
 {
-  diagnostic_msgs::msg::DiagnosticArray array;
-  array.header.stamp = now();
-
-  diagnostic_msgs::msg::DiagnosticStatus status;
-  status.name = std::string(get_fully_qualified_name()) + ": RIP stream";
-  status.hardware_id = sonar_ip_.empty() ? "any Sonar 3D-15" : sonar_ip_;
-
-  const auto last_packet = last_valid_packet_steady_ns_.load(std::memory_order_relaxed);
-  double packet_age = -1.0;
-  if (last_packet < 0) {
-    status.level = diagnostic_msgs::msg::DiagnosticStatus::WARN;
-    status.message = "waiting for valid RIP packets";
+  const auto & lifecycle_state = get_current_state();
+  status.add("lifecycle_state", lifecycle_state.label());
+  if (!streaming_.load()) {
+    status.summary(DiagnosticStatus::OK, "not streaming (lifecycle state " +
+      lifecycle_state.label() + ")");
   } else {
-    packet_age = static_cast<double>(steady_time_nanoseconds() - last_packet) / 1.0e9;
-    if (packet_age > packet_stale_timeout_) {
-      status.level = diagnostic_msgs::msg::DiagnosticStatus::WARN;
-      status.message = "RIP packet stream is stale";
+    const auto last_packet = last_valid_packet_steady_ns_.load(std::memory_order_relaxed);
+    double packet_age = -1.0;
+    if (last_packet < 0) {
+      status.summary(DiagnosticStatus::WARN, "waiting for valid RIP packets");
     } else {
-      status.level = diagnostic_msgs::msg::DiagnosticStatus::OK;
-      status.message = "receiving RIP packets";
+      packet_age = static_cast<double>(steady_time_nanoseconds() - last_packet) / 1.0e9;
+      if (packet_age > settings_.packet_stale_timeout) {
+        status.summary(DiagnosticStatus::WARN, "RIP packet stream is stale");
+      } else {
+        status.summary(DiagnosticStatus::OK, "receiving RIP packets");
+      }
     }
+    status.add("last_packet_age_seconds", packet_age);
   }
 
-  const auto configuration_state = configuration_state_.load(std::memory_order_relaxed);
-  std::string configuration_text;
-  switch (configuration_state) {
-    case 0:
-      configuration_text = "disabled";
+  switch (configuration_state_.load()) {
+    case ConfigurationState::DISABLED:
+      status.add("configuration", "disabled");
       break;
-    case 1:
-      configuration_text = "pending";
+    case ConfigurationState::PENDING:
+      status.add("configuration", "pending");
       break;
-    case 2:
-      configuration_text = "successful";
-      break;
-    case 3:
-      configuration_text = "failed";
-      status.level = std::max(status.level, diagnostic_msgs::msg::DiagnosticStatus::WARN);
-      break;
-    default:
-      configuration_text = "unknown";
-      break;
+    case ConfigurationState::SUCCESSFUL: {
+        status.add("configuration", "successful");
+        std::lock_guard<std::mutex> lock(configuration_mutex_);
+        if (!configuration_unsupported_.empty()) {
+          status.add("configuration_unsupported", join(configuration_unsupported_));
+          status.mergeSummary(
+            DiagnosticStatus::WARN, "sonar firmware lacks requested settings");
+        }
+        break;
+      }
+    case ConfigurationState::FAILED: {
+        status.add("configuration", "failed");
+        std::lock_guard<std::mutex> lock(configuration_mutex_);
+        status.add("configuration_error", configuration_error_);
+        status.mergeSummary(DiagnosticStatus::WARN, "sonar configuration failed");
+        break;
+      }
   }
 
-  add_diagnostic_value(status, "configuration", configuration_text);
-  if (configuration_state == 3) {
-    std::lock_guard<std::mutex> lock(configuration_error_mutex_);
-    add_diagnostic_value(status, "configuration_error", configuration_error_);
-  }
-
-  std::string timestamp_text;
-  if (!use_sensor_timestamps_) {
-    timestamp_text = "receive (sensor timestamps disabled)";
+  const auto offset_seconds =
+    static_cast<double>(last_sensor_clock_offset_ns_.load(std::memory_order_relaxed)) / 1.0e9;
+  if (!settings_.use_sensor_timestamps) {
+    status.add("timestamp_source", "receive (sensor timestamps disabled)");
   } else {
     switch (timestamp_source_.load(std::memory_order_relaxed)) {
       case TimestampSource::NONE:
-        timestamp_text = "none yet";
+        status.add("timestamp_source", "none yet");
         break;
       case TimestampSource::SENSOR:
-        timestamp_text = "sensor";
-        add_diagnostic_value(status, "sensor_clock_offset_seconds",
-          static_cast<double>(last_sensor_clock_offset_ns_.load(std::memory_order_relaxed)) /
-          1.0e9);
+        status.add("timestamp_source", "sensor");
+        status.add("sensor_clock_offset_seconds", offset_seconds);
         break;
       case TimestampSource::RECEIVE:
-        timestamp_text = "receive-aligned (sensor clock unsynchronized)";
-        add_diagnostic_value(status, "sensor_clock_offset_seconds",
-          static_cast<double>(last_sensor_clock_offset_ns_.load(std::memory_order_relaxed)) /
-          1.0e9);
-        status.level = std::max(status.level, diagnostic_msgs::msg::DiagnosticStatus::WARN);
-        if (status.message == "receiving RIP packets") {
-          status.message = "sonar clock unsynchronized; sensor timestamps aligned to receive time";
-        }
+        status.add("timestamp_source", "receive-aligned (sensor clock unsynchronized)");
+        status.add("sensor_clock_offset_seconds", offset_seconds);
+        status.mergeSummary(
+          DiagnosticStatus::WARN,
+          "sonar clock unsynchronized; sensor timestamps aligned to receive time");
         break;
     }
   }
-  add_diagnostic_value(status, "timestamp_source", timestamp_text);
-  add_diagnostic_value(status, "sensor_clock_fallbacks",
-      metrics_.sensor_clock_fallbacks.load(std::memory_order_relaxed));
-  add_diagnostic_value(status, "last_packet_age_seconds", packet_age);
-  add_diagnostic_value(status, "udp_receive_buffer_bytes", receiver_->receive_buffer_size());
-  add_diagnostic_value(status, "datagrams", metrics_.datagrams.load(std::memory_order_relaxed));
-  add_diagnostic_value(status, "rejected_sources",
-      metrics_.rejected_sources.load(std::memory_order_relaxed));
-  add_diagnostic_value(status, "valid_packets",
-      metrics_.valid_packets.load(std::memory_order_relaxed));
-  add_diagnostic_value(status, "malformed_packets",
-      metrics_.malformed_packets.load(std::memory_order_relaxed));
-  add_diagnostic_value(status, "crc_failures",
-      metrics_.crc_failures.load(std::memory_order_relaxed));
-  add_diagnostic_value(status, "unknown_messages",
-      metrics_.unknown_messages.load(std::memory_order_relaxed));
-  add_diagnostic_value(status, "range_images",
-      metrics_.range_images.load(std::memory_order_relaxed));
-  add_diagnostic_value(status, "bitmap_images",
-      metrics_.bitmap_images.load(std::memory_order_relaxed));
-  add_diagnostic_value(status, "imu_batches", metrics_.imu_batches.load(std::memory_order_relaxed));
-  add_diagnostic_value(status, "sequence_gaps",
-      metrics_.sequence_gaps.load(std::memory_order_relaxed));
-  add_diagnostic_value(status, "duplicates",
-      metrics_.duplicate_messages.load(std::memory_order_relaxed));
-  add_diagnostic_value(status, "out_of_order",
-      metrics_.out_of_order_messages.load(std::memory_order_relaxed));
-  add_diagnostic_value(status, "sequence_resets",
-      metrics_.sequence_resets.load(std::memory_order_relaxed));
-  add_diagnostic_value(status, "socket_errors",
-      metrics_.socket_errors.load(std::memory_order_relaxed));
-
-  array.status.push_back(std::move(status));
-  diagnostics_publisher_->publish(std::move(array));
+  status.add("sensor_clock_fallbacks", value(metrics_.sensor_clock_fallbacks));
+  if (receiver_) {
+    status.add("udp_receive_buffer_bytes", receiver_->receive_buffer_size());
+  }
+  status.add("datagrams", value(metrics_.datagrams));
+  status.add("rejected_sources", value(metrics_.rejected_sources));
+  status.add("valid_packets", value(metrics_.valid_packets));
+  status.add("malformed_packets", value(metrics_.malformed_packets));
+  status.add("crc_failures", value(metrics_.crc_failures));
+  status.add("unknown_messages", value(metrics_.unknown_messages));
+  status.add("range_images", value(metrics_.range_images));
+  status.add("bitmap_images", value(metrics_.bitmap_images));
+  status.add("imu_batches", value(metrics_.imu_batches));
+  status.add("sequence_gaps", value(metrics_.sequence_gaps));
+  status.add("duplicates", value(metrics_.duplicate_messages));
+  status.add("out_of_order", value(metrics_.out_of_order_messages));
+  status.add("sequence_resets", value(metrics_.sequence_resets));
+  status.add("socket_errors", value(metrics_.socket_errors));
 }
 
 }  // namespace sonar3d

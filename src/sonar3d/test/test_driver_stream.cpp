@@ -14,6 +14,7 @@
 #include <thread>
 #include <vector>
 
+#include <lifecycle_msgs/msg/state.hpp>
 #include <rclcpp/rclcpp.hpp>
 
 #include "sonar3d/conversions.hpp"
@@ -53,7 +54,7 @@ protected:
     options.append_parameter_override("multicast_interface", "127.0.0.1");
     options.append_parameter_override("frame_id", "test_sonar");
     options.append_parameter_override("imu_frame_id", "test_imu");
-    options.append_parameter_override("diagnostics_period", 0.1);
+    options.append_parameter_override("diagnostic_updater.period", 0.1);
     options.append_parameter_override("max_sensor_clock_offset", max_sensor_clock_offset);
     for (const auto * parameter : {"publish_range_image", "publish_point_cloud",
         "publish_bitmap_images", "publish_imu"})
@@ -70,14 +71,18 @@ protected:
       "observer", "/sonar3d_stream_test", observer_options);
     diagnostics_ = observer_->create_subscription<diagnostic_msgs::msg::DiagnosticArray>(
       "/diagnostics", 10, [this](diagnostic_msgs::msg::DiagnosticArray::ConstSharedPtr message) {
-        if (!message->status.empty() &&
-        message->status.front().name == "/sonar3d_stream_test/sonar3d_driver: RIP stream")
-        {
-          status_ = message->status.front();
+        for (const auto & status : message->status) {
+          if (status.name.ends_with("sonar3d_driver: RIP stream")) {
+            status_ = status;
+          } else if (status.name.ends_with("sonar3d_driver: Range image rate")) {
+            rate_status_ = status;
+          }
         }
       });
-    executor_.add_node(driver_);
+    executor_.add_node(driver_->get_node_base_interface());
     executor_.add_node(observer_);
+    ASSERT_EQ(driver_->configure().id(), lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE);
+    ASSERT_EQ(driver_->activate().id(), lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE);
   }
 
   template<typename Predicate>
@@ -114,23 +119,23 @@ protected:
   {
     const auto qos = rclcpp::SensorDataQoS(rclcpp::KeepLast(100));
     subscriptions_.push_back(observer_->create_subscription<Image>(
-        "sonar_range_image", qos, [this](Image::ConstSharedPtr message) {
+        "range_image", qos, [this](Image::ConstSharedPtr message) {
           ranges_.push_back(message);
         }));
     subscriptions_.push_back(observer_->create_subscription<Cloud>(
-        "sonar_point_cloud", qos, [this](Cloud::ConstSharedPtr message) {
+        "points", qos, [this](Cloud::ConstSharedPtr message) {
           clouds_.push_back(message);
         }));
     subscriptions_.push_back(observer_->create_subscription<Image>(
-        "sonar_intensity_image", qos, [this](Image::ConstSharedPtr message) {
+        "intensity_image", qos, [this](Image::ConstSharedPtr message) {
           intensities_.push_back(message);
         }));
     subscriptions_.push_back(observer_->create_subscription<Image>(
-        "sonar_shaded_image", qos, [this](Image::ConstSharedPtr message) {
+        "shaded_image", qos, [this](Image::ConstSharedPtr message) {
           shaded_.push_back(message);
         }));
     subscriptions_.push_back(observer_->create_subscription<Imu>(
-        "sonar_imu", qos, [this](Imu::ConstSharedPtr message) {
+        "imu/data_raw", qos, [this](Imu::ConstSharedPtr message) {
           imus_.push_back(message);
         }));
   }
@@ -138,8 +143,8 @@ protected:
   bool discovered()
   {
     return wait_for([this] {
-               for (const auto * topic : {"sonar_range_image", "sonar_point_cloud",
-                 "sonar_intensity_image", "sonar_shaded_image", "sonar_imu"})
+               for (const auto * topic : {"range_image", "points",
+                 "intensity_image", "shaded_image", "imu/data_raw"})
                {
                  if (driver_->count_subscribers(topic) != 1 ||
                  observer_->count_publishers(topic) != 1)
@@ -190,6 +195,7 @@ protected:
   std::vector<Cloud::ConstSharedPtr> clouds_;
   std::vector<Imu::ConstSharedPtr> imus_;
   diagnostic_msgs::msg::DiagnosticStatus status_;
+  diagnostic_msgs::msg::DiagnosticStatus rate_status_;
   std::vector<rclcpp::SubscriptionBase::SharedPtr> subscriptions_;
   rclcpp::Subscription<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr diagnostics_;
 };
@@ -231,7 +237,7 @@ TEST_P(DriverStream, SubscribersCanJoinLeaveAndRejoinWhileReceptionContinues)
     }));
   check_frame(1, 0);
   subscriptions_.clear();
-  ASSERT_TRUE(wait_for([this] {return driver_->count_subscribers("sonar_point_cloud") == 0;}));
+  ASSERT_TRUE(wait_for([this] {return driver_->count_subscribers("points") == 0;}));
   send_frame(2, ProtocolVersion::RIP1);
   ASSERT_TRUE(wait_for([this] {return metric("valid_packets") == 12;}));
   subscribe();
@@ -252,11 +258,11 @@ TEST_P(DriverStream, DisabledProductsKeepReceivingAndReportingPackets)
   subscribe();
   send_frame(0, ProtocolVersion::RIP2);
   ASSERT_TRUE(wait_for([this] {return metric("valid_packets") == 4;}));
-  EXPECT_EQ(observer_->count_publishers("sonar_range_image"), 0U);
-  EXPECT_EQ(observer_->count_publishers("sonar_point_cloud"), 0U);
-  EXPECT_EQ(observer_->count_publishers("sonar_intensity_image"), 0U);
-  EXPECT_EQ(observer_->count_publishers("sonar_shaded_image"), 0U);
-  EXPECT_EQ(observer_->count_publishers("sonar_imu"), 0U);
+  EXPECT_EQ(observer_->count_publishers("range_image"), 0U);
+  EXPECT_EQ(observer_->count_publishers("points"), 0U);
+  EXPECT_EQ(observer_->count_publishers("intensity_image"), 0U);
+  EXPECT_EQ(observer_->count_publishers("shaded_image"), 0U);
+  EXPECT_EQ(observer_->count_publishers("imu/data_raw"), 0U);
   EXPECT_TRUE(ranges_.empty());
   EXPECT_TRUE(clouds_.empty());
   EXPECT_TRUE(intensities_.empty());
@@ -375,6 +381,116 @@ TEST_P(DriverStream, UnsynchronizedClockKeepsSensorSpacingAcrossProducts)
     (rclcpp::Time(ranges_[0]->header.stamp) - rclcpp::Time(imus_[4]->header.stamp)).nanoseconds(),
     30'000'000);
   EXPECT_EQ(clouds_[0]->header.stamp, ranges_[0]->header.stamp);
+}
+
+TEST_P(DriverStream, ReliableSubscribersReceiveProductsAsRep2003Requires)
+{
+  start();
+  std::vector<Cloud::ConstSharedPtr> reliable;
+  const auto subscription = observer_->create_subscription<Cloud>(
+    "points", rclcpp::QoS(10).reliable(), [&reliable](Cloud::ConstSharedPtr message) {
+      reliable.push_back(message);
+    });
+  ASSERT_TRUE(wait_for([this] {return driver_->count_subscribers("points") == 1;}));
+  send_frame(0, ProtocolVersion::RIP2);
+  ASSERT_TRUE(wait_for([&reliable] {return reliable.size() == 1;}));
+}
+
+TEST_P(DriverStream, DeactivationPausesStreamingAndDropsStaleData)
+{
+  start();
+  subscribe();
+  ASSERT_TRUE(discovered());
+  send_frame(0, ProtocolVersion::RIP2);
+  ASSERT_TRUE(wait_for([this] {return ranges_.size() == 1 && imus_.size() == 5;}));
+  ASSERT_TRUE(wait_for([this] {return metric("valid_packets") == 4;}));
+
+  ASSERT_EQ(driver_->deactivate().id(), lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE);
+  ASSERT_TRUE(wait_for([this] {return status_.message.starts_with("not streaming");}));
+  EXPECT_EQ(value("lifecycle_state"), "inactive");
+  send_frame(5, ProtocolVersion::RIP2);
+  std::this_thread::sleep_for(100ms);
+  executor_.spin_some();
+  EXPECT_EQ(ranges_.size(), 1U);
+
+  // The frame sent while inactive is discarded; the next one is published and
+  // the sequence jump across the pause is not counted as lost frames.
+  ASSERT_EQ(driver_->activate().id(), lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE);
+  send_frame(9, ProtocolVersion::RIP2);
+  ASSERT_TRUE(wait_for([this] {return ranges_.size() == 2 && imus_.size() == 10;}));
+  check_frame(9, 1);
+  ASSERT_TRUE(wait_for([this] {return metric("valid_packets") == 8;}));
+  EXPECT_EQ(metric("sequence_gaps"), 0U);
+}
+
+TEST_P(DriverStream, ParametersChangeOnlyWhileUnconfigured)
+{
+  start();
+  EXPECT_FALSE(driver_->set_parameter(rclcpp::Parameter("frame_id", "moved")).successful);
+  // Parameters owned by other components stay adjustable.
+  EXPECT_TRUE(driver_->set_parameter(rclcpp::Parameter("diagnostic_updater.period", 0.1))
+    .successful);
+
+  ASSERT_EQ(driver_->deactivate().id(), lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE);
+  ASSERT_EQ(driver_->cleanup().id(), lifecycle_msgs::msg::State::PRIMARY_STATE_UNCONFIGURED);
+  ASSERT_TRUE(driver_->set_parameter(rclcpp::Parameter("frame_id", "moved")).successful);
+  ASSERT_EQ(driver_->configure().id(), lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE);
+  ASSERT_EQ(driver_->activate().id(), lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE);
+
+  subscribe();
+  ASSERT_TRUE(discovered());
+  send_frame(0, ProtocolVersion::RIP2);
+  ASSERT_TRUE(wait_for([this] {return ranges_.size() == 1 && clouds_.size() == 1;}));
+  EXPECT_EQ(ranges_[0]->header.frame_id, "moved");
+  EXPECT_EQ(clouds_[0]->header.frame_id, "moved");
+}
+
+TEST_P(DriverStream, InvalidParametersFailConfigurationAndCanBeCorrected)
+{
+  start();
+  ASSERT_EQ(driver_->deactivate().id(), lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE);
+  ASSERT_EQ(driver_->cleanup().id(), lifecycle_msgs::msg::State::PRIMARY_STATE_UNCONFIGURED);
+  ASSERT_TRUE(driver_->set_parameter(rclcpp::Parameter("sonar_ip", "sonar.local")).successful);
+  EXPECT_EQ(driver_->configure().id(), lifecycle_msgs::msg::State::PRIMARY_STATE_UNCONFIGURED);
+  ASSERT_TRUE(driver_->set_parameter(rclcpp::Parameter("sonar_ip", "127.0.0.1")).successful);
+  EXPECT_EQ(driver_->configure().id(), lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE);
+}
+
+TEST_P(DriverStream, RangeImageRateIsDiagnosedWhileActive)
+{
+  start();
+  for (std::uint32_t frame = 0; frame < 6; ++frame) {
+    send_frame(frame, ProtocolVersion::RIP2);
+    std::this_thread::sleep_for(50ms);
+    executor_.spin_some();
+  }
+  ASSERT_TRUE(wait_for([this] {return !rate_status_.name.empty();}));
+  EXPECT_EQ(rate_status_.hardware_id, "127.0.0.1");
+}
+
+TEST_P(DriverStream, AutostartParameterActivatesOnceSpinning)
+{
+  rclcpp::NodeOptions options;
+  options.use_intra_process_comms(GetParam());
+  options.arguments({"--ros-args", "-r", "__ns:=/sonar3d_autostart_test"});
+  options.append_parameter_override("autostart", true);
+  options.append_parameter_override("configure_sonar", false);
+  options.append_parameter_override("multicast_group", "239.255.96.15");
+  options.append_parameter_override("multicast_port", sonar3d::testing::unused_udp_port());
+  options.append_parameter_override("multicast_interface", "127.0.0.1");
+  const auto driver = std::make_shared<sonar3d::SonarDriver>(options);
+  EXPECT_EQ(
+    driver->get_current_state().id(), lifecycle_msgs::msg::State::PRIMARY_STATE_UNCONFIGURED);
+  rclcpp::executors::SingleThreadedExecutor executor;
+  executor.add_node(driver->get_node_base_interface());
+  const auto deadline = std::chrono::steady_clock::now() + 5s;
+  while (driver->get_current_state().id() != lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE &&
+    std::chrono::steady_clock::now() < deadline)
+  {
+    executor.spin_some();
+    std::this_thread::sleep_for(2ms);
+  }
+  EXPECT_EQ(driver->get_current_state().id(), lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE);
 }
 
 INSTANTIATE_TEST_SUITE_P(Transport, DriverStream, ::testing::Bool());

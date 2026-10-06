@@ -118,6 +118,11 @@ void HttpSonarApi::set_udp_multicast()
     timeout_);
 }
 
+void HttpSonarApi::set_imu_output_enabled(bool enabled)
+{
+  post_json("/api/v1/integration/output/imu-batch/enabled", enabled ? "true" : "false", timeout_);
+}
+
 void HttpSonarApi::post_json(
   const std::string & path,
   const std::string & body,
@@ -162,8 +167,8 @@ void HttpSonarApi::post_json(
   long status_code{};  // NOLINT(runtime/int): required by libcurl
   curl_easy_getinfo(handle.get(), CURLINFO_RESPONSE_CODE, &status_code);
   if (status_code < 200 || status_code >= 300) {
-    throw std::runtime_error(
-      "HTTP POST " + path + " returned status " + std::to_string(status_code));
+    throw HttpStatusError(
+      "HTTP POST " + path + " returned status " + std::to_string(status_code), status_code);
   }
 }
 
@@ -179,30 +184,45 @@ void validate_configuration(double speed_of_sound, double timeout_seconds)
   }
 }
 
-std::vector<std::string> configure_sonar(
+ConfigurationResult configure_sonar(
   SonarApi & api,
-  double speed_of_sound,
+  const ConfigurationRequest & request,
   const std::function<bool()> & stop_requested)
 {
-  validate_configuration(speed_of_sound, 1.0);
-  std::vector<std::string> applied;
+  validate_configuration(request.speed_of_sound, 1.0);
+  ConfigurationResult result;
 
-  if (speed_of_sound != 0.0 && !stopping(stop_requested)) {
-    api.set_speed_of_sound(speed_of_sound);
-    applied.emplace_back("speed_of_sound");
+  if (request.speed_of_sound != 0.0 && !stopping(stop_requested)) {
+    api.set_speed_of_sound(request.speed_of_sound);
+    result.applied.emplace_back("speed_of_sound");
   }
   if (stopping(stop_requested)) {
-    return applied;
+    return result;
   }
   api.set_acoustics_enabled(true);
-  applied.emplace_back("acoustics");
+  result.applied.emplace_back("acoustics");
 
   if (stopping(stop_requested)) {
-    return applied;
+    return result;
   }
   api.set_udp_multicast();
-  applied.emplace_back("multicast");
-  return applied;
+  result.applied.emplace_back("multicast");
+
+  if (!request.imu_output || stopping(stop_requested)) {
+    return result;
+  }
+  try {
+    api.set_imu_output_enabled(true);
+    result.applied.emplace_back("imu_output");
+  } catch (const HttpStatusError & error) {
+    // Releases before 1.8.0 have no such endpoint. Imaging still works, so
+    // report the missing feature instead of failing the configuration.
+    if (error.status() != 404) {
+      throw;
+    }
+    result.unsupported.emplace_back("imu_output");
+  }
+  return result;
 }
 
 }  // namespace sonar3d

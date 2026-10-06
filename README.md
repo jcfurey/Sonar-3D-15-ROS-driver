@@ -11,25 +11,48 @@ The driver is split into small reusable libraries:
 - `sonar3d_ros` validates images and converts them to ROS messages and REP-103
   geometry.
 - `sonar3d_io` owns the multicast socket and bounded HTTP client.
-- `sonar3d_component` is a composable `rclcpp` node. The installed
-  `sonar_publisher` executable loads that same component.
+- `sonar3d_component` is a composable managed (lifecycle) node. The installed
+  `sonar_publisher` executable runs that same component.
 
 The protobuf definition is generated during the CMake build from Water
 Linked's published protocol, so generated sources are not checked in.
 
 ## Published topics
 
-All topic names are relative and can be namespaced or remapped normally.
+Data topics are relative to the driver's namespace (`sonar3d` in the launch
+files), so they appear as `/sonar3d/points` and so on, and can be namespaced
+or remapped normally.
 
 | Topic | Type | Contract |
 | --- | --- | --- |
-| `sonar_range_image` | `sensor_msgs/Image` | Upright `32FC1` range in metres; zero means no return |
-| `sonar_intensity_image` | `sensor_msgs/Image` | Upright `mono8` signal-strength bitmap |
-| `sonar_shaded_image` | `sensor_msgs/Image` | Upright `mono8` vendor shaded-depth bitmap |
-| `sonar_point_cloud` | `sensor_msgs/PointCloud2` | Valid returns with `x,y,z,range,azimuth,elevation` float32 fields |
-| `sonar_imu` | `sensor_msgs/Imu` | Batched specific force and angular rate, one ROS message per sample |
+| `range_image` | `sensor_msgs/Image` | Upright `32FC1` range in metres; zero means no return |
+| `intensity_image` | `sensor_msgs/Image` | Upright `mono8` signal-strength bitmap |
+| `shaded_image` | `sensor_msgs/Image` | Upright `mono8` vendor shaded-depth bitmap |
+| `points` | `sensor_msgs/PointCloud2` | Valid returns with `x,y,z,range,azimuth,elevation` float32 fields |
+| `imu/data_raw` | `sensor_msgs/Imu` | REP-145 specific force and angular rate without orientation, one message per sample |
 | `/tf_static` | `tf2_msgs/TFMessage` | Documented `frame_id` to `imu_frame_id` offset (`publish_tf`) |
-| `/diagnostics` | `diagnostic_msgs/DiagnosticArray` | Stream health, configuration state, CRC errors, and sequence statistics |
+| `/diagnostics` | `diagnostic_msgs/DiagnosticArray` | `diagnostic_updater` statuses: stream health, lifecycle and configuration state, clock source, counters, and the range image rate |
+
+Following REP-2003, data topics are published with `SystemDefaultsQoS`
+(reliable), so reliable subscribers such as RViz's default and best-effort
+`SensorDataQoS` subscribers both connect. Processing nodes should subscribe
+with `SensorDataQoS`. Images are raw `sensor_msgs/Image` topics; for
+compressed transport over a tether, run `image_transport`'s republisher, e.g.
+`ros2 run image_transport republish raw compressed --ros-args -r
+in:=/sonar3d/intensity_image -r out/compressed:=/sonar3d/intensity_image/compressed`
+(`compressedDepth` handles the `32FC1` range image).
+
+Topic names before version 0.5 carried a `sonar_` prefix. To keep old
+consumers working, remap the new names back, e.g. `-r points:=sonar_point_cloud
+-r range_image:=sonar_range_image -r imu/data_raw:=sonar_imu`:
+
+| Before 0.5 | Now |
+| --- | --- |
+| `sonar_point_cloud` | `points` |
+| `sonar_range_image` | `range_image` |
+| `sonar_intensity_image` | `intensity_image` |
+| `sonar_shaded_image` | `shaded_image` |
+| `sonar_imu` | `imu/data_raw` |
 
 The point cloud is x-forward, y-left, z-up (REP-103). The device's native
 x-forward, y-right, z-down coordinates are converted when points and IMU
@@ -50,10 +73,18 @@ the REP-103 equivalent, translation `(-0.022, 0.046, 0.003)` metres from
 `frame_id` to `imu_frame_id`, on `/tf_static`. Set `publish_tf:=false` if a
 URDF already provides that joint.
 
+IMU data follows REP-145: `linear_acceleration` is specific force in m/s²
+(+g on z when level), `angular_velocity` is in rad/s, and
+`orientation_covariance[0]` is -1 because the public protocol reports no
+orientation. Covariances are zero ("unknown") unless
+`linear_acceleration_stddev` and `angular_velocity_stddev` are set. The topic
+uses REP-145's `imu` namespace; ROS 2 remaps whole names, so move it with
+`-r imu/data_raw:=<new name>`.
+
 IMU samples arrive in batches (5 at 20 Hz, 20 at 5 Hz) and are published back
-to back. Subscribe with a queue depth of at least the batch size, for example
-`rclcpp::SensorDataQoS(rclcpp::KeepLast(50))`; the default depth of 5 drops
-samples from 5 Hz batches.
+to back with a 100-message history. Subscribe with a queue depth of at least
+the batch size, for example `rclcpp::SensorDataQoS(rclcpp::KeepLast(50))`;
+the default depth of 5 drops samples from 5 Hz batches.
 
 Sensor protobuf timestamps are used by default. The sonar keeps an arbitrary
 clock until NTP succeeds, so each timestamped message is compared with ROS
@@ -107,7 +138,8 @@ accepted as a double. Other launch arguments:
 | Argument | Default | Meaning |
 | --- | --- | --- |
 | `params_file` | package `config/sonar3d.yaml` | Driver parameter file |
-| `namespace` | empty | Namespace for the driver and its relative topics |
+| `namespace` | `sonar3d` | Namespace for the driver and its relative topics |
+| `autostart` | `true` | Configure and activate the driver on start; `false` leaves it unconfigured for a lifecycle manager |
 | `container` | empty | Load the component into this running container, with intra-process communication, instead of starting `sonar_publisher` |
 | `log_level` | `info` | Log level of the standalone driver process |
 
@@ -115,20 +147,56 @@ HTTP configuration runs on a bounded background thread, so a missing sonar
 does not block the executor or multicast receive path. Setting
 `configure_sonar:=false` makes the node listen without changing device state.
 
-The component can also be loaded into an existing container directly:
+### Lifecycle
+
+The driver is a managed node:
+
+| Transition | Effect |
+| --- | --- |
+| configure | Validates parameters, opens and joins the multicast socket, creates publishers, broadcasts the IMU transform, and starts HTTP configuration. Invalid parameters or a socket error fail the transition and leave the node unconfigured. |
+| activate | Discards datagrams queued while inactive, resets sequence tracking, and starts streaming. |
+| deactivate | Stops streaming; the socket and device settings stay in place. |
+| cleanup | Releases the socket and publishers and stops pending HTTP configuration. |
+
+Driver parameters can be changed only while the node is unconfigured and take
+effect on the next configure, so a running driver never reports a value it is
+not using:
 
 ```bash
-ros2 component load /ComponentManager sonar3d sonar3d::SonarDriver
+ros2 lifecycle set /sonar3d/sonar3d_driver deactivate
+ros2 lifecycle set /sonar3d/sonar3d_driver cleanup
+ros2 param set /sonar3d/sonar3d_driver frame_id sonar_front_link
+ros2 lifecycle set /sonar3d/sonar3d_driver configure
+ros2 lifecycle set /sonar3d/sonar3d_driver activate
 ```
+
+The launch file sets the driver's `autostart` parameter, which configures and
+activates it as soon as it spins, both standalone and in a container. The
+node's own default is `false`, as a lifecycle manager such as
+`nav2_lifecycle_manager` expects; run it directly with
+`ros2 run sonar3d sonar_publisher --ros-args -p autostart:=true`, or drive the
+transitions with `ros2 lifecycle set`. The component can also be loaded into
+an existing container directly:
+
+```bash
+ros2 component load /ComponentManager sonar3d sonar3d::SonarDriver -p autostart:=true
+```
+
+`/diagnostics` is published in every state. The `RIP stream` status reports
+the lifecycle state and is OK with "not streaming" while inactive; the
+`Range image rate` status (5–20 Hz expected) is added while active. The
+update period is `diagnostic_updater`'s standard `diagnostic_updater.period`
+parameter.
 
 | Parameter | Default | Meaning |
 | --- | --- | --- |
+| `autostart` | `false` | Configure and activate when the node starts spinning (the launch file sets `true`) |
 | `sonar_ip` | `192.168.194.96` | Literal IPv4 packet source and HTTP API address; empty accepts any source when configuration is disabled |
 | `fallback_ip` | `192.168.194.96` | Additional accepted packet source, by default the sonar's fixed fallback address; empty accepts `sonar_ip` only |
 | `frame_id` | `sonar3d_link` | Frame for range, bitmap, and point-cloud products |
 | `imu_frame_id` | `sonar3d_imu_link` | Frame at the internal IMU origin |
 | `speed_of_sound` | `0.0` | m/s to configure; zero preserves the device setting |
-| `configure_sonar` | `true` | Enable acoustics and multicast through the HTTP API |
+| `configure_sonar` | `true` | On configure, enable acoustics, multicast and (with `publish_imu`) IMU output through the HTTP API |
 | `http_timeout` | `5.0` | Ordinary HTTP timeout in seconds |
 | `multicast_group` | `224.0.0.96` | RIP multicast group |
 | `multicast_port` | `4747` | RIP UDP port |
@@ -140,18 +208,16 @@ ros2 component load /ComponentManager sonar3d sonar3d::SonarDriver
 | `publish_point_cloud` | `true` | Enable the derived cloud |
 | `publish_range_image` | `true` | Enable the scaled range image |
 | `publish_bitmap_images` | `true` | Enable signal-strength and shaded bitmap topics |
-| `publish_imu` | `true` | Publish `ImuBatch` samples when present |
-| `diagnostics_period` | `1.0` | Diagnostic publication period in seconds |
+| `publish_imu` | `true` | Publish `ImuBatch` samples on `imu/data_raw` |
+| `linear_acceleration_stddev` | `0.0` | REP-145 accelerometer noise in m/s²; zero reports the covariance as unknown |
+| `angular_velocity_stddev` | `0.0` | REP-145 gyroscope noise in rad/s; zero reports the covariance as unknown |
 | `packet_stale_timeout` | `2.0` | Time without valid packets before diagnostics report a stale stream |
+| `diagnostic_updater.period` | `1.0` | `/diagnostics` period in seconds (owned by `diagnostic_updater`) |
 
 `fallback_ip` carries Water Linked's fix from the original Python driver: on
 some vehicles (Blueye, for example) the sonar's UDP output arrives from its
 fixed fallback address even when it holds a DHCP address. Packets from any
 other address are counted as `rejected_sources` and logged once per address.
-
-Parameters that determine socket, publisher, or device setup are read-only;
-restart the node to change them. This avoids reporting a parameter update that
-was not actually applied to the hardware or transport.
 
 A dedicated receive thread blocks on the socket and publishes each product as
 soon as its datagram arrives, independent of executor load, and sleeps while
@@ -168,7 +234,8 @@ Playback is native C++:
 ros2 run sonar3d sonar_replay \
   --file survey.sonar \
   --realtime-factor 1.0 \
-  --frame-id sonar3d_link
+  --frame-id sonar3d_link \
+  --ros-args -r __ns:=/sonar3d
 ```
 
 The player reads mixed RIP1/RIP2 recordings using declared packet lengths,
@@ -178,7 +245,8 @@ old `sonar_to_bag` executable name remains as an alias.
 ### Converting a recording to a bag
 
 ```bash
-ros2 run sonar3d sonar_to_bag --file survey.sonar --output survey_bag
+ros2 run sonar3d sonar_to_bag --file survey.sonar --output survey_bag \
+  --ros-args -r __ns:=/sonar3d
 ```
 
 `--output` writes every supported product straight into a new rosbag2 bag
@@ -187,14 +255,15 @@ publishing. There is no DDS discovery, no `ros2 bag record` process, and no
 real-time pacing, so conversion runs as fast as decoding and loses nothing.
 Each message is stored at its recorded sensor timestamp, which is also its
 header stamp; `--receive-time` is rejected in this mode. Topic names follow
-the node namespace, e.g. `--ros-args -r __ns:=/sonar3d` writes
-`/sonar3d/sonar_point_cloud`. The summary lists the messages written per
-topic, and framing errors fail the conversion as in playback.
+the node namespace, so the example writes `/sonar3d/points`,
+`/sonar3d/imu/data_raw` and so on, matching the live driver. The summary lists
+the messages written per topic, and framing errors fail the conversion as in
+playback.
 
 ### Publishing a recording
 
 Without `--output`, the player publishes the same data topics as the live
-driver with reliable QoS. A short startup
+driver, reliably with a 100-message history. A short startup
 delay allows DDS discovery before the first sample; control it with
 `--startup-delay`. Use `--receive-time` to ignore recorded sensor timestamps.
 
@@ -231,13 +300,20 @@ if framing is lost.
 Some GUI recordings contain private `waterlinked.sonar.internal.ImuOrientation`
 and `ImuRaw` messages. Their payload schemas are absent from the public vendor
 protocol. They are reported as unsupported and are not converted into
-`sonar_imu`; that topic supports the documented public `ImuBatch` format.
+`imu/data_raw`; that topic supports the documented public `ImuBatch` format.
 Keep the original recordings to retain private telemetry. For future recordings,
-enable public raw IMU output through the sonar's integration HTTP API before
-recording. The vendor manual (Integration API, pages 36–38) describes 100 Hz
-`ImuBatch` output, disabled by default. Its linked
+enable public raw IMU output before recording. The vendor manual (Integration
+API, pages 36–38) describes 100 Hz `ImuBatch` output, disabled by default, and
+its linked
 [HTTP specification](https://docs.waterlinked.com/sonar-3d/sonar-3d-15-api-swagger/swagger.json)
-defines a boolean POST to `/api/v1/integration/output/imu-batch/enabled`:
+defines a boolean POST to `/api/v1/integration/output/imu-batch/enabled`.
+
+With `configure_sonar` and `publish_imu` both true (the defaults), the live
+driver sends that request itself after enabling acoustics and multicast.
+Releases before 1.8.0 answer 404; the driver then logs that IMU output is
+unsupported and diagnostics report `configuration_unsupported: imu_output`
+as a warning, while imaging continues. With `configure_sonar:=false`, enable
+it yourself:
 
 ```bash
 SONAR_IP=192.168.194.96  # Set this to your sonar's address.
@@ -246,10 +322,8 @@ curl --fail --show-error \
   "http://${SONAR_IP}/api/v1/integration/output/imu-batch/enabled"
 ```
 
-`publish_imu` controls ROS publication of received samples; it does not enable
-the device's IMU output. Configure that output separately, with acoustics and
-UDP output enabled. Existing recordings need recorded public `ImuBatch` packets
-to replay samples on `sonar_imu`; enabling device output later cannot add them.
+Existing recordings need recorded public `ImuBatch` packets to replay samples
+on `imu/data_raw`; enabling device output later cannot add them.
 
 ### Standalone RViz playback
 
@@ -258,7 +332,7 @@ ros2 launch sonar3d sonar_replay.launch.py file:=/absolute/path/survey.sonar
 ```
 
 The included layout shows the current cloud and signal-strength image on the
-driver's native topic names. Enable the optional Shaded depth display for
+driver's topic names in the `sonar3d` namespace. Enable the optional Shaded depth display for
 recordings containing shaded images. Its fixed frame is `sonar3d_link`,
 so no vehicle model or identity `odom` transform is needed. The viewer publishes
 the documented sensor-to-IMU static transform to provide a complete sensor TF
@@ -289,11 +363,12 @@ directly with `--output` as above):
 
 ```bash
 ros2 bag record \
-  /sonar_range_image \
-  /sonar_intensity_image \
-  /sonar_shaded_image \
-  /sonar_point_cloud \
-  /sonar_imu
+  /sonar3d/range_image \
+  /sonar3d/intensity_image \
+  /sonar3d/shaded_image \
+  /sonar3d/points \
+  /sonar3d/imu/data_raw \
+  /tf_static
 ```
 
 ## Tests
@@ -322,7 +397,13 @@ exact sensor timestamps, and that the fallback source is accepted while other
 sources are rejected. Offset-estimator tests cover latency spikes, drift, and
 clock steps. Image tests check the upright row order against the vendor's
 pixel-to-angle formula, and bag tests check that `--output` writes every
-product with its sensor timestamp without pacing.
+product with its sensor timestamp without pacing. Lifecycle tests check that
+deactivation pauses streaming and discards stale datagrams without counting
+false sequence gaps, that parameters change only while unconfigured and apply
+on the next configure, that invalid parameters fail configure recoverably, and
+that the `autostart` parameter activates the node. A reliable subscriber test
+guards REP-2003 compatibility, HTTP tests cover the IMU output step and its
+404 fallback, and IMU tests cover REP-145 covariances.
 
 For repeatable performance measurements, build the optional benchmark from the
 workspace root after an optimized build with testing enabled:

@@ -339,8 +339,14 @@ std::vector<sensor_msgs::msg::Imu> make_imu_messages(
   const std::string & frame_id,
   const builtin_interfaces::msg::Time & fallback_stamp,
   bool use_sensor_timestamp,
-  std::int64_t sensor_offset_nanoseconds)
+  std::int64_t sensor_offset_nanoseconds,
+  const ImuNoise & noise)
 {
+  if (!std::isfinite(noise.linear_acceleration_stddev) || noise.linear_acceleration_stddev < 0.0 ||
+    !std::isfinite(noise.angular_velocity_stddev) || noise.angular_velocity_stddev < 0.0)
+  {
+    throw std::invalid_argument("IMU standard deviations must be finite and non-negative");
+  }
   const auto sample_count = static_cast<std::size_t>(source.sample_count);
   if (source.timestamps.size() != sample_count ||
     source.specific_force.size() != sample_count * 3U ||
@@ -359,7 +365,14 @@ std::vector<sensor_msgs::msg::Imu> make_imu_messages(
     message.header = make_header(
       source_header, frame_id, fallback_stamp, use_sensor_timestamp, sensor_offset_nanoseconds);
     message.orientation.w = 1.0;
+    // REP-145: -1 marks the orientation as not reported.
     message.orientation_covariance[0] = -1.0;
+    for (const std::size_t diagonal : {0U, 4U, 8U}) {
+      message.linear_acceleration_covariance[diagonal] =
+        noise.linear_acceleration_stddev * noise.linear_acceleration_stddev;
+      message.angular_velocity_covariance[diagonal] =
+        noise.angular_velocity_stddev * noise.angular_velocity_stddev;
+    }
 
     // Water Linked reports x-forward, y-right, z-down. A 180-degree rotation
     // about x maps both vectors into the ROS body convention (x-forward,

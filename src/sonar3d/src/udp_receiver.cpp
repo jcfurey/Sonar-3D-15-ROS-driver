@@ -205,4 +205,23 @@ void UdpReceiver::interrupt()
   [[maybe_unused]] const auto written = write(wake_event_, &increment, sizeof(increment));
 }
 
+void UdpReceiver::clear_interrupt()
+{
+  // Reading an eventfd returns and resets its counter; EAGAIN means it was clear.
+  std::uint64_t counter{};
+  [[maybe_unused]] const auto read_bytes = read(wake_event_, &counter, sizeof(counter));
+}
+
+std::size_t UdpReceiver::discard_pending()
+{
+  std::size_t discarded{};
+  while (true) {
+    if (recv(socket_, buffer_.data(), buffer_.size(), MSG_DONTWAIT) >= 0) {
+      ++discarded;
+    } else if (errno != EINTR) {
+      return discarded;
+    }
+  }
+}
+
 }  // namespace sonar3d
