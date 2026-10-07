@@ -2,7 +2,8 @@
 
 Native C++20 ROS 2 driver and recording player for the Water Linked Sonar
 3D-15. The package is tested on ROS 2 Jazzy and has no Python or `wlsonar`
-runtime dependency.
+runtime dependency in its driver/player. The optional quantitative image viewer
+uses NumPy and Matplotlib.
 
 The driver is split into small reusable libraries:
 
@@ -30,6 +31,8 @@ or remapped normally.
 | `shaded_image` | `sensor_msgs/Image` | Upright `mono8` vendor shaded-depth bitmap |
 | `points` | `sensor_msgs/PointCloud2` | Valid returns with `x,y,z,intensity,range,azimuth,elevation` float32 fields |
 | `imu/data_raw` | `sensor_msgs/Imu` | REP-145 specific force and angular rate without orientation, one message per sample |
+| `image_metadata` | `sonar3d/ImageMetadata` | Exact image header, source shot ID/clock, angular geometry, acquisition settings and driver source fingerprint; one message per range/bitmap image |
+| `quantitative_image` | `sensor_msgs/Image` | Optional headless renderer's display-only `rgb8` figure: labelled range and signal panels, fixed scales and no-return masks; measurements remain on the raw topics |
 | `/tf_static` | `tf2_msgs/TFMessage` | Documented `frame_id` to `imu_frame_id` offset (`publish_tf`) |
 | `/diagnostics` | `diagnostic_msgs/DiagnosticArray` | `diagnostic_updater` statuses: stream health, lifecycle and configuration state, clock source, counters, range image rate, and the sonar's own status (temperature, self-check, NTP sync, firmware) |
 
@@ -446,8 +449,125 @@ ros2 bag record \
   /sonar3d/shaded_image \
   /sonar3d/points \
   /sonar3d/imu/data_raw \
+  /sonar3d/image_metadata \
   /tf_static
 ```
+
+### Quantitative 2D images
+
+The raw image topics remain measurement data. `image_metadata` supplies the
+settings for each image, paired by **image type, frame, and exact ROS header
+timestamp**. It retains the original sonar timestamp separately from the ROS
+header: receive-time playback and live clock re-anchoring do not erase the
+recorded clock. A sonar clock reading is not evidence of NTP synchronization.
+`frequency` is copied as the vendor field without assigning an undocumented
+unit. `driver_source_sha256` fingerprints the native production source,
+headers, protocol/interface definitions and build/package descriptions.
+
+The optional viewer uses the same rendering code for live viewing and saved
+figures:
+
+```bash
+ros2 run sonar3d sonar_image_viewer --namespace sonar3d \
+  --range-limits 0 15 --signal-limits 0 255 --output image-captures
+```
+
+Or add it to standalone replay, including the Nautilus GPU helper:
+
+```bash
+ros2 launch sonar3d sonar_replay.launch.py file:=/absolute/path/survey.sonar \
+  scientific_images:=true image_range_min:=0 image_range_max:=15
+```
+
+RViz replay now shows the same labelled figure in its **Quantitative images**
+panel automatically, using a headless `sonar_image_publisher`. The RGB image
+includes angular axes, metre/code colour bars, source and ROS clocks, coverage,
+and acquisition settings. It uses the same `ScientificFigure` renderer as the
+offline figures. This is a display-only raster; use `range_image` and
+`intensity_image` for analysis, not the plotted pixels.
+
+The default display rate is 3 Hz, selecting the latest ready shot without
+averaging; raw measurements keep their original publication rate. The output
+uses reliable, transient-local QoS with depth 1, allowing a newly enabled RViz
+panel to receive the last plotted frame after replay ends. Rendering pauses
+when there are no output subscribers. `rviz_images:=false` disables the replay
+renderer. Raw range, raw signal and qualitative shaded displays remain optional;
+the raw range panel explicitly disables RViz's per-frame normalization and
+uses 0–15 m. Adjust these raw-panel limits manually for other configured ranges.
+
+For a live driver, enable `quantitative_images:=true` in `sonar3d.launch.py`,
+or start the renderer alongside an existing driver:
+
+```bash
+ros2 run sonar3d sonar_image_publisher --namespace sonar3d \
+  --range-limits 0 15 --signal-limits 0 255 --refresh-hz 3
+```
+
+Add an RViz Image display on `/sonar3d/quantitative_image`, with Reliable and
+Transient Local QoS. RGB colours are already fixed by the renderer; RViz's
+floating-point normalization does not apply. See the
+[Jazzy Image display implementation](https://github.com/ros2/rviz/blob/jazzy/rviz_default_plugins/src/rviz_default_plugins/displays/image/image_display.cpp).
+
+Closing either enabled viewer stops the launch. The image viewer offers
+**Pause/Resume** and **Save frame**; pausing freezes the displayed shot while
+reception continues. It displays only products with matching source shot
+IDs/clocks and geometry, never a signal image from the previous shot. If a
+signal image is missing, the range remains viewable with signal marked
+unavailable.
+
+The plots show **slant range in metres** and the vendor's logarithmic signal
+code. Colour limits are fixed (defaults 0–15 m and 0–255), never normalized to
+each frame. Zero/no-return pixels are grey and excluded from summaries;
+out-of-scale returns use distinct under/over colours and are counted. The
+[perceptually uniform sequential colormap](https://matplotlib.org/stable/users/explain/colors/colormaps.html)
+defaults to `cividis`; `viridis` and `magma` are also available. Angular axes use
+REP-103 degrees, positive left and up. Vendor first/last pixel **centres** lie
+at the FOV endpoints; figure boundaries extend half a bin beyond these centres.
+Pixels are not interpolated. Image cells represent the strongest return in
+each direction, not a Cartesian slice or a range-time echogram.
+
+For vendor-relative linear signal strength, use `--signal-scale linear`
+(default limits 0–10644). Its documented conversion is
+`round(30 * 10 ** (code / 100))`, with zero retained as no return. This is
+**not calibrated acoustic backscatter**. Shaded bitmaps are saved as qualitative
+vendor codes when present; metric distance always comes from `range_image`.
+
+Export a selected frame reproducibly from an original recording:
+
+```bash
+ros2 run sonar3d sonar_image_viewer --file survey.sonar --frame-index 0 \
+  --range-limits 0 15 --signal-limits 0 255 --output figures/shot-0
+```
+
+The native player first validates supported products, then converts to a temporary bag with
+metadata, then the viewer reads the selected shot. `--frame-index` is zero
+based in bag read order; `--sequence-id` selects a source shot instead.
+`--bag` reads an existing rosbag2 bag containing `image_metadata`. Recordings
+or older bags without metadata cannot provide angular/acquisition provenance;
+use the original `.sonar` input to generate it.
+
+Each new bundle contains `figure.png`, `figure.pdf`, `data.npz`, and
+`metadata.json`. Arrays preserve upright float32 metre measurements and
+uint8 signal/shaded codes, with valid-return masks, relative linear strength
+and angular pixel centres. The manifest records source SHA-256, native
+converter/library and driver source fingerprints, exact integer timestamps,
+shot/settings metadata, colour limits/units, array checksums, and Python,
+NumPy and Matplotlib versions. Raw ROS range precision is retained; keep
+the original recording for its pre-conversion integer pixels and telemetry.
+Existing bundles are never overwritten.
+
+Verify and rerender a bundle with its saved colour settings:
+
+```bash
+ros2 run sonar3d sonar_image_viewer --bundle figures/shot-0 --output figures/shot-0-copy
+```
+
+Array checksums are verified before rendering. Fixed data, settings and the
+same plotting environment reproduce the PNG; font/backend/library version
+changes can change rendering, which is why the numeric data and environment
+are retained. Display scale changes do not modify saved measurements. Standalone
+replay also attaches the recording's SHA-256 to live snapshots; when starting
+the image viewer separately for replay, pass `--source-recording survey.sonar`.
 
 ## Tests
 

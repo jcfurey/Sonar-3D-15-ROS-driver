@@ -200,6 +200,7 @@ private:
   Publisher<sensor_msgs::msg::Image> range_image_publisher_;
   Publisher<sensor_msgs::msg::Image> intensity_image_publisher_;
   Publisher<sensor_msgs::msg::Image> shaded_image_publisher_;
+  Publisher<msg::ImageMetadata> image_metadata_publisher_;
   Publisher<sensor_msgs::msg::PointCloud2> point_cloud_publisher_;
   Publisher<sensor_msgs::msg::Imu> imu_publisher_;
   std::unique_ptr<tf2_ros::StaticTransformBroadcaster> static_transform_broadcaster_;

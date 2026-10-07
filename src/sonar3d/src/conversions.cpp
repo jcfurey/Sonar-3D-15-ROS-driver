@@ -451,4 +451,51 @@ std::vector<sensor_msgs::msg::Imu> make_imu_messages(
   return messages;
 }
 
+namespace
+{
+template<typename Image>
+msg::ImageMetadata image_metadata(const Image & source, const std_msgs::msg::Header & header)
+{
+  static_cast<void>(expected_pixel_count(source.width, source.height, source.pixels.size(),
+        "image metadata"));
+  msg::ImageMetadata metadata;
+  metadata.header = header;
+  metadata.sequence_id = source.header.sequence_id;
+  metadata.width = source.width;
+  metadata.height = source.height;
+  metadata.horizontal_fov_degrees = source.horizontal_fov_degrees;
+  metadata.vertical_fov_degrees = source.vertical_fov_degrees;
+  metadata.configured_range_m = source.range;
+  metadata.speed_of_sound_mps = source.speed_of_sound;
+  metadata.frequency = source.frequency;
+  metadata.sensor_timestamp_valid = sensor_nanoseconds(source.header.timestamp).has_value();
+  if (source.header.timestamp) {
+    metadata.sensor_stamp_seconds = source.header.timestamp->seconds;
+    metadata.sensor_stamp_nanoseconds = source.header.timestamp->nanoseconds;
+  }
+  metadata.driver_version = SONAR3D_VERSION;
+  metadata.driver_source_sha256 = SONAR3D_SOURCE_SHA256;
+  return metadata;
+}
+}  // namespace
+
+msg::ImageMetadata make_image_metadata(
+  const protocol::RangeImage & source, const std_msgs::msg::Header & header)
+{
+  auto metadata = image_metadata(source, header);
+  metadata.image_type = msg::ImageMetadata::RANGE;
+  metadata.range_pixel_scale_m = source.pixel_scale;
+  return metadata;
+}
+
+msg::ImageMetadata make_image_metadata(
+  const protocol::BitmapImage & source, const std_msgs::msg::Header & header)
+{
+  auto metadata = image_metadata(source, header);
+  metadata.image_type = source.type == protocol::BitmapImageType::SHADED_IMAGE ?
+    msg::ImageMetadata::SHADED : msg::ImageMetadata::SIGNAL;
+  return metadata;
+}
+
+
 }  // namespace sonar3d::conversions

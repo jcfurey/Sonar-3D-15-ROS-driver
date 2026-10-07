@@ -20,6 +20,7 @@
 #include <std_msgs/msg/header.hpp>
 
 #include "sonar3d/protocol.hpp"
+#include "sonar3d/msg/image_metadata.hpp"
 
 namespace sonar3d::conversions
 {
@@ -59,6 +60,12 @@ struct RangePoint
 [[nodiscard]] sensor_msgs::msg::Image make_range_image(
   const protocol::RangeImage & source,
   const std_msgs::msg::Header & header);
+
+// Header exactly matches its image; original sensor clock remains separate.
+[[nodiscard]] msg::ImageMetadata make_image_metadata(
+  const protocol::RangeImage & source, const std_msgs::msg::Header & header);
+[[nodiscard]] msg::ImageMetadata make_image_metadata(
+  const protocol::BitmapImage & source, const std_msgs::msg::Header & header);
 
 // Throws std::invalid_argument unless the image can be converted to a point
 // cloud; lets callers that defer the cloud reject a malformed image at once.

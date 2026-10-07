@@ -616,6 +616,42 @@ TEST_P(DriverStream, ConfiguresTheSonarAndReportsDeviceStatus)
   EXPECT_EQ(posted["/output/imu-batch/enabled"], "true");
 }
 
+// Uncrustify 0.78 misparses the generated ROS type in this GTest callback.
+// *INDENT-OFF*
+TEST_P(DriverStream, ImageMetadataMatchesEveryRawImageWithReceiveTimeHeaders)
+{
+  start(true, 0.0, {rclcpp::Parameter("use_sensor_timestamps", false)});
+  subscribe();
+  std::vector<sonar3d::msg::ImageMetadata::ConstSharedPtr> metadata;
+  const auto subscription = observer_->create_subscription<sonar3d::msg::ImageMetadata>(
+    "image_metadata", rclcpp::QoS(100),
+    [&metadata](sonar3d::msg::ImageMetadata::ConstSharedPtr message) {
+      metadata.push_back(message);
+    });
+  ASSERT_TRUE(discovered());
+  ASSERT_TRUE(wait_for([this] {return driver_->count_subscribers("image_metadata") == 1U;}));
+  send_frame(3, ProtocolVersion::RIP2);
+  ASSERT_TRUE(wait_for([this, &metadata] {
+      return metadata.size() == 3 && ranges_.size() == 1 && intensities_.size() == 1 &&
+             shaded_.size() == 1;
+    }));
+  for (const auto & item : metadata) {
+    EXPECT_EQ(item->sequence_id, 3U);
+    EXPECT_TRUE(item->sensor_timestamp_valid);
+    const auto source = sonar3d::testing::range_image(3);
+    EXPECT_EQ(item->sensor_stamp_seconds, source.header.timestamp->seconds);
+    EXPECT_EQ(item->sensor_stamp_nanoseconds, source.header.timestamp->nanoseconds);
+    if (item->image_type == sonar3d::msg::ImageMetadata::RANGE) {
+      EXPECT_EQ(item->header, ranges_.front()->header);
+    } else if (item->image_type == sonar3d::msg::ImageMetadata::SIGNAL) {
+      EXPECT_EQ(item->header, intensities_.front()->header);
+    } else {
+      EXPECT_EQ(item->header, shaded_.front()->header);
+    }
+  }
+}
+// *INDENT-ON*
+
 INSTANTIATE_TEST_SUITE_P(Transport, DriverStream, ::testing::Bool());
 
 }  // namespace
