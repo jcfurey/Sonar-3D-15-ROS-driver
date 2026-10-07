@@ -214,6 +214,10 @@ void SonarDriver::configure_driver()
   // reliable subscribers and SensorDataQoS (best-effort) subscribers connect.
   // IMU samples arrive in batches of up to 20, so keep a second of history.
   const auto product_qos = rclcpp::SystemDefaultsQoS().keep_last(5);
+  if (parameters.publish_range_image || parameters.publish_bitmap_images) {
+    image_metadata_publisher_ = create_publisher<msg::ImageMetadata>(
+      "image_metadata", rclcpp::SystemDefaultsQoS().keep_last(100));
+  }
   if (parameters.publish_range_image) {
     range_image_publisher_ = create_publisher<sensor_msgs::msg::Image>("range_image", product_qos);
   }
@@ -351,6 +355,7 @@ void SonarDriver::release()
   range_image_publisher_.reset();
   intensity_image_publisher_.reset();
   shaded_image_publisher_.reset();
+  image_metadata_publisher_.reset();
   point_cloud_publisher_.reset();
   imu_publisher_.reset();
   receiver_.reset();
@@ -659,6 +664,10 @@ void SonarDriver::handle_range_image(
     range_image_publisher_->publish(
       std::make_unique<sensor_msgs::msg::Image>(conversions::make_range_image(image, header)));
   }
+  if (range_image_publisher_ && has_subscribers(image_metadata_publisher_)) {
+    image_metadata_publisher_->publish(
+      std::make_unique<msg::ImageMetadata>(conversions::make_image_metadata(image, header)));
+  }
   if (has_subscribers(point_cloud_publisher_)) {
     if (settings_.point_cloud_intensity) {
       // Reject a malformed image now rather than when its pair completes.
@@ -713,11 +722,17 @@ void SonarDriver::handle_bitmap_image(
       return;
   }
   const auto offset = sensor_clock_offset(image.header.timestamp, fallback_stamp);
-  if (has_subscribers(publisher)) {
+  if (has_subscribers(publisher) || (publisher && has_subscribers(image_metadata_publisher_))) {
     const auto header = conversions::make_header(
       image.header, settings_.frame_id, fallback_stamp, settings_.use_sensor_timestamps, offset);
-    publisher->publish(std::make_unique<sensor_msgs::msg::Image>(
-        conversions::make_bitmap_image(image, header)));
+    if (has_subscribers(publisher)) {
+      publisher->publish(std::make_unique<sensor_msgs::msg::Image>(
+          conversions::make_bitmap_image(image, header)));
+    }
+    if (has_subscribers(image_metadata_publisher_)) {
+      image_metadata_publisher_->publish(
+        std::make_unique<msg::ImageMetadata>(conversions::make_image_metadata(image, header)));
+    }
   }
   metrics_.bitmap_images.fetch_add(1, std::memory_order_relaxed);
   if (image.type == protocol::BitmapImageType::SIGNAL_STRENGTH_IMAGE &&

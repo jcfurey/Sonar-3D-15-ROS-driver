@@ -9,8 +9,9 @@
 
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, OpaqueFunction
+from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
-from launch_ros.actions import LifecycleNode, LoadComposableNodes
+from launch_ros.actions import LifecycleNode, LoadComposableNodes, Node
 from launch_ros.descriptions import ComposableLifecycleNode
 from launch_ros.substitutions import FindPackageShare
 
@@ -123,6 +124,9 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'log_level', default_value='info',
             description='Driver log level when it runs in its own process'),
+        DeclareLaunchArgument(
+            'quantitative_images', default_value='false',
+            description='Publish labelled RGB figures for RViz from raw images and metadata'),
     ]
     arguments += [
         DeclareLaunchArgument(
@@ -130,4 +134,9 @@ def generate_launch_description():
             description=f'Override {name} from params_file ({declared_type.__name__})')
         for name, declared_type in PARAMETER_TYPES.items()
     ]
-    return LaunchDescription(arguments + [OpaqueFunction(function=_driver)])
+    images = Node(
+        package='sonar3d', executable='sonar_image_publisher',
+        namespace=LaunchConfiguration('namespace'),
+        condition=IfCondition(LaunchConfiguration('quantitative_images')),
+        arguments=['--namespace', LaunchConfiguration('namespace')], output='screen')
+    return LaunchDescription(arguments + [OpaqueFunction(function=_driver), images])

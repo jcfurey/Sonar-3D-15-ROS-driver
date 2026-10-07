@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(sonar3d VERSION 0.6.0 LANGUAGES CXX)
+project(sonar3d VERSION 0.6.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -24,10 +24,14 @@ find_package(rclcpp_components REQUIRED)
 find_package(rclcpp_lifecycle REQUIRED)
 find_package(rosbag2_cpp REQUIRED)
 find_package(rosbag2_storage REQUIRED)
+find_package(rosidl_default_generators REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(ZLIB REQUIRED)
+
+rosidl_generate_interfaces(${PROJECT_NAME} "msg/ImageMetadata.msg" DEPENDENCIES std_msgs)
+rosidl_get_typesupport_target(sonar3d_typesupport ${PROJECT_NAME} rosidl_typesupport_cpp)
 
 # Ubuntu's libsnappy-dev exports Snappy::snappy on newer releases. Retain a
 # small fallback for Jazzy-era distributions that only install headers/library.
@@ -69,7 +73,22 @@ target_link_libraries(
   PRIVATE protobuf::libprotobuf Snappy::snappy ZLIB::ZLIB
 )
 
+file(GLOB_RECURSE sonar3d_sources CONFIGURE_DEPENDS
+  "src/*.cpp" "include/*.hpp" "proto/*.proto" "msg/*.msg")
+list(APPEND sonar3d_sources "${CMAKE_CURRENT_SOURCE_DIR}/CMakeLists.txt"
+  "${CMAKE_CURRENT_SOURCE_DIR}/package.xml")
+list(SORT sonar3d_sources)
+set(sonar3d_source_hashes "")
+foreach(source IN LISTS sonar3d_sources)
+  file(SHA256 "${source}" source_hash)
+  file(RELATIVE_PATH source_name "${CMAKE_CURRENT_SOURCE_DIR}" "${source}")
+  string(APPEND sonar3d_source_hashes "${source_name}:${source_hash}\n")
+endforeach()
+string(SHA256 sonar3d_source_sha256 "${sonar3d_source_hashes}")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${sonar3d_sources})
 add_library(sonar3d_ros SHARED src/conversions.cpp)
+target_compile_definitions(sonar3d_ros PRIVATE SONAR3D_VERSION="${PROJECT_VERSION}"
+  SONAR3D_SOURCE_SHA256="${sonar3d_source_sha256}")
 target_compile_features(sonar3d_ros PUBLIC cxx_std_20)
 target_include_directories(
   sonar3d_ros
@@ -84,6 +103,7 @@ target_link_libraries(
     ${builtin_interfaces_TARGETS}
     ${sensor_msgs_TARGETS}
     ${std_msgs_TARGETS}
+    ${sonar3d_typesupport}
 )
 
 add_library(sonar3d_io SHARED src/http_client.cpp src/udp_receiver.cpp)
@@ -168,9 +188,15 @@ install(
 install(DIRECTORY include/ DESTINATION include)
 install(DIRECTORY config launch DESTINATION share/${PROJECT_NAME})
 install(DIRECTORY proto/ DESTINATION share/${PROJECT_NAME}/proto)
+install(PROGRAMS tools/sonar_image_viewer.py DESTINATION lib/${PROJECT_NAME}
+  RENAME sonar_image_viewer)
+install(PROGRAMS tools/sonar_image_publisher.py DESTINATION lib/${PROJECT_NAME}
+  RENAME sonar_image_publisher)
+install(FILES tools/sonar_image_science.py DESTINATION lib/${PROJECT_NAME})
 
 if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
+  find_package(ament_cmake_pytest REQUIRED)
   find_package(ament_lint_auto REQUIRED)
 
   # The ament wrapper intentionally omits external include paths, so cppcheck
@@ -189,6 +215,8 @@ if(BUILD_TESTING)
     test/test_recording_player.cpp
   )
   ament_lint_auto_find_test_dependencies()
+  ament_add_pytest_test(test_image_science test/test_image_science.py
+    APPEND_ENV PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/tools PYTEST_DISABLE_PLUGIN_AUTOLOAD=1)
 
   ament_add_gtest(test_protocol test/test_protocol.cpp)
   target_link_libraries(test_protocol sonar3d_protocol)
@@ -242,5 +270,6 @@ ament_export_dependencies(
   sensor_msgs
   std_msgs
   tf2_ros
+  rosidl_default_runtime
 )
 ament_package()

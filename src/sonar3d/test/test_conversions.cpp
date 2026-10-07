@@ -426,4 +426,54 @@ TEST(Conversions, DirectBuildersRetainValidationOfDimensionsAndOverflow)
       std::invalid_argument);
 }
 
+// Uncrustify 0.78 misparses the generated ROS type in these GTest macros.
+// *INDENT-OFF*
+TEST(Conversions, ImageMetadataSeparatesSourceClockFromRosHeader)
+{
+  auto source = test_range_image();
+  source.header.sequence_id = 12;
+  source.speed_of_sound = 1491.0F;
+  source.range = 15.0F;
+  source.frequency = 5;
+  std_msgs::msg::Header header;
+  header.frame_id = "sonar_link";
+  header.stamp.sec = 1'800'000'000;
+  header.stamp.nanosec = 99;
+  const auto metadata = sonar3d::conversions::make_image_metadata(source, header);
+  EXPECT_EQ(metadata.header, header);
+  EXPECT_EQ(metadata.image_type, sonar3d::msg::ImageMetadata::RANGE);
+  EXPECT_EQ(metadata.sequence_id, 12U);
+  EXPECT_EQ(metadata.width, 3U);
+  EXPECT_EQ(metadata.height, 2U);
+  EXPECT_FLOAT_EQ(metadata.horizontal_fov_degrees, 90.0F);
+  EXPECT_FLOAT_EQ(metadata.vertical_fov_degrees, 40.0F);
+  EXPECT_FLOAT_EQ(metadata.configured_range_m, 15.0F);
+  EXPECT_FLOAT_EQ(metadata.speed_of_sound_mps, 1491.0F);
+  EXPECT_FLOAT_EQ(metadata.range_pixel_scale_m, 0.01F);
+  EXPECT_EQ(metadata.frequency, 5U);
+  EXPECT_TRUE(metadata.sensor_timestamp_valid);
+  EXPECT_EQ(metadata.sensor_stamp_seconds, 123);
+  EXPECT_EQ(metadata.sensor_stamp_nanoseconds, 456);
+  EXPECT_EQ(metadata.driver_source_sha256.size(), 64U);
+}
+
+TEST(Conversions, BitmapMetadataDistinguishesProductsAndMissingSensorTime)
+{
+  sonar3d::protocol::BitmapImage source;
+  source.width = 2;
+  source.height = 1;
+  source.pixels = {0, 100};
+  source.type = sonar3d::protocol::BitmapImageType::SHADED_IMAGE;
+  const std_msgs::msg::Header header;
+  const auto metadata = sonar3d::conversions::make_image_metadata(source, header);
+  EXPECT_EQ(metadata.image_type, sonar3d::msg::ImageMetadata::SHADED);
+  EXPECT_FALSE(metadata.sensor_timestamp_valid);
+  EXPECT_EQ(metadata.sensor_stamp_seconds, 0);
+  EXPECT_FLOAT_EQ(metadata.range_pixel_scale_m, 0.0F);
+  source.type = sonar3d::protocol::BitmapImageType::SIGNAL_STRENGTH_IMAGE;
+  EXPECT_EQ(sonar3d::conversions::make_image_metadata(source, header).image_type,
+    sonar3d::msg::ImageMetadata::SIGNAL);
+}
+// *INDENT-ON*
+
 }  // namespace

@@ -27,6 +27,12 @@ def generate_launch_description():
         DeclareLaunchArgument('imu_frame_id', default_value='sonar3d_imu_link'),
         DeclareLaunchArgument('namespace', default_value='sonar3d'),
         DeclareLaunchArgument('rviz', default_value='true'),
+        DeclareLaunchArgument('rviz_images', default_value=LaunchConfiguration('rviz'),
+                              description='Publish labelled quantitative RGB images for RViz'),
+        DeclareLaunchArgument('scientific_images', default_value='false'),
+        DeclareLaunchArgument('image_output', default_value='sonar-image-captures'),
+        DeclareLaunchArgument('image_range_min', default_value='0.0'),
+        DeclareLaunchArgument('image_range_max', default_value='15.0'),
     ]
     replay = Node(
         package='sonar3d',
@@ -73,4 +79,34 @@ def generate_launch_description():
         target_action=viewer,
         on_exit=[EmitEvent(event=Shutdown(reason='RViz viewer closed'))],
     ))
-    return LaunchDescription(arguments + [close_viewer, imu_tf, viewer, replay])
+    images = Node(
+        package='sonar3d',
+        executable='sonar_image_viewer',
+        condition=IfCondition(LaunchConfiguration('scientific_images')),
+        output='screen',
+        arguments=[
+            '--namespace', LaunchConfiguration('namespace'),
+            '--output', LaunchConfiguration('image_output'),
+            '--source-recording', LaunchConfiguration('file'),
+            '--range-limits', LaunchConfiguration('image_range_min'),
+            LaunchConfiguration('image_range_max'),
+        ],
+    )
+    close_images = RegisterEventHandler(OnProcessExit(
+        target_action=images,
+        on_exit=[EmitEvent(event=Shutdown(reason='Scientific image viewer closed'))],
+    ))
+    rviz_images = Node(
+        package='sonar3d',
+        executable='sonar_image_publisher',
+        namespace=LaunchConfiguration('namespace'),
+        condition=IfCondition(LaunchConfiguration('rviz_images')),
+        output='screen',
+        arguments=[
+            '--namespace', LaunchConfiguration('namespace'),
+            '--range-limits', LaunchConfiguration('image_range_min'),
+            LaunchConfiguration('image_range_max'),
+        ],
+    )
+    return LaunchDescription(arguments + [close_viewer, close_images,
+                                          imu_tf, rviz_images, viewer, images, replay])

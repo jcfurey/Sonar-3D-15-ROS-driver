@@ -252,6 +252,7 @@ public:
     shaded_image_.topic = resolve("shaded_image");
     point_cloud_.topic = resolve("points");
     imu_.topic = resolve("imu/data_raw");
+    image_metadata_.topic = resolve("image_metadata");
     if (mode_ == OutputMode::BAG) {
       rosbag2_storage::StorageOptions storage;
       storage.uri = options.output;
@@ -268,6 +269,7 @@ public:
       advertise(shaded_image_, qos);
       advertise(point_cloud_, qos);
       advertise(imu_, qos);
+      advertise(image_metadata_, qos);
     }
   }
 
@@ -293,8 +295,15 @@ public:
           if (cloud) {
             conversions::validate_point_cloud_source(message);
           }
+          std::optional<msg::ImageMetadata> metadata;
+          if (wanted(image_metadata_)) {
+            metadata = conversions::make_image_metadata(message, header);
+          }
           if (image) {
             emit(range_image_, std::move(*image));
+          }
+          if (metadata) {
+            emit(image_metadata_, std::move(*metadata));
           }
           if (cloud && intensity_) {
             // The cloud waits for this shot's signal-strength image.
@@ -307,10 +316,15 @@ public:
         } else if constexpr (std::is_same_v<MessageType, protocol::BitmapImage>) {
           auto & output = message.type == protocol::BitmapImageType::SHADED_IMAGE ?
           shaded_image_ : intensity_image_;
-          if (wanted(output)) {
+          if (wanted(output) || wanted(image_metadata_)) {
             const auto header = conversions::make_header(
               message.header, frame_id_, fallback_stamp, use_sensor_timestamps_);
-            emit(output, conversions::make_bitmap_image(message, header));
+            if (wanted(output)) {
+              emit(output, conversions::make_bitmap_image(message, header));
+            }
+            if (wanted(image_metadata_)) {
+              emit(image_metadata_, conversions::make_image_metadata(message, header));
+            }
           }
           if (message.type == protocol::BitmapImageType::SIGNAL_STRENGTH_IMAGE && intensity_ &&
           wanted(point_cloud_))
@@ -414,6 +428,7 @@ private:
   Output<sensor_msgs::msg::Image> shaded_image_;
   Output<sensor_msgs::msg::PointCloud2> point_cloud_;
   Output<sensor_msgs::msg::Imu> imu_;
+  Output<msg::ImageMetadata> image_metadata_;
 };
 
 [[nodiscard]] int play_recording(const PlaybackOptions & options)

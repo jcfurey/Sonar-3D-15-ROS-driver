@@ -380,6 +380,19 @@ TEST_F(ReplayTest, OutputWritesEveryProductToABagWithoutPacing)
   ASSERT_EQ(topics["/sonar3d_replay_test/intensity_image"].size(), 12U);
   ASSERT_EQ(topics["/sonar3d_replay_test/shaded_image"].size(), 12U);
   ASSERT_EQ(topics["/sonar3d_replay_test/imu/data_raw"].size(), 60U);
+  ASSERT_EQ(topics["/sonar3d_replay_test/image_metadata"].size(), 36U);
+
+  rclcpp::Serialization<sonar3d::msg::ImageMetadata> metadata_serialization;
+  for (const auto & stored : topics["/sonar3d_replay_test/image_metadata"]) {
+    sonar3d::msg::ImageMetadata metadata;
+    const rclcpp::SerializedMessage serialized(*stored->serialized_data);
+    metadata_serialization.deserialize_message(&serialized, &metadata);
+    EXPECT_EQ(stored->recv_timestamp, rclcpp::Time(metadata.header.stamp).nanoseconds());
+    EXPECT_TRUE(metadata.sensor_timestamp_valid);
+    EXPECT_EQ(metadata.width, 256U);
+    EXPECT_EQ(metadata.height, 64U);
+    EXPECT_EQ(metadata.driver_source_sha256.size(), 64U);
+  }
 
   rclcpp::Serialization<Cloud> cloud_serialization;
   rclcpp::Serialization<Imu> imu_serialization;

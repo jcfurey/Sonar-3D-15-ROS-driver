@@ -40,18 +40,54 @@ Visualization Manager:
       Size (Pixels): 3
       Value: true
     - Class: rviz_default_plugins/Image
-      Name: Signal strength
+      Name: Quantitative images
       Enabled: true
+      Normalize Range: false
+      Min Value: 0
+      Max Value: 255
+      Median window: 1
+      Topic:
+        Value: quantitative_image
+        Reliability Policy: Reliable
+        Durability Policy: Transient Local
+        History Policy: Keep Last
+        Depth: 1
+      Value: true
+    - Class: rviz_default_plugins/Image
+      Name: Raw range (0-15 m; black is no return)
+      Enabled: false
+      Normalize Range: false
+      Min Value: 0
+      Max Value: 15
+      Median window: 1
+      Topic:
+        Value: range_image
+        Reliability Policy: Reliable
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Depth: 5
+      Value: false
+    - Class: rviz_default_plugins/Image
+      Name: Raw signal (vendor codes 0-255)
+      Enabled: false
+      Normalize Range: false
+      Min Value: 0
+      Max Value: 255
+      Median window: 1
       Topic:
         Value: intensity_image
         Reliability Policy: Reliable
         Durability Policy: Volatile
         History Policy: Keep Last
         Depth: 5
-      Value: true
+      Value: false
     - Class: rviz_default_plugins/Image
-      Name: Shaded depth
+      Name: Vendor shaded rendering (qualitative)
       Enabled: false
+      Normalize Range: false
+      Min Value: 0
+      Max Value: 255
+      Median window: 1
       Topic:
         Value: shaded_image
         Reliability Policy: Reliable
@@ -82,3 +118,4 @@ Visualization Manager:
 Window Geometry:
   Width: 1400
   Height: 900
+  QMainWindow State: 000000ff00000000fd00000002000000000000003e00000384fc0200000005fb000000100044006900730070006c0061007900730100000000000003840000001700fffffffb00000026005100750061006e0074006900740061007400690076006500200069006d006100670065007303000005a20000003e0000052800000262fb0000004c005200610077002000720061006e00670065002000280030002d003100350020006d003b00200062006c00610063006b0020006900730020006e006f002000720065007400750072006e0029000000016a000000b00000001700fffffffb0000003e0052006100770020007300690067006e0061006c0020002800760065006e0064006f007200200063006f00640065007300200030002d00320035003500290000000220000000af0000001700fffffffb0000004a00560065006e0064006f00720020007300680061006400650064002000720065006e0064006500720069006e006700200028007100750061006c0069007400610074006900760065002900000002d5000000af0000001700ffffff000000010000003e00000384fc0200000001fb0000000a005600690065007700730100000000000003840000001700ffffff000004f00000038400000004000000040000000800000008fc00000000
