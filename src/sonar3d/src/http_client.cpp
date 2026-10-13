@@ -208,6 +208,27 @@ NtpSyncResult parse_ntp_sync(const std::string & text)
   });
 }
 
+std::optional<std::string> parse_acoustics_mode_response(const std::string & text)
+{
+  if (text.empty()) {
+    return std::nullopt;
+  }
+  auto mode = parse_json(text, "acoustics mode", [](const json & value) {
+        return value.get<std::string>();
+  });
+  if (mode != "low-frequency" && mode != "high-frequency") {
+    throw std::runtime_error("unexpected acoustics mode response: " + mode);
+  }
+  return mode;
+}
+
+AcousticsRange parse_acoustics_range(const std::string & text)
+{
+  return parse_json(text, "acoustics range", [](const json & value) {
+             return AcousticsRange{value.at("min").get<double>(), value.at("max").get<double>()};
+  });
+}
+
 HttpSonarApi::HttpSonarApi(
   std::string address, std::chrono::milliseconds timeout,
   std::function<bool()> cancelled, std::uint16_t port)
@@ -303,6 +324,18 @@ double HttpSonarApi::temperature() const
 TimeStatus HttpSonarApi::time_status() const
 {
   return parse_time_status(request("/api/v1/integration/time/status", std::nullopt, timeout_));
+}
+
+std::optional<std::string> HttpSonarApi::acoustics_mode() const
+{
+  return parse_acoustics_mode_response(
+    request("/api/v1/integration/acoustics/mode", std::nullopt, timeout_));
+}
+
+AcousticsRange HttpSonarApi::acoustics_range() const
+{
+  return parse_acoustics_range(
+    request("/api/v1/integration/acoustics/range", std::nullopt, timeout_));
 }
 
 std::string HttpSonarApi::request(
@@ -465,6 +498,17 @@ ConfigurationResult configure_sonar(
     }
   }
   return result;
+}
+
+bool is_transient_configuration_error(const std::exception & error)
+{
+  const auto * status = dynamic_cast<const HttpStatusError *>(&error);
+  if (status == nullptr) {
+    // Connection failures, timeouts and malformed replies.
+    return dynamic_cast<const std::invalid_argument *>(&error) == nullptr;
+  }
+  const auto code = status->status();
+  return code < 400 || code >= 500 || code == 408 || code == 409 || code == 429;
 }
 
 }  // namespace sonar3d

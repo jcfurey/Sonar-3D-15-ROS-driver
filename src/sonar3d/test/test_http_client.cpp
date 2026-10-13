@@ -261,8 +261,35 @@ TEST(HttpClient, ParsesVendorResponses)
   EXPECT_EQ(sync.status.ntp_synced_to, "10.0.0.1");
   EXPECT_EQ(sync.status.seconds_since_last_sync, 2);
 
+  EXPECT_EQ(sonar3d::parse_acoustics_mode_response(R"("high-frequency")"), "high-frequency");
+  EXPECT_FALSE(sonar3d::parse_acoustics_mode_response(""));
+  const auto range = sonar3d::parse_acoustics_range(R"({"max":15,"min":0.3})");
+  EXPECT_DOUBLE_EQ(range.minimum, 0.3);
+  EXPECT_DOUBLE_EQ(range.maximum, 15.0);
+
   EXPECT_THROW(static_cast<void>(sonar3d::parse_temperature("hot")), std::runtime_error);
   EXPECT_THROW(static_cast<void>(sonar3d::parse_device_info("{}")), std::runtime_error);
+  EXPECT_THROW(
+    static_cast<void>(sonar3d::parse_acoustics_mode_response(R"("medium")")), std::runtime_error);
+  EXPECT_THROW(
+    static_cast<void>(sonar3d::parse_acoustics_range(R"({"max":15})")), std::runtime_error);
+}
+
+TEST(HttpClient, OnlyRejectedRequestsArePermanentConfigurationErrors)
+{
+  const auto transient = [](long status) {  // NOLINT(runtime/int)
+      return sonar3d::is_transient_configuration_error(sonar3d::HttpStatusError("test", status));
+    };
+  EXPECT_FALSE(transient(400));
+  EXPECT_FALSE(transient(404));
+  EXPECT_TRUE(transient(408));
+  EXPECT_TRUE(transient(409));
+  EXPECT_TRUE(transient(429));
+  EXPECT_TRUE(transient(500));
+  EXPECT_TRUE(transient(503));
+  // Unreachable sonars and malformed replies, but not invalid settings.
+  EXPECT_TRUE(sonar3d::is_transient_configuration_error(std::runtime_error("timed out")));
+  EXPECT_FALSE(sonar3d::is_transient_configuration_error(std::invalid_argument("bad")));
 }
 
 TEST(HttpSonarApi, SendsJsonBodiesTheVendorApiExpects)
@@ -313,10 +340,14 @@ TEST(HttpSonarApi, ReadsStatusAndReportsMissingEndpoints)
     "GET /api/v1/integration/time/status",
     {200, R"({"system_time":"2026-10-06T19:00:00Z","ntp_synced":true,"ntp_synced_to":"10.0.0.1",)"
       R"("ntp_seconds_since_last_sync":12})", 0ms});
+  server.respond("GET /api/v1/integration/acoustics/mode", {200, R"("low-frequency")", 0ms});
+  server.respond("GET /api/v1/integration/acoustics/range", {200, R"({"max":8,"min":0})", 0ms});
   sonar3d::HttpSonarApi api("127.0.0.1", 2s, {}, server.port());
 
   EXPECT_DOUBLE_EQ(api.temperature(), 27.25);
   EXPECT_EQ(api.time_status().seconds_since_last_sync, 12);
+  EXPECT_EQ(api.acoustics_mode(), "low-frequency");
+  EXPECT_DOUBLE_EQ(api.acoustics_range().maximum, 8.0);
   try {
     static_cast<void>(api.status());
     FAIL() << "expected a 404";

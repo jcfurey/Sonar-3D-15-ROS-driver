@@ -204,6 +204,7 @@ if(BUILD_TESTING)
   # test translation units are compiled with the same warning policy above.
   set(
     ament_cmake_cppcheck_ADDITIONAL_EXCLUDE
+    test/test_acoustics_mode.cpp
     test/test_conversions.cpp
     test/test_http_client.cpp
     test/test_protocol.cpp
@@ -232,6 +233,10 @@ if(BUILD_TESTING)
 
   ament_add_gtest(test_range_signal_pairing test/test_range_signal_pairing.cpp)
   target_link_libraries(test_range_signal_pairing sonar3d_protocol)
+
+  ament_add_gtest(test_acoustics_mode test/test_acoustics_mode.cpp)
+  target_include_directories(
+    test_acoustics_mode PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
 
   ament_add_gtest(test_sensor_clock test/test_sensor_clock.cpp)
   target_include_directories(

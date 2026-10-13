@@ -166,8 +166,12 @@ accepted as a double. Other launch arguments:
 
 HTTP configuration runs on a bounded background thread, so a missing sonar
 does not block the executor or receive path, and cleanup cancels requests in
-flight within about a second. Setting `configure_sonar:=false` makes the node
-listen without changing device state.
+flight within about a second. A sonar that is unreachable, busy or failing
+(connection errors, timeouts, HTTP 408, 409, 429 and 5xx) is configured again
+after 1 s, then at doubling intervals up to 30 s, until it accepts; a sonar
+still booting when the driver starts is therefore configured once it is up.
+A request the sonar rejects (another 4xx) is not repeated. Setting
+`configure_sonar:=false` makes the node listen without changing device state.
 
 ### Sonar settings
 
@@ -181,7 +185,7 @@ device's value", and the sonar persists what it is given:
 | `ntp_server` | NTP server for the sonar clock, an address or `auto` | 1.7.1 |
 | `salinity` | `fresh` or `salt`, used by the automatic speed of sound | 1.7.0 |
 | `speed_of_sound` | `0` automatic (from salinity and water temperature), or 1000–2000 m/s | all |
-| `acoustics_mode` | `low-frequency` (5 Hz, 90°×40°) or `high-frequency` (20 Hz, 40°×40°) | 1.7.0 |
+| `acoustics_mode` | `low-frequency` (5 Hz, 90°×40°) or `high-frequency` (20 Hz, 40°×40°); see [Acoustics modes](#acoustics-modes) | 1.7.0 |
 | `range_min`, `range_max` | Imaging range in metres; applied when `range_max` > 0 | all |
 | `udp_mode` | Multicast, or unicast to `interface_address`:`udp_port` | all |
 | `publish_imu` | Also enables `ImuBatch` output | 1.8.0 |
@@ -190,12 +194,39 @@ device's value", and the sonar persists what it is given:
 Releases older than a setting answer 404; the driver then logs which
 settings the firmware lacks and diagnostics list them in
 `configuration_unsupported` as a warning, while imaging continues. Other
-failures mark the configuration failed with the error. A wrong speed of sound
+failures report `configuration: retrying` (or `failed` when the sonar rejected
+the request) with `configuration_error` and `configuration_attempts`. A wrong speed of sound
 scales every range (1491 instead of 1530 m/s is a 2.6% error), so prefer
 `speed_of_sound: 0` with the right `salinity`, or a measured value. Giving the
 sonar an NTP server (for example the vehicle computer) lets the driver use
 its acquisition timestamps directly instead of the offset estimate described
 above.
+
+### Acoustics modes
+
+Both modes image 256×64 pixels; they differ in field of view and rate:
+
+| Mode | Field of view | Documented rate | Pixel spacing (azimuth × elevation) |
+| --- | --- | --- | --- |
+| `low-frequency` | 90° × 40° | 5 Hz (recordings run at 6.0 Hz) | 0.35° × 0.63° |
+| `high-frequency` | 40° × 40° | 20 Hz | 0.16° × 0.63° |
+
+Images carry no mode field, so the driver identifies the mode from each range
+image's field of view and converts every image with its own field of view; a
+mode change takes effect from the next image. It logs the mode when imaging
+starts or the mode changes, and the `RIP stream` diagnostic reports
+`image_fov_degrees` and `image_acoustics_mode`. The `Range image rate` bounds
+follow that mode: 5–6 Hz in low frequency and 20–24 Hz in high frequency, each
+with `diagnostic_updater`'s 10% tolerance, or 5–24 Hz before the first image or
+for an unrecognised field of view. The upper bounds allow the 20% excess seen
+in low-frequency recordings; the high-frequency rate has not yet been measured
+on hardware.
+
+Set `acoustics_mode` to the mode the vehicle should use. With
+`configure_sonar` the driver applies it; either way, `RIP stream` warns when
+the images show another mode, for example after the sonar's web interface
+changed it. The check waits for the first configuration attempt to finish.
+The `Device` diagnostic reports the mode and range the sonar itself reports.
 
 ### Unicast output
 
@@ -210,10 +241,12 @@ fails to configure instead of silently stealing packets.
 ### Device status
 
 While configured, the driver reads the sonar's `/about`, `/status`,
-`/temperature` and `/time/status` every `device_status_period` seconds (5 by
-default; 0 disables) and publishes them as the `Device` diagnostic: firmware
-version, chip ID, readiness, temperature, each component's status
-(`ok`/`warning`/`error` map to OK/WARN/ERROR), and NTP sync state. Once the
+`/temperature`, `/time/status`, `/acoustics/mode` and `/acoustics/range` every
+`device_status_period` seconds (5 by default; 0 disables) and publishes them as
+the `Device` diagnostic: firmware version, chip ID, readiness, temperature,
+each component's status (`ok`/`warning`/`error` map to OK/WARN/ERROR), NTP
+sync state, `acoustics_mode`, `range_min_m` and `range_max_m`. Endpoints that
+the firmware answers with 404 are left out. Once the
 sonar answers, its chip ID becomes the diagnostics `hardware_id`.
 
 ### Lifecycle
@@ -253,7 +286,7 @@ ros2 component load /ComponentManager sonar3d sonar3d::SonarDriver -p autostart:
 
 `/diagnostics` is published in every state. The `RIP stream` status reports
 the lifecycle state and is OK with "not streaming" while inactive; the
-`Range image rate` status (5–20 Hz expected) is added while active, and the
+`Range image rate` status (bounds per [acoustics mode](#acoustics-modes)) is added while active, and the
 `Device` status is filled while configured. The update period is
 `diagnostic_updater`'s standard `diagnostic_updater.period` parameter.
 
@@ -264,10 +297,10 @@ the lifecycle state and is OK with "not streaming" while inactive; the
 | `fallback_ip` | `192.168.194.96` | Additional accepted packet source, by default the sonar's fixed fallback address; empty accepts `sonar_ip` only |
 | `frame_id` | `sonar3d_link` | Frame for range, bitmap, and point-cloud products |
 | `imu_frame_id` | `sonar3d_imu_link` | Frame at the internal IMU origin |
-| `configure_sonar` | `true` | On configure, apply the sonar settings above and enable acoustics, UDP output and (with `publish_imu`) IMU output |
+| `configure_sonar` | `true` | On configure, apply the sonar settings above and enable acoustics, UDP output and (with `publish_imu`) IMU output, retrying while the sonar is unreachable or busy |
 | `speed_of_sound` | `-1.0` | Negative keeps the device setting; `0` automatic; otherwise 1000–2000 m/s |
 | `salinity` | empty | `fresh` or `salt`; empty keeps the device setting |
-| `acoustics_mode` | empty | `low-frequency` or `high-frequency`; empty keeps the device setting |
+| `acoustics_mode` | empty | `low-frequency` or `high-frequency`; empty keeps the device setting. Diagnostics warn when images show another mode, also with `configure_sonar` false |
 | `range_min` | `0.0` | Minimum imaging range in metres, applied with `range_max` |
 | `range_max` | `0.0` | Maximum imaging range in metres; zero keeps the device range |
 | `ntp_server` | empty | NTP server address or `auto`; empty keeps the device setting |
@@ -608,7 +641,11 @@ cancellation of a hung request; a driver test configures a stand-in sonar end
 to end and checks the `Device` diagnostic and its chip-ID `hardware_id`.
 Pairing tests cover either arrival order, lost and stale signal images, and
 sequence wraparound; stream tests cover unicast delivery, unpaired release
-after the wait, and the cloud without intensity.
+after the wait, and the cloud without intensity. Acoustics mode tests check
+that the field of view identifies each mode, that the rate bounds follow it,
+that images from an unexpected mode warn, that the `Device` diagnostic reports
+the sonar's mode and range, and that configuration is retried after a
+transient failure but not after the sonar rejects a request.
 
 For repeatable performance measurements, build the optional benchmark from the
 workspace root after an optimized build with testing enabled:

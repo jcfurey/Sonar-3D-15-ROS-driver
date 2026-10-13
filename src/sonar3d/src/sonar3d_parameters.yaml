@@ -27,7 +27,7 @@ sonar3d:
   configure_sonar:
     type: bool
     default_value: true
-    description: "On configure, enable acoustics, UDP multicast and (with publish_imu) ImuBatch output through the device HTTP API."
+    description: "On configure, apply the sonar settings and enable acoustics, UDP output and (with publish_imu) ImuBatch output through the device HTTP API. Runs in the background and is repeated while the sonar is unreachable or busy."
 
   speed_of_sound:
     type: double
@@ -46,7 +46,7 @@ sonar3d:
   acoustics_mode:
     type: string
     default_value: ""
-    description: "low-frequency (5 Hz, 90 x 40 degrees) or high-frequency (20 Hz, 40 x 40 degrees), sonar release 1.7.0+. Empty keeps the device setting."
+    description: "low-frequency (5 Hz, 90 x 40 degrees) or high-frequency (20 Hz, 40 x 40 degrees), sonar release 1.7.0+. Empty keeps the device setting. Diagnostics warn when the field of view of incoming images shows another mode, also when configure_sonar is false and the mode is only expected."
     validation:
       one_of<>: [["", "low-frequency", "high-frequency"]]
 

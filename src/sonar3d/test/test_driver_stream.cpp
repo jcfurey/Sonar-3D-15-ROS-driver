@@ -103,9 +103,10 @@ protected:
     return false;
   }
 
-  std::string value(const std::string & key) const
+  static std::string find_value(
+    const diagnostic_msgs::msg::DiagnosticStatus & status, const std::string & key)
   {
-    for (const auto & item : status_.values) {
+    for (const auto & item : status.values) {
       if (item.key == key) {
         return item.value;
       }
@@ -113,15 +114,12 @@ protected:
     return {};
   }
 
+  std::string value(const std::string & key) const {return find_value(status_, key);}
   std::string device_value(const std::string & key) const
   {
-    for (const auto & item : device_status_.values) {
-      if (item.key == key) {
-        return item.value;
-      }
-    }
-    return {};
+    return find_value(device_status_, key);
   }
+  std::string rate_value(const std::string & key) const {return find_value(rate_status_, key);}
 
   std::uint64_t metric(const std::string & key) const
   {
@@ -565,6 +563,8 @@ TEST_P(DriverStream, ConfiguresTheSonarAndReportsDeviceStatus)
   {
     sonar.respond("POST " + api + path, {});
   }
+  sonar.respond("GET " + api + "/acoustics/mode", {200, R"("high-frequency")", 0ms});
+  sonar.respond("GET " + api + "/acoustics/range", {200, R"({"max":12.0,"min":0.5})", 0ms});
   // Firmware before 1.8.0: no public ImuBatch output.
   sonar.respond("GET " + api + "/about", {200,
       R"json({"chipid":"0xC0FFEE","hardware_revision":6,"is_ready":true,"product_id":21045,)json"
@@ -601,6 +601,10 @@ TEST_P(DriverStream, ConfiguresTheSonarAndReportsDeviceStatus)
   EXPECT_EQ(device_value("firmware_version"), "1.7.1 (test)");
   EXPECT_EQ(device_value("temperature_celsius"), "41.5");
   EXPECT_EQ(device_value("ntp_synced"), "false");
+  EXPECT_EQ(device_value("acoustics_mode"), "high-frequency");
+  EXPECT_DOUBLE_EQ(std::stod(device_value("range_min_m")), 0.5);
+  EXPECT_DOUBLE_EQ(std::stod(device_value("range_max_m")), 12.0);
+  EXPECT_EQ(value("configuration_attempts"), "1");
   ASSERT_TRUE(wait_for([this] {return device_status_.hardware_id == "Sonar 3D-15 0xC0FFEE";}));
 
   std::map<std::string, std::string> posted;
@@ -614,6 +618,82 @@ TEST_P(DriverStream, ConfiguresTheSonarAndReportsDeviceStatus)
   EXPECT_EQ(posted["/acoustics/mode"], R"("high-frequency")");
   EXPECT_EQ(posted["/time/ntp"], R"({"ntp_address":"auto"})");
   EXPECT_EQ(posted["/output/imu-batch/enabled"], "true");
+}
+
+TEST_P(DriverStream, ConfigurationIsRetriedUntilTheSonarAccepts)
+{
+  sonar3d::testing::HttpServer sonar;
+  const std::string api = "/api/v1/integration";
+  // A sonar that is still starting answers 503 until its acoustics are ready.
+  sonar.respond("POST " + api + "/acoustics/enabled", {503, "", 0ms});
+  sonar.respond("POST " + api + "/udp", {});
+  start(true, 0.0, {
+      rclcpp::Parameter("configure_sonar", true),
+      rclcpp::Parameter("publish_imu", false),
+      rclcpp::Parameter("http_port", static_cast<int>(sonar.port()))});
+
+  ASSERT_TRUE(wait_for([this] {return value("configuration") == "retrying";}));
+  EXPECT_EQ(status_.level, diagnostic_msgs::msg::DiagnosticStatus::WARN);
+  EXPECT_NE(value("configuration_error").find("503"), std::string::npos);
+  sonar.respond("POST " + api + "/acoustics/enabled", {});
+  ASSERT_TRUE(wait_for([this] {return value("configuration") == "successful";}));
+  EXPECT_GE(std::stoul(value("configuration_attempts")), 2U);
+  EXPECT_TRUE(value("configuration_error").empty());
+}
+
+TEST_P(DriverStream, RejectedConfigurationIsNotRetried)
+{
+  sonar3d::testing::HttpServer sonar;
+  const std::string api = "/api/v1/integration";
+  sonar.respond("POST " + api + "/acoustics/range", {400, "", 0ms});
+  start(true, 0.0, {
+      rclcpp::Parameter("configure_sonar", true),
+      rclcpp::Parameter("range_max", 99.0),
+      rclcpp::Parameter("http_port", static_cast<int>(sonar.port()))});
+
+  ASSERT_TRUE(wait_for([this] {return value("configuration") == "failed";}));
+  // Longer than the first retry interval.
+  std::this_thread::sleep_for(1500ms);
+  executor_.spin_some();
+  EXPECT_EQ(sonar.requests().size(), 1U);
+  EXPECT_EQ(value("configuration_attempts"), "1");
+}
+
+TEST_P(DriverStream, ImageFieldOfViewReportsTheAcousticsModeAndItsRate)
+{
+  start(true, 0.0, {rclcpp::Parameter("acoustics_mode", "high-frequency")});
+  for (std::uint32_t frame = 0; frame < 3; ++frame) {
+    send_frame(frame, ProtocolVersion::RIP2);
+  }
+  ASSERT_TRUE(wait_for([this] {
+      return value("image_acoustics_mode") == "high-frequency" &&
+             !rate_value("Maximum acceptable frequency (Hz)").empty();
+    }));
+  EXPECT_EQ(value("image_fov_degrees"), "40.0 x 40.0");
+  EXPECT_EQ(value("expected_acoustics_mode"), "high-frequency");
+  EXPECT_EQ(status_.level, diagnostic_msgs::msg::DiagnosticStatus::OK);
+  // 20-24 Hz with diagnostic_updater's 10% tolerance.
+  EXPECT_NEAR(std::stod(rate_value("Minimum acceptable frequency (Hz)")), 18.0, 1e-6);
+  EXPECT_NEAR(std::stod(rate_value("Maximum acceptable frequency (Hz)")), 26.4, 1e-6);
+}
+
+TEST_P(DriverStream, ImagesFromAnotherAcousticsModeThanExpectedWarn)
+{
+  start(true, 0.0, {rclcpp::Parameter("acoustics_mode", "low-frequency")});
+  send_frame(0, ProtocolVersion::RIP2);
+  ASSERT_TRUE(wait_for([this] {return value("image_acoustics_mode") == "high-frequency";}));
+  EXPECT_EQ(status_.level, diagnostic_msgs::msg::DiagnosticStatus::WARN);
+  EXPECT_EQ(status_.message, "images are high-frequency but acoustics_mode is low-frequency");
+
+  auto wide = sonar3d::testing::range_image(1);
+  wide.horizontal_fov_degrees = 90.0F;
+  sender_.send(port_, sonar3d::protocol::encode_packet(wide), destination_.c_str());
+  ASSERT_TRUE(wait_for([this] {return value("image_acoustics_mode") == "low-frequency";}));
+  EXPECT_EQ(value("image_fov_degrees"), "90.0 x 40.0");
+  EXPECT_EQ(status_.level, diagnostic_msgs::msg::DiagnosticStatus::OK);
+  ASSERT_TRUE(wait_for([this] {
+      return rate_value("Maximum acceptable frequency (Hz)").starts_with("6.6");
+    }));
 }
 
 // Uncrustify 0.78 misparses the generated ROS type in this GTest callback.

@@ -41,6 +41,11 @@ using diagnostic_msgs::msg::DiagnosticStatus;
 // The sonar sends a shot's range and signal-strength images back to back.
 constexpr std::chrono::milliseconds kSignalImageWait{25};
 
+// A sonar that is still booting or busy is configured again, at doubling
+// intervals up to the maximum.
+constexpr std::chrono::milliseconds kFirstConfigurationRetry{1'000};
+constexpr std::chrono::milliseconds kMaximumConfigurationRetry{30'000};
+
 [[nodiscard]] std::int64_t steady_time_nanoseconds()
 {
   return std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -67,6 +72,32 @@ constexpr std::chrono::milliseconds kSignalImageWait{25};
 [[nodiscard]] std::chrono::milliseconds seconds_to_milliseconds(double seconds)
 {
   return std::chrono::milliseconds(static_cast<std::int64_t>(std::llround(seconds * 1000.0)));
+}
+
+[[nodiscard]] std::string format_fov(float horizontal_degrees, float vertical_degrees)
+{
+  std::ostringstream stream;
+  stream.setf(std::ios::fixed);
+  stream.precision(1);
+  stream << horizontal_degrees << " x " << vertical_degrees;
+  return stream.str();
+}
+
+// Older firmware answers 404 for newer status endpoints; stop asking once it does.
+template<typename Read>
+void read_if_supported(bool & supported, Read read)
+{
+  if (!supported) {
+    return;
+  }
+  try {
+    read();
+  } catch (const HttpStatusError & error) {
+    if (error.status() != 404) {
+      throw;
+    }
+    supported = false;
+  }
 }
 
 [[nodiscard]] unsigned char diagnostic_level(const StatusEntry & entry)
@@ -199,6 +230,7 @@ void SonarDriver::configure_driver()
   settings.imu_noise = {parameters.linear_acceleration_stddev, parameters.angular_velocity_stddev};
   settings.packet_stale_timeout = parameters.packet_stale_timeout;
   settings.point_cloud_intensity = parameters.point_cloud_intensity;
+  settings.expected_mode = parse_acoustics_mode(parameters.acoustics_mode);
   settings.http_port = static_cast<std::uint16_t>(parameters.http_port);
   settings.http_timeout = seconds_to_milliseconds(parameters.http_timeout);
   settings_ = std::move(settings);
@@ -283,6 +315,12 @@ SonarDriver::CallbackReturn SonarDriver::on_activate(const rclcpp_lifecycle::Sta
   timestamp_source_.store(TimestampSource::NONE);
   last_valid_packet_steady_ns_.store(-1);
   pairing_.clear();
+  // The mode may have changed while inactive; report it from the next image.
+  last_image_geometry_.reset();
+  {
+    std::lock_guard<std::mutex> lock(image_geometry_mutex_);
+    image_geometry_.reset();
+  }
   // Datagrams queued while inactive are stale; start from the live stream.
   receiver_->clear_interrupt();
   const auto discarded = receiver_->discard_pending();
@@ -384,52 +422,93 @@ void SonarDriver::start_configuration(const ConfigurationRequest & request)
     configuration_error_.clear();
     configuration_unsupported_.clear();
   }
+  configuration_attempts_.store(0);
   configuration_state_.store(ConfigurationState::PENDING);
   configuration_thread_ = std::jthread(
-    [this, request, sonar_ip = settings_.sonar_ip, port = settings_.http_port,
-    timeout = settings_.http_timeout](std::stop_token stop_token) {
-      const auto stopping = [&stop_token]() {return stop_token.stop_requested();};
-      try {
-        HttpSonarApi api(sonar_ip, timeout, stopping, port);
-        const auto result = configure_sonar(api, request, stopping);
-        if (stop_token.stop_requested()) {
-          configuration_state_.store(ConfigurationState::DISABLED);
-          return;
-        }
-        {
-          std::lock_guard<std::mutex> lock(configuration_mutex_);
-          configuration_unsupported_ = result.unsupported;
-        }
-        configuration_state_.store(ConfigurationState::SUCCESSFUL);
-        RCLCPP_INFO(get_logger(), "Configured sonar settings: %s", join(result.applied).c_str());
-        if (!result.unsupported.empty()) {
-          RCLCPP_WARN(
-            get_logger(),
-            "The sonar firmware does not provide %s; update the sonar or stop requesting them. "
-            "Salinity and acoustics mode need release 1.7.0, NTP 1.7.1 and ImuBatch output "
-            "(imu/data_raw) 1.8.0.",
-            join(result.unsupported).c_str());
-        }
-        if (result.ntp_sync && result.ntp_sync->success) {
-          RCLCPP_INFO(
-            get_logger(), "Sonar clock synchronized to %s",
-            result.ntp_sync->status.ntp_synced_to.c_str());
-        } else if (result.ntp_sync) {
-          RCLCPP_WARN(
-            get_logger(), "Sonar NTP sync did not complete: %s",
-            result.ntp_sync->message.c_str());
-        }
-      } catch (const std::exception & error) {
-        {
-          std::lock_guard<std::mutex> lock(configuration_mutex_);
-          configuration_error_ = error.what();
-        }
-        configuration_state_.store(ConfigurationState::FAILED);
-        RCLCPP_WARN(
-          get_logger(), "Could not configure Sonar 3D-15 at %s: %s", sonar_ip.c_str(),
-          error.what());
+    [this, request](std::stop_token stop) {configure_device(stop, request);});
+}
+
+void SonarDriver::configure_device(
+  const std::stop_token & stop, const ConfigurationRequest & request)
+{
+  const auto stopping = [&stop]() {return stop.stop_requested();};
+  std::mutex wait_mutex;
+  std::condition_variable_any wake;
+  auto retry_delay = kFirstConfigurationRetry;
+  while (!stop.stop_requested()) {
+    const auto attempt = configuration_attempts_.fetch_add(1) + 1;
+    try {
+      HttpSonarApi api(settings_.sonar_ip, settings_.http_timeout, stopping, settings_.http_port);
+      const auto result = configure_sonar(api, request, stopping);
+      if (stop.stop_requested()) {
+        break;
       }
-    });
+      {
+        std::lock_guard<std::mutex> lock(configuration_mutex_);
+        configuration_error_.clear();
+        configuration_unsupported_ = result.unsupported;
+      }
+      configuration_state_.store(ConfigurationState::SUCCESSFUL);
+      if (attempt > 1) {
+        RCLCPP_INFO(
+          get_logger(), "Configured sonar settings on attempt %lu: %s",
+          static_cast<unsigned long>(attempt), join(result.applied).c_str());  // NOLINT
+      } else {
+        RCLCPP_INFO(get_logger(), "Configured sonar settings: %s", join(result.applied).c_str());
+      }
+      if (!result.unsupported.empty()) {
+        RCLCPP_WARN(
+          get_logger(),
+          "The sonar firmware does not provide %s; update the sonar or stop requesting them. "
+          "Salinity and acoustics mode need release 1.7.0, NTP 1.7.1 and ImuBatch output "
+          "(imu/data_raw) 1.8.0.",
+          join(result.unsupported).c_str());
+      }
+      if (result.ntp_sync && result.ntp_sync->success) {
+        RCLCPP_INFO(
+          get_logger(), "Sonar clock synchronized to %s",
+          result.ntp_sync->status.ntp_synced_to.c_str());
+      } else if (result.ntp_sync) {
+        RCLCPP_WARN(
+          get_logger(), "Sonar NTP sync did not complete: %s",
+          result.ntp_sync->message.c_str());
+      }
+      return;
+    } catch (const std::exception & error) {
+      if (stop.stop_requested()) {
+        break;
+      }
+      const bool transient = is_transient_configuration_error(error);
+      std::string previous_error;
+      {
+        std::lock_guard<std::mutex> lock(configuration_mutex_);
+        previous_error = std::exchange(configuration_error_, error.what());
+      }
+      configuration_state_.store(
+        transient ? ConfigurationState::RETRYING : ConfigurationState::FAILED);
+      if (!transient) {
+        RCLCPP_ERROR(
+          get_logger(), "Could not configure Sonar 3D-15 at %s: %s. The sonar rejected the "
+          "request, so it is not retried; correct the setting and configure the driver again.",
+          settings_.sonar_ip.c_str(), error.what());
+        return;
+      }
+      // Log each distinct error once; diagnostics carry the attempt count.
+      if (previous_error != error.what()) {
+        RCLCPP_WARN(
+          get_logger(), "Could not configure Sonar 3D-15 at %s: %s. Retrying until it succeeds.",
+          settings_.sonar_ip.c_str(), error.what());
+      } else {
+        RCLCPP_DEBUG(
+          get_logger(), "Sonar 3D-15 configuration attempt %lu failed: %s",
+          static_cast<unsigned long>(attempt), error.what());  // NOLINT
+      }
+    }
+    std::unique_lock<std::mutex> lock(wait_mutex);
+    wake.wait_for(lock, stop, retry_delay, [] {return false;});
+    retry_delay = std::min(retry_delay * 2, kMaximumConfigurationRetry);
+  }
+  configuration_state_.store(ConfigurationState::DISABLED);
 }
 
 void SonarDriver::start_device_polling(std::chrono::milliseconds period)
@@ -457,9 +536,11 @@ void SonarDriver::poll_device(const std::stop_token & stop, std::chrono::millise
 {
   const auto stopping = [&stop]() {return stop.stop_requested();};
   HttpSonarApi api(settings_.sonar_ip, settings_.http_timeout, stopping, settings_.http_port);
-  // Status needs release 1.7.0 and time status 1.7.1; older firmware answers 404.
+  // Status and acoustics mode need release 1.7.0 and time status 1.7.1.
   bool status_supported = true;
   bool time_supported = true;
+  bool mode_supported = true;
+  bool range_supported = true;
   std::mutex wait_mutex;
   std::condition_variable_any wake;
   while (!stop.stop_requested()) {
@@ -477,26 +558,10 @@ void SonarDriver::poll_device(const std::stop_token & stop, std::chrono::millise
           reading.info->chip_id.c_str(), static_cast<long>(reading.info->hardware_revision));  // NOLINT
       }
       reading.temperature = api.temperature();
-      if (status_supported) {
-        try {
-          reading.components = api.status();
-        } catch (const HttpStatusError & error) {
-          if (error.status() != 404) {
-            throw;
-          }
-          status_supported = false;
-        }
-      }
-      if (time_supported) {
-        try {
-          reading.time = api.time_status();
-        } catch (const HttpStatusError & error) {
-          if (error.status() != 404) {
-            throw;
-          }
-          time_supported = false;
-        }
-      }
+      read_if_supported(status_supported, [&] {reading.components = api.status();});
+      read_if_supported(time_supported, [&] {reading.time = api.time_status();});
+      read_if_supported(mode_supported, [&] {reading.acoustics_mode = api.acoustics_mode();});
+      read_if_supported(range_supported, [&] {reading.range = api.acoustics_range();});
       reading.last_success_steady_ns = steady_time_nanoseconds();
     } catch (const std::exception & error) {
       if (stop.stop_requested()) {
@@ -653,6 +718,7 @@ void SonarDriver::handle_range_image(
 {
   observe_sequence(range_sequence_, image.header.sequence_id);
   range_rate_.tick();
+  observe_image_geometry(image.horizontal_fov_degrees, image.vertical_fov_degrees);
   const auto header = conversions::make_header(
     image.header,
     settings_.frame_id,
@@ -684,6 +750,37 @@ void SonarDriver::handle_range_image(
     }
   }
   metrics_.range_images.fetch_add(1, std::memory_order_relaxed);
+}
+
+void SonarDriver::observe_image_geometry(float horizontal_fov_degrees, float vertical_fov_degrees)
+{
+  if (last_image_geometry_ &&
+    last_image_geometry_->horizontal_fov_degrees == horizontal_fov_degrees &&
+    last_image_geometry_->vertical_fov_degrees == vertical_fov_degrees)
+  {
+    return;
+  }
+  const auto previous_mode = last_image_geometry_ ?
+    std::optional{last_image_geometry_->mode} : std::nullopt;
+  const ImageGeometry geometry{
+    horizontal_fov_degrees, vertical_fov_degrees,
+    acoustics_mode_from_fov(horizontal_fov_degrees, vertical_fov_degrees)};
+  last_image_geometry_ = geometry;
+  {
+    std::lock_guard<std::mutex> lock(image_geometry_mutex_);
+    image_geometry_ = geometry;
+  }
+  const auto fov = format_fov(horizontal_fov_degrees, vertical_fov_degrees);
+  if (geometry.mode == AcousticsMode::UNKNOWN) {
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *get_clock(), 5000,
+      "Sonar 3D-15 range images have a %s degree field of view, which matches neither "
+      "acoustics mode (90 x 40 low-frequency, 40 x 40 high-frequency)", fov.c_str());
+  } else if (previous_mode != geometry.mode) {
+    RCLCPP_INFO(
+      get_logger(), "Sonar 3D-15 is imaging in %s mode (%s degree field of view)",
+      std::string(to_string(geometry.mode)).c_str(), fov.c_str());
+  }
 }
 
 void SonarDriver::publish_cloud(CloudPairing::Pair && pair)
@@ -860,7 +957,47 @@ void SonarDriver::diagnose_stream(diagnostic_updater::DiagnosticStatusWrapper & 
     status.add("last_packet_age_seconds", packet_age);
   }
 
-  switch (configuration_state_.load()) {
+  const auto configuration = configuration_state_.load();
+  std::optional<ImageGeometry> geometry;
+  {
+    std::lock_guard<std::mutex> lock(image_geometry_mutex_);
+    geometry = image_geometry_;
+  }
+  const auto image_mode = geometry ? geometry->mode : AcousticsMode::UNKNOWN;
+  // The Range image rate task runs after this one in the same update, so its
+  // bounds follow the mode just observed.
+  const auto rate = expected_image_rate(
+    image_mode != AcousticsMode::UNKNOWN ? image_mode :
+    settings_.expected_mode.value_or(AcousticsMode::UNKNOWN));
+  minimum_range_rate_ = rate.minimum_hz;
+  maximum_range_rate_ = rate.maximum_hz;
+  if (geometry) {
+    status.add(
+      "image_fov_degrees",
+      format_fov(geometry->horizontal_fov_degrees, geometry->vertical_fov_degrees));
+    status.add(
+      "image_acoustics_mode",
+      image_mode == AcousticsMode::UNKNOWN ? "unrecognised" : std::string(to_string(image_mode)));
+  } else {
+    status.add("image_acoustics_mode", "none yet");
+  }
+  if (settings_.expected_mode) {
+    status.add("expected_acoustics_mode", std::string(to_string(*settings_.expected_mode)));
+    // Until the first configuration attempt ends, images may still show the
+    // previous mode.
+    if (geometry && image_mode != *settings_.expected_mode &&
+      configuration != ConfigurationState::PENDING)
+    {
+      status.mergeSummary(
+        DiagnosticStatus::WARN,
+        "images are " + std::string(
+          image_mode == AcousticsMode::UNKNOWN ? "in an unrecognised mode" :
+          to_string(image_mode)) +
+        " but acoustics_mode is " + std::string(to_string(*settings_.expected_mode)));
+    }
+  }
+
+  switch (configuration) {
     case ConfigurationState::DISABLED:
       status.add("configuration", "disabled");
       break;
@@ -877,6 +1014,13 @@ void SonarDriver::diagnose_stream(diagnostic_updater::DiagnosticStatusWrapper & 
         }
         break;
       }
+    case ConfigurationState::RETRYING: {
+        status.add("configuration", "retrying");
+        std::lock_guard<std::mutex> lock(configuration_mutex_);
+        status.add("configuration_error", configuration_error_);
+        status.mergeSummary(DiagnosticStatus::WARN, "sonar configuration failed; retrying");
+        break;
+      }
     case ConfigurationState::FAILED: {
         status.add("configuration", "failed");
         std::lock_guard<std::mutex> lock(configuration_mutex_);
@@ -884,6 +1028,9 @@ void SonarDriver::diagnose_stream(diagnostic_updater::DiagnosticStatusWrapper & 
         status.mergeSummary(DiagnosticStatus::WARN, "sonar configuration failed");
         break;
       }
+  }
+  if (configuration != ConfigurationState::DISABLED) {
+    status.add("configuration_attempts", configuration_attempts_.load());
   }
 
   const auto offset_seconds =
@@ -969,6 +1116,13 @@ void SonarDriver::diagnose_device(diagnostic_updater::DiagnosticStatusWrapper & 
     if (level != DiagnosticStatus::OK) {
       status.mergeSummary(level, entry.message);
     }
+  }
+  if (device_.acoustics_mode) {
+    status.add("acoustics_mode", *device_.acoustics_mode);
+  }
+  if (device_.range) {
+    status.add("range_min_m", device_.range->minimum);
+    status.add("range_max_m", device_.range->maximum);
   }
   if (device_.temperature) {
     status.add("temperature_celsius", *device_.temperature);

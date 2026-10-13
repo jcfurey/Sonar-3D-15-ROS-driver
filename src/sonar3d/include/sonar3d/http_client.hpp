@@ -80,6 +80,13 @@ struct TimeStatus
   std::optional<std::int64_t> seconds_since_last_sync;
 };
 
+// GET /acoustics/range, in metres.
+struct AcousticsRange
+{
+  double minimum{};
+  double maximum{};
+};
+
 // POST /time/ntp/force-sync.
 struct NtpSyncResult
 {
@@ -95,6 +102,9 @@ struct NtpSyncResult
 [[nodiscard]] double parse_temperature(const std::string & json);
 [[nodiscard]] TimeStatus parse_time_status(const std::string & json);
 [[nodiscard]] NtpSyncResult parse_ntp_sync(const std::string & json);
+// "low-frequency" or "high-frequency"; an empty (204) reply is nullopt.
+[[nodiscard]] std::optional<std::string> parse_acoustics_mode_response(const std::string & json);
+[[nodiscard]] AcousticsRange parse_acoustics_range(const std::string & json);
 
 class SonarApi
 {
@@ -139,6 +149,9 @@ public:
   [[nodiscard]] std::map<std::string, StatusEntry> status() const;
   [[nodiscard]] double temperature() const;
   [[nodiscard]] TimeStatus time_status() const;
+  // Release 1.7.0 or newer; older firmware answers 404.
+  [[nodiscard]] std::optional<std::string> acoustics_mode() const;
+  [[nodiscard]] AcousticsRange acoustics_range() const;
 
 private:
   // Returns the response body; throws HttpStatusError for non-2xx replies.
@@ -188,5 +201,11 @@ void validate_configuration(const ConfigurationRequest & request, double timeout
   SonarApi & api,
   const ConfigurationRequest & request = {},
   const std::function<bool()> & stop_requested = {});
+
+// Whether configure_sonar may succeed if repeated after this error. An invalid
+// setting or a request the sonar rejects (4xx other than 408 timeout, 409 busy
+// and 429 throttled) will not change on its own; unreachable, busy or failing
+// sonars may recover.
+[[nodiscard]] bool is_transient_configuration_error(const std::exception & error);
 
 }  // namespace sonar3d

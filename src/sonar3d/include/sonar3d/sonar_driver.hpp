@@ -30,6 +30,7 @@
 #include <std_msgs/msg/header.hpp>
 #include <tf2_ros/static_transform_broadcaster.hpp>
 
+#include "sonar3d/acoustics_mode.hpp"
 #include "sonar3d/conversions.hpp"
 #include "sonar3d/http_client.hpp"
 #include "sonar3d/protocol.hpp"
@@ -107,8 +108,12 @@ private:
   enum class ConfigurationState : int
   {
     DISABLED,
+    // The first attempt has not finished.
     PENDING,
     SUCCESSFUL,
+    // A transient failure; the next attempt is scheduled.
+    RETRYING,
+    // The sonar rejected a request, so repeating it would fail again.
     FAILED,
   };
 
@@ -126,6 +131,9 @@ private:
     conversions::ImuNoise imu_noise;
     double packet_stale_timeout{2.0};
     bool point_cloud_intensity{true};
+    // From acoustics_mode: images are checked against it even when
+    // configure_sonar is false.
+    std::optional<AcousticsMode> expected_mode;
     std::uint16_t http_port{80};
     std::chrono::milliseconds http_timeout{5000};
   };
@@ -138,6 +146,14 @@ private:
   };
   using CloudPairing = RangeSignalPairing<CloudContext>;
 
+  // Field of view of the latest range image and the mode it identifies.
+  struct ImageGeometry
+  {
+    float horizontal_fov_degrees{};
+    float vertical_fov_degrees{};
+    AcousticsMode mode{AcousticsMode::UNKNOWN};
+  };
+
   // Latest sonar HTTP API readings, written by device_status_thread_.
   struct DeviceStatus
   {
@@ -145,6 +161,8 @@ private:
     std::map<std::string, StatusEntry> components;
     std::optional<double> temperature;
     std::optional<TimeStatus> time;
+    std::optional<std::string> acoustics_mode;
+    std::optional<AcousticsRange> range;
     // Empty after a successful poll.
     std::string error;
     std::int64_t last_success_steady_ns{-1};
@@ -166,6 +184,8 @@ private:
   void handle_bitmap_image(
     protocol::BitmapImage && image,
     const builtin_interfaces::msg::Time & fallback_stamp);
+  // Records and logs the field of view, which identifies the acoustics mode.
+  void observe_image_geometry(float horizontal_fov_degrees, float vertical_fov_degrees);
   void publish_cloud(CloudPairing::Pair && pair);
   // Publish a waiting range image without intensity once its signal image is
   // overdue; returns how long the receive thread may wait.
@@ -184,6 +204,9 @@ private:
   void diagnose_device(diagnostic_updater::DiagnosticStatusWrapper & status);
   void publish_imu_transform();
   void start_configuration(const ConfigurationRequest & request);
+  // Runs on configuration_thread_: applies the request, repeating it after
+  // transient failures until it succeeds or the thread is stopped.
+  void configure_device(const std::stop_token & stop, const ConfigurationRequest & request);
   void start_device_polling(std::chrono::milliseconds period);
   void poll_device(const std::stop_token & stop, std::chrono::milliseconds period);
   void stop_device_polling();
@@ -215,6 +238,7 @@ private:
   SensorClockOffset clock_offset_{10'000'000'000, 1'000'000'000};
   std::unordered_set<std::uint32_t> warned_sources_;
   CloudPairing pairing_;
+  std::optional<ImageGeometry> last_image_geometry_;
 
   // Shared with the diagnostics timer.
   Metrics metrics_;
@@ -223,8 +247,12 @@ private:
   std::atomic<TimestampSource> timestamp_source_{TimestampSource::NONE};
   // Receive time minus sensor time for the latest timestamped message.
   std::atomic<std::int64_t> last_sensor_clock_offset_ns_{0};
+  // Written by the receive thread only when the field of view changes.
+  std::mutex image_geometry_mutex_;
+  std::optional<ImageGeometry> image_geometry_;
 
   std::atomic<ConfigurationState> configuration_state_{ConfigurationState::DISABLED};
+  std::atomic<std::uint64_t> configuration_attempts_{0};
   std::mutex configuration_mutex_;
   std::string configuration_error_;
   std::vector<std::string> configuration_unsupported_;
@@ -236,9 +264,9 @@ private:
   std::string device_hardware_id_;
   std::jthread device_status_thread_;
 
-  // The sonar images at 5 Hz (low frequency mode) or 20 Hz (high frequency).
-  double minimum_range_rate_{5.0};
-  double maximum_range_rate_{20.0};
+  // Bounds follow the acoustics mode the images show; see expected_image_rate.
+  double minimum_range_rate_{expected_image_rate(AcousticsMode::UNKNOWN).minimum_hz};
+  double maximum_range_rate_{expected_image_rate(AcousticsMode::UNKNOWN).maximum_hz};
   diagnostic_updater::FrequencyStatus range_rate_;
   diagnostic_updater::Updater diagnostics_;
 
