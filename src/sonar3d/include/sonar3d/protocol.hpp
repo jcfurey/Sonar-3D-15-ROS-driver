@@ -141,6 +141,11 @@ private:
 // so recording playback can skip that packet and continue safely.
 [[nodiscard]] std::optional<DecodedPacket> read_packet(std::istream & stream);
 
+// Exact bytes are filled before decoding, including a fully framed
+// packet whose CRC or protobuf is damaged. No decode/re-encode loses fields.
+[[nodiscard]] std::optional<DecodedPacket> read_packet(
+  std::istream & stream, std::vector<std::uint8_t> * raw_packet);
+
 // Primarily intended for protocol regression tests and diagnostic tooling.
 [[nodiscard]] std::vector<std::uint8_t> encode_packet(
   const Message & message,

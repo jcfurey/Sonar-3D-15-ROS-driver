@@ -136,7 +136,7 @@ sonar3d:
   max_sensor_clock_offset:
     type: double
     default_value: 1.0
-    description: "Largest accepted difference in seconds between a sensor timestamp and ROS receive time. The sonar clock starts at an arbitrary time and stays there until NTP succeeds; beyond this offset, sensor timestamps are shifted onto ROS time by one offset shared by all products (the minimum observed receive delay), keeping the sonar's own spacing between images and IMU samples. Zero trusts sensor timestamps unconditionally."
+    description: "Threshold in seconds for the minimum observed receive-minus-sensor clock offset. An unsynchronized clock is shifted onto ROS time with one shared offset, preserving sample spacing. Isolated late packets cannot change the clock source; backward clock steps need persistent confirmation. Zero trusts sensor timestamps unconditionally."
     validation:
       bounds<>: [0.0, 3600.0]
 
@@ -149,6 +149,11 @@ sonar3d:
     type: bool
     default_value: true
     description: "Add an intensity field with linear signal strength from the same shot's signal-strength image to the point cloud."
+
+  publish_raw_packets:
+    type: bool
+    default_value: true
+    description: "Publish exact accepted-source RIP datagrams on raw_packet before decoding or sequence filtering, retaining every vendor field for lossless recording and reprocessing."
 
   publish_point_cloud:
     type: bool

@@ -278,7 +278,7 @@ class ScientificFigure:
                          'Strongest return per angular cell; no spatial interpolation. '
                          'Signal is not calibrated backscatter.', fontsize=9)
 
-    def update(self, planes):
+    def update(self, planes, *, draw=True):
         """Render one shot without normalizing by its extrema or mixing shots."""
         arrays = raw_arrays(planes)
         meta = planes['range_image'].metadata
@@ -312,7 +312,8 @@ class ScientificFigure:
             f"FOV centres: {meta['horizontal_fov_degrees']:g}° × "
             f"{meta['vertical_fov_degrees']:g}°; configured range: "
             f"{meta['configured_range_m']:g} m; sound speed: {meta['speed_of_sound_mps']:.3f} m/s")
-        self.figure.canvas.draw_idle()
+        if draw:
+            self.figure.canvas.draw_idle()
 
     def rgb8(self):
         """Return an owned RGB raster of the labelled figure for an RViz Image display."""

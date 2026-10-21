@@ -30,7 +30,8 @@ find_package(std_msgs REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(ZLIB REQUIRED)
 
-rosidl_generate_interfaces(${PROJECT_NAME} "msg/ImageMetadata.msg" DEPENDENCIES std_msgs)
+rosidl_generate_interfaces(${PROJECT_NAME}
+  "msg/ImageMetadata.msg" "msg/RawPacket.msg" DEPENDENCIES std_msgs)
 rosidl_get_typesupport_target(sonar3d_typesupport ${PROJECT_NAME} rosidl_typesupport_cpp)
 
 # Ubuntu's libsnappy-dev exports Snappy::snappy on newer releases. Retain a
@@ -74,7 +75,7 @@ target_link_libraries(
 )
 
 file(GLOB_RECURSE sonar3d_sources CONFIGURE_DEPENDS
-  "src/*.cpp" "include/*.hpp" "proto/*.proto" "msg/*.msg")
+  "src/*.cpp" "src/*.yaml" "include/*.hpp" "proto/*.proto" "msg/*.msg")
 list(APPEND sonar3d_sources "${CMAKE_CURRENT_SOURCE_DIR}/CMakeLists.txt"
   "${CMAKE_CURRENT_SOURCE_DIR}/package.xml")
 list(SORT sonar3d_sources)
@@ -218,6 +219,10 @@ if(BUILD_TESTING)
   ament_lint_auto_find_test_dependencies()
   ament_add_pytest_test(test_image_science test/test_image_science.py
     APPEND_ENV PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/tools PYTEST_DISABLE_PLUGIN_AUTOLOAD=1)
+  ament_add_pytest_test(test_image_publisher test/test_image_publisher.py
+    APPEND_ENV
+      PYTHONPATH=${CMAKE_CURRENT_BINARY_DIR}/rosidl_generator_py:${CMAKE_CURRENT_SOURCE_DIR}/tools:${CMAKE_CURRENT_SOURCE_DIR}/test
+      PYTEST_DISABLE_PLUGIN_AUTOLOAD=1)
 
   ament_add_gtest(test_protocol test/test_protocol.cpp)
   target_link_libraries(test_protocol sonar3d_protocol)

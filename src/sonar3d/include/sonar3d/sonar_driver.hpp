@@ -35,6 +35,7 @@
 #include "sonar3d/http_client.hpp"
 #include "sonar3d/protocol.hpp"
 #include "sonar3d/range_signal_pairing.hpp"
+#include "sonar3d/msg/raw_packet.hpp"
 #include "sonar3d/sensor_clock.hpp"
 #include "sonar3d/sonar3d_parameters.hpp"
 #include "sonar3d/udp_receiver.hpp"
@@ -73,6 +74,12 @@ private:
   struct SequenceState
   {
     std::optional<std::uint32_t> last;
+    std::optional<std::int64_t> stamp;
+    std::int64_t arrival{};
+    std::optional<std::uint32_t> restart_last;
+    std::optional<std::int64_t> restart_stamp;
+    std::int64_t restart_arrival{};
+    unsigned restart_samples{};
   };
 
   struct Metrics
@@ -199,7 +206,9 @@ private:
   [[nodiscard]] std::int64_t sensor_clock_offset(
     const std::optional<protocol::Timestamp> & reference,
     const builtin_interfaces::msg::Time & receive_stamp);
-  void observe_sequence(SequenceState & state, std::uint32_t sequence_id);
+  [[nodiscard]] bool observe_sequence(
+    SequenceState & state, std::uint32_t sequence_id,
+    const std::optional<protocol::Timestamp> & timestamp);
   void diagnose_stream(diagnostic_updater::DiagnosticStatusWrapper & status);
   void diagnose_device(diagnostic_updater::DiagnosticStatusWrapper & status);
   void publish_imu_transform();
@@ -224,6 +233,7 @@ private:
   Publisher<sensor_msgs::msg::Image> intensity_image_publisher_;
   Publisher<sensor_msgs::msg::Image> shaded_image_publisher_;
   Publisher<msg::ImageMetadata> image_metadata_publisher_;
+  Publisher<msg::RawPacket> raw_packet_publisher_;
   Publisher<sensor_msgs::msg::PointCloud2> point_cloud_publisher_;
   Publisher<sensor_msgs::msg::Imu> imu_publisher_;
   std::unique_ptr<tf2_ros::StaticTransformBroadcaster> static_transform_broadcaster_;

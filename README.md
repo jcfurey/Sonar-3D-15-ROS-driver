@@ -30,6 +30,7 @@ or remapped normally.
 | `intensity_image` | `sensor_msgs/Image` | Upright `mono8` signal-strength bitmap |
 | `shaded_image` | `sensor_msgs/Image` | Upright `mono8` vendor shaded-depth bitmap |
 | `points` | `sensor_msgs/PointCloud2` | Valid returns with `x,y,z,intensity,range,azimuth,elevation` float32 fields |
+| `raw_packet` | `sonar3d/RawPacket` | Exact accepted-source RIP datagrams, including unknown messages, duplicates and damaged packets; host receipt stamp and sender address |
 | `imu/data_raw` | `sensor_msgs/Imu` | REP-145 specific force and angular rate without orientation, one message per sample |
 | `image_metadata` | `sonar3d/ImageMetadata` | Exact image header, source shot ID/clock, angular geometry, acquisition settings and driver source fingerprint; one message per range/bitmap image |
 | `quantitative_image` | `sensor_msgs/Image` | Optional headless renderer's display-only `rgb8` figure: labelled range and signal panels, fixed scales and no-return masks; measurements remain on the raw topics |
@@ -109,18 +110,36 @@ the default depth of 5 drops samples from 5 Hz batches.
 
 Sensor protobuf timestamps are used by default. The sonar keeps an arbitrary
 clock until NTP succeeds, so each timestamped message is compared with ROS
-receive time. When they differ by more than `max_sensor_clock_offset` (1 s by
+receive time. When the minimum observed offset exceeds `max_sensor_clock_offset` (1 s by
 default), sensor timestamps are shifted onto ROS time by one offset shared by
 every product: the smallest receive-minus-sensor difference seen over the last
 10–20 s. Transport delay only ever makes a packet late, so this minimum removes
 network and processing jitter, follows slow clock drift, and preserves the
 sonar's own spacing between images and IMU samples. Stamps therefore reflect
 acquisition time plus the minimum delivery delay rather than each packet's
-receipt. A sonar clock step of more than 1 s restarts the estimate. The switch
+receipt. A backward clock step must persist across at least three observations
+spanning one second before the estimate restarts; isolated late packets and
+queued bursts cannot reset it. The switch
 is logged in both directions, and diagnostics report `timestamp_source`,
 `sensor_clock_offset_seconds` and `sensor_clock_fallbacks`. Give the sonar a
 reachable NTP server so its own acquisition timestamps are used. Set
 `use_sensor_timestamps:=false` to always stamp on receipt.
+
+Duplicates and older sequence IDs are rejected before clock estimation and
+processed publication. A counter restart with a newer timestamp is accepted;
+if both the counter and sensor clock reset, recovery requires a stale stream
+and three advancing packets spanning at least 50 ms, excluding queued bursts.
+`raw_packet` retains these packets unchanged.
+
+Record `raw_packet` for complete source preservation: IMU batch IDs/counts,
+native pixel ordering, unknown protobuf fields/types, framing and CRC are all
+retained. Processed images, clouds and individual IMU messages are derived
+views and cannot retain every source attribute. The raw header is host receipt
+time in live operation; it does not claim synchronized acquisition time.
+Its `packet_index` preserves input order independently of acquisition-time
+sorting by a bag reader. Sort by this index before concatenating raw bytes to
+reconstruct a native `.sonar` stream; receipt-index gaps can reflect source
+filtering or an unsubscribed interval.
 
 The driver and player build each enabled product only while that topic has a
 subscriber, including subscribers in the same component process. Subscription
@@ -314,10 +333,11 @@ the lifecycle state and is OK with "not streaming" while inactive; the
 | `interface_address` | `0.0.0.0` | Multicast: interface joining the group. Unicast: local address to bind and, with `configure_sonar`, the sonar's destination |
 | `udp_receive_buffer_size` | `1048576` | Requested socket receive buffer in bytes; zero keeps the OS default |
 | `use_sensor_timestamps` | `true` | Prefer valid device timestamps over receive time |
-| `max_sensor_clock_offset` | `1.0` | Seconds a sensor timestamp may differ from receive time before sensor timestamps are shifted onto ROS time; zero trusts the sensor clock unconditionally |
+| `max_sensor_clock_offset` | `1.0` | Maximum absolute minimum-observed clock offset in seconds before sensor timestamps are shifted onto ROS time; zero trusts the sensor clock unconditionally |
 | `publish_tf` | `true` | Broadcast the static `frame_id` to `imu_frame_id` transform |
 | `point_cloud_intensity` | `true` | Add linear signal strength from the paired signal image as `intensity` |
 | `publish_point_cloud` | `true` | Enable the derived cloud |
+| `publish_raw_packets` | `true` | Enable exact RIP packet publication on demand |
 | `publish_range_image` | `true` | Enable the scaled range image |
 | `publish_bitmap_images` | `true` | Enable signal-strength and shaded bitmap topics |
 | `publish_imu` | `true` | Publish `ImuBatch` samples on `imu/data_raw` |
@@ -372,7 +392,10 @@ header stamp; `--receive-time` is rejected in this mode. Topic names follow
 the node namespace, so the example writes `/sonar3d/points`,
 `/sonar3d/imu/data_raw` and so on, matching the live driver. The summary lists
 the messages written per topic, and framing errors fail the conversion as in
-playback.
+playback. The bag also includes exact `raw_packet` bytes, including complete
+damaged and unsupported packets. Recordings lack sender addresses and host
+receipt times, so their raw headers use the packet's acquisition reference,
+or the previous/first known reference when its type cannot be interpreted.
 
 ### Publishing a recording
 
@@ -388,6 +411,10 @@ delay. A backward clock jump exceeding one second starts a new timing segment.
 `--realtime-factor` scales these intervals; `--receive-time` changes ROS message
 stamps while retaining recorded pacing. Start subscribers (including rosbag)
 before playback and allow enough startup delay for discovery.
+
+During paced playback, a range image missing its signal image is released
+after the same 25 ms wall-clock wait as live acquisition. Offline bag
+conversion pairs by recorded shot without a wall-clock deadline.
 
 The summary separates supported packets, unsupported message types, damaged
 packets (CRC, decompression, or protobuf envelope errors), malformed supported
@@ -536,8 +563,11 @@ ros2 run sonar3d sonar_image_publisher --namespace sonar3d \
   --range-limits 0 15 --signal-limits 0 255 --refresh-hz 3
 ```
 
-Add an RViz Image display on `/sonar3d/quantitative_image`, with Reliable and
-Transient Local QoS. RGB colours are already fixed by the renderer; RViz's
+Add an RViz Image display on `/sonar3d/quantitative_image/compressed`, with
+Reliable and Transient Local QoS. Both bundled RViz configurations
+select the lossless PNG `quantitative_image/compressed` topic. Raw RGB remains
+available for subscribers requesting it; each requested figure is drawn once,
+and encoding/publication runs only for subscribed transports. RGB colours are already fixed by the renderer; RViz's
 floating-point normalization does not apply. See the
 [Jazzy Image display implementation](https://github.com/ros2/rviz/blob/jazzy/rviz_default_plugins/src/rviz_default_plugins/displays/image/image_display.cpp).
 
@@ -661,7 +691,8 @@ cmake --build build/sonar3d --target benchmark_stream
 
 The live arguments are rate (`5` or `20` Hz), frame count, subscribed products
 (`none`, `range`, `cloud`, `all`), image protocol version (`1` or `2`), and ROS
-transport (`dds` or `ipc`). It simulates one sonar over loopback multicast with
+transport (`dds` or `ipc`). The `all` selection includes raw packets and image
+metadata as well as processed products. It simulates one sonar over loopback multicast with
 256×64 images and 100 Hz RIP2 IMU samples. It reports delivered counts, sequence
 gaps, range/cloud latency, and CPU for the entire test process, including the
 sender and subscriber. HTTP configuration is disabled. Nonzero exit status

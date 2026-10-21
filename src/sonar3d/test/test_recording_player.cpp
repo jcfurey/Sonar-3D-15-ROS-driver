@@ -30,6 +30,7 @@
 #include <rosbag2_cpp/reader.hpp>
 
 #include "sonar3d/conversions.hpp"
+#include "sonar3d/msg/raw_packet.hpp"
 #include "stream_test_support.hpp"
 #include "WaterLinkedSonarIntegrationProtocol.pb.h"
 
@@ -305,9 +306,11 @@ TEST_F(ReplayTest, PlaybackRecoversAndReportsActualPublicationCounts)
   const auto subscription = observer->create_subscription<Cloud>(
     "points", qos, [&received](Cloud::ConstSharedPtr) {++received;});
   PlayerProcess process(recording.path(), false);
+  rclcpp::executors::SingleThreadedExecutor executor;
+  executor.add_node(observer);
   const auto deadline = std::chrono::steady_clock::now() + 5s;
   while (std::chrono::steady_clock::now() < deadline && (!process.finished() || received == 0)) {
-    rclcpp::spin_some(observer);
+    executor.spin_some();
     std::this_thread::sleep_for(2ms);
   }
   ASSERT_TRUE(process.finished()) << process.output();
@@ -331,9 +334,11 @@ TEST_F(ReplayTest, InterruptStopsPlaybackCleanlyWithAnIncompleteSummary)
     "points", qos, [&received](Cloud::ConstSharedPtr) {++received;});
   PlayerProcess process(recording.path(), std::vector<std::string>{
       "--startup-delay", "1.0", "--realtime-factor", "0.01"});
+  rclcpp::executors::SingleThreadedExecutor executor;
+  executor.add_node(observer);
   const auto deadline = std::chrono::steady_clock::now() + 5s;
   while (received == 0 && std::chrono::steady_clock::now() < deadline) {
-    rclcpp::spin_some(observer);
+    executor.spin_some();
     std::this_thread::sleep_for(2ms);
   }
   ASSERT_EQ(received, 1U) << process.output();
@@ -343,6 +348,36 @@ TEST_F(ReplayTest, InterruptStopsPlaybackCleanlyWithAnIncompleteSummary)
   EXPECT_NE(process.output().find("Stopped before recording EOF; results are incomplete"),
     std::string::npos);
   EXPECT_EQ(process.output().find("failed to create guard condition"), std::string::npos);
+}
+
+TEST_F(ReplayTest, MissingSignalReleasesCloudBeforeTheNextRecordedRangeImage)
+{
+  auto first = sonar3d::testing::range_image(0);
+  auto second = sonar3d::testing::range_image(1);
+  second.header.timestamp = sonar3d::testing::timestamp(
+    *sonar3d::conversions::sensor_nanoseconds(first.header.timestamp) + 500'000'000);
+  const Recording recording({sonar3d::protocol::encode_packet(first),
+      sonar3d::protocol::encode_packet(second)});
+  auto observer = std::make_shared<rclcpp::Node>("observer", "/sonar3d_replay_test");
+  rclcpp::executors::SingleThreadedExecutor executor;
+  executor.add_node(observer);
+  std::vector<double> ages;
+  const auto subscription = observer->create_subscription<Cloud>(
+    "points", rclcpp::QoS(10), [&ages, &observer](Cloud::ConstSharedPtr message) {
+      ages.push_back((observer->now() - rclcpp::Time(message->header.stamp)).seconds());
+    });
+  PlayerProcess process(recording.path(), std::vector<std::string>{
+      "--startup-delay", "0.5", "--receive-time"});
+  const auto deadline = std::chrono::steady_clock::now() + 5s;
+  while (std::chrono::steady_clock::now() < deadline && (!process.finished() || ages.size() < 2)) {
+    executor.spin_some();
+    std::this_thread::sleep_for(2ms);
+  }
+  ASSERT_TRUE(process.finished()) << process.output();
+  ASSERT_TRUE(process.succeeded()) << process.output();
+  ASSERT_EQ(ages.size(), 2U);
+  EXPECT_GE(ages[0], 0.020);
+  EXPECT_LT(ages[0], 0.2);
 }
 
 TEST_F(ReplayTest, OutputWritesEveryProductToABagWithoutPacing)
@@ -381,6 +416,32 @@ TEST_F(ReplayTest, OutputWritesEveryProductToABagWithoutPacing)
   ASSERT_EQ(topics["/sonar3d_replay_test/shaded_image"].size(), 12U);
   ASSERT_EQ(topics["/sonar3d_replay_test/imu/data_raw"].size(), 60U);
   ASSERT_EQ(topics["/sonar3d_replay_test/image_metadata"].size(), 36U);
+  const auto & raw_packets = topics["/sonar3d_replay_test/raw_packet"];
+  ASSERT_EQ(raw_packets.size(), 48U);
+  std::ifstream original(recording.path(), std::ios::binary);
+  std::vector<PacketBytes> original_packets;
+  for (std::size_t index = 0; index < raw_packets.size(); ++index) {
+    PacketBytes bytes;
+    ASSERT_TRUE(sonar3d::protocol::read_packet(original, &bytes));
+    original_packets.push_back(std::move(bytes));
+  }
+  std::vector<bool> seen(raw_packets.size(), false);
+  rclcpp::Serialization<sonar3d::msg::RawPacket> raw_serialization;
+  for (const auto & stored : raw_packets) {
+    rclcpp::SerializedMessage serialized(*stored->serialized_data);
+    sonar3d::msg::RawPacket raw;
+    raw_serialization.deserialize_message(&serialized, &raw);
+    ASSERT_LT(raw.packet_index, original_packets.size());
+    EXPECT_FALSE(seen[raw.packet_index]);
+    seen[raw.packet_index] = true;
+    EXPECT_EQ(raw.data, original_packets[raw.packet_index]);
+    EXPECT_TRUE(raw.source_address.empty());
+    // Bag readers sort by acquisition time; an interleaved IMU batch begins
+    // before its shot. The input index retains original packet ordering.
+    const auto expected = 1'700'000'000'000'000'000LL +
+      (raw.packet_index / 4) * 50'000'000LL - (raw.packet_index % 4 == 3 ? 40'000'000LL : 0);
+    EXPECT_EQ(rclcpp::Time(raw.header.stamp).nanoseconds(), expected);
+  }
 
   rclcpp::Serialization<sonar3d::msg::ImageMetadata> metadata_serialization;
   for (const auto & stored : topics["/sonar3d_replay_test/image_metadata"]) {
@@ -418,6 +479,44 @@ TEST_F(ReplayTest, OutputWritesEveryProductToABagWithoutPacing)
     imu_serialization.deserialize_message(&serialized, &imu);
     EXPECT_EQ(imu, expected_imu[sample]);
   }
+}
+
+TEST_F(ReplayTest, BagRetainsUnknownAndDamagedPacketsWithoutChangingTheirBytes)
+{
+  const auto unknown = unknown_packet("type.googleapis.com/waterlinked.sonar.future.NewProduct");
+  const auto valid = sonar3d::protocol::encode_packet(sonar3d::testing::range_image(1));
+  auto damaged = valid;
+  damaged.at(damaged.size() - 1) ^= 1;
+  const std::vector<PacketBytes> packets{unknown, damaged, valid};
+  const Recording recording(packets);
+  char pattern[] = "/tmp/sonar3d-raw-bag-XXXXXX";
+  ASSERT_NE(mkdtemp(pattern), nullptr);
+  const std::filesystem::path directory(pattern);
+  const auto bag = (directory / "converted").string();
+  PlayerProcess process(recording.path(), std::vector<std::string>{"--output", bag});
+  ASSERT_TRUE(process.wait()) << process.output();
+  ASSERT_TRUE(process.succeeded()) << process.output();
+  std::size_t count = 0;
+  {
+    rosbag2_cpp::Reader reader;
+    reader.open(bag);
+    rclcpp::Serialization<sonar3d::msg::RawPacket> serialization;
+    while (reader.has_next()) {
+      const auto stored = reader.read_next();
+      if (stored->topic_name != "/sonar3d_replay_test/raw_packet") {
+        continue;
+      }
+      rclcpp::SerializedMessage serialized(*stored->serialized_data);
+      sonar3d::msg::RawPacket raw;
+      serialization.deserialize_message(&serialized, &raw);
+      ASSERT_LT(raw.packet_index, packets.size());
+      EXPECT_EQ(raw.data, packets[raw.packet_index]);
+      ++count;
+      EXPECT_EQ(raw.header.stamp.sec, 1'700'000'000);
+    }
+  }
+  EXPECT_EQ(count, packets.size());
+  std::filesystem::remove_all(directory);
 }
 
 TEST_F(ReplayTest, OutputRejectsReceiveTimeStamps)

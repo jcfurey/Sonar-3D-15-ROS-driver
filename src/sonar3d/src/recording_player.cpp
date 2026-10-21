@@ -38,6 +38,7 @@
 #include "sonar3d/protocol.hpp"
 #include "sonar3d/publisher_demand.hpp"
 #include "sonar3d/range_signal_pairing.hpp"
+#include "sonar3d/msg/raw_packet.hpp"
 
 namespace sonar3d
 {
@@ -253,6 +254,7 @@ public:
     point_cloud_.topic = resolve("points");
     imu_.topic = resolve("imu/data_raw");
     image_metadata_.topic = resolve("image_metadata");
+    raw_packet_.topic = resolve("raw_packet");
     if (mode_ == OutputMode::BAG) {
       rosbag2_storage::StorageOptions storage;
       storage.uri = options.output;
@@ -270,7 +272,33 @@ public:
       advertise(point_cloud_, qos);
       advertise(imu_, qos);
       advertise(image_metadata_, qos);
+      advertise(raw_packet_, qos);
     }
+  }
+
+  [[nodiscard]] bool wants_raw_packets() const
+  {
+    return mode_ != OutputMode::VALIDATE && wanted(raw_packet_);
+  }
+
+  void recording_origin(std::optional<std::int64_t> stamp) {raw_stamp_ = stamp;}
+
+  void process_packet(
+    std::vector<std::uint8_t> && bytes, std::optional<std::int64_t> stamp = std::nullopt)
+  {
+    const auto index = raw_packet_index_++;
+    if (stamp && *stamp >= 0) {
+      raw_stamp_ = stamp;
+    }
+    if (!wants_raw_packets() || bytes.empty()) {
+      return;
+    }
+    msg::RawPacket raw;
+    raw.header.frame_id = frame_id_;
+    raw.packet_index = index;
+    raw.header.stamp = use_sensor_timestamps_ ? rclcpp::Time(raw_stamp_.value_or(0)) : now();
+    raw.data = std::move(bytes);
+    emit(raw_packet_, std::move(raw));
   }
 
   void process_message(protocol::Message && source)
@@ -307,7 +335,10 @@ public:
           }
           if (cloud && intensity_) {
             // The cloud waits for this shot's signal-strength image.
-            for (auto & pair : pairing_.add_range(std::move(message), header)) {
+            for (auto & pair : pairing_.add_range(std::move(message),
+                CloudContext{header, std::chrono::steady_clock::now() +
+              std::chrono::milliseconds(25)}))
+            {
               emit_cloud(std::move(pair));
             }
           } else if (cloud) {
@@ -354,6 +385,32 @@ public:
     }
   }
 
+  // Service the live driver's 25 ms intensity deadline while the file player
+  // waits for the next recorded packet. Offline bag conversion keeps pairing
+  // by recorded shot without imposing wall-clock time on the conversion.
+  void wait_until(
+    std::chrono::steady_clock::time_point deadline,
+    rclcpp::executors::SingleThreadedExecutor & executor)
+  {
+    while (rclcpp::ok()) {
+      const auto now = std::chrono::steady_clock::now();
+      const auto * pending = pairing_.pending_context();
+      if (pending && now >= pending->deadline) {
+        flush();
+        continue;
+      }
+      if (now >= deadline) {
+        return;
+      }
+      auto wake = std::min(deadline, now + std::chrono::milliseconds(50));
+      if (pending) {
+        wake = std::min(wake, pending->deadline);
+      }
+      std::this_thread::sleep_until(wake);
+      executor.spin_some();
+    }
+  }
+
   [[nodiscard]] std::uint64_t unpaired_range_images() const {return unpaired_range_images_;}
 
   [[nodiscard]] const std::map<std::string, std::uint64_t> & outputs() const {return outputs_;}
@@ -363,6 +420,13 @@ public:
   void finish() {writer_.reset();}
 
 private:
+  struct CloudContext
+  {
+    std_msgs::msg::Header header;
+    std::chrono::steady_clock::time_point deadline;
+  };
+  using CloudPairing = RangeSignalPairing<CloudContext>;
+
   template<typename MessageT>
   struct Output
   {
@@ -389,13 +453,13 @@ private:
     return mode_ != OutputMode::PUBLISH || has_subscribers(output.publisher);
   }
 
-  void emit_cloud(RangeSignalPairing<std_msgs::msg::Header>::Pair && pair)
+  void emit_cloud(CloudPairing::Pair && pair)
   {
     if (!pair.signal) {
       ++unpaired_range_images_;
     }
     emit(point_cloud_, conversions::make_point_cloud(
-        pair.range, pair.context, true, pair.signal ? &*pair.signal : nullptr));
+        pair.range, pair.context.header, true, pair.signal ? &*pair.signal : nullptr));
   }
 
   template<typename MessageT>
@@ -419,7 +483,7 @@ private:
   bool use_sensor_timestamps_;
   bool intensity_;
   OutputMode mode_;
-  RangeSignalPairing<std_msgs::msg::Header> pairing_;
+  CloudPairing pairing_;
   std::uint64_t unpaired_range_images_{};
   std::map<std::string, std::uint64_t> outputs_;
   std::unique_ptr<rosbag2_cpp::Writer> writer_;
@@ -429,7 +493,38 @@ private:
   Output<sensor_msgs::msg::PointCloud2> point_cloud_;
   Output<sensor_msgs::msg::Imu> imu_;
   Output<msg::ImageMetadata> image_metadata_;
+  Output<msg::RawPacket> raw_packet_;
+  std::optional<std::int64_t> raw_stamp_;
+  std::uint64_t raw_packet_index_{};
 };
+
+// Unknown packets have no interpreted acquisition clock. Anchor their bag
+// event times to the first known stamp, then the last known stamp, rather than
+// mixing the sonar epoch with this computer's current wall clock.
+std::optional<std::int64_t> first_recorded_stamp(std::istream & stream)
+{
+  std::optional<std::int64_t> stamp;
+  const auto origin = stream.tellg();
+  while (!stamp) {
+    try {
+      const auto packet = protocol::read_packet(stream);
+      if (!packet) {
+        break;
+      }
+      stamp = sensor_time_nanoseconds(packet->message);
+      if (stamp && *stamp < 0) {
+        stamp.reset();
+      }
+    } catch (const protocol::ProtocolError & error) {
+      if (!error.framing_intact()) {
+        break;
+      }
+    }
+  }
+  stream.clear();
+  stream.seekg(origin);
+  return stamp;
+}
 
 [[nodiscard]] int play_recording(const PlaybackOptions & options)
 {
@@ -439,6 +534,9 @@ private:
   }
 
   auto node = std::make_shared<RecordingPlayer>(options);
+  if (options.use_sensor_timestamps && node->mode() != OutputMode::VALIDATE) {
+    node->recording_origin(first_recorded_stamp(stream));
+  }
   const bool paced = node->mode() == OutputMode::PUBLISH;
   rclcpp::executors::SingleThreadedExecutor executor;
   executor.add_node(node);
@@ -457,9 +555,11 @@ private:
   while (rclcpp::ok()) {
     const auto offset = stream.tellg();
     std::optional<protocol::DecodedPacket> packet;
+    std::vector<std::uint8_t> raw_packet;
     try {
-      packet = protocol::read_packet(stream);
+      packet = protocol::read_packet(stream, node->wants_raw_packets() ? &raw_packet : nullptr);
     } catch (const protocol::ProtocolError & error) {
+      node->process_packet(std::move(raw_packet));
       if (error.framing_intact()) {
         ++damaged;
         RCLCPP_WARN(
@@ -479,18 +579,25 @@ private:
     }
 
     if (const auto type = unsupported_type(packet->message)) {
+      node->process_packet(std::move(raw_packet), sensor_time_nanoseconds(packet->message));
       ++unsupported;
       ++unsupported_types[*type];
       continue;
     }
     if (paced) {
-      interruptible_sleep_until(playback_clock.deadline(
-          sensor_time_nanoseconds(packet->message), std::chrono::steady_clock::now()));
+      try {
+        node->wait_until(playback_clock.deadline(
+            sensor_time_nanoseconds(packet->message), std::chrono::steady_clock::now()), executor);
+      } catch (const std::exception & error) {
+        ++malformed;
+        RCLCPP_WARN(node->get_logger(), "Skipping malformed waiting cloud: %s", error.what());
+      }
     }
     if (!rclcpp::ok()) {
       break;
     }
 
+    node->process_packet(std::move(raw_packet), sensor_time_nanoseconds(packet->message));
     try {
       node->process_message(std::move(packet->message));
     } catch (const std::exception & error) {

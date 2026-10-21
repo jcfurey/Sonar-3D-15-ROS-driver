@@ -246,6 +246,10 @@ void SonarDriver::configure_driver()
   // reliable subscribers and SensorDataQoS (best-effort) subscribers connect.
   // IMU samples arrive in batches of up to 20, so keep a second of history.
   const auto product_qos = rclcpp::SystemDefaultsQoS().keep_last(5);
+  if (parameters.publish_raw_packets) {
+    raw_packet_publisher_ = create_publisher<msg::RawPacket>(
+      "raw_packet", rclcpp::SystemDefaultsQoS().keep_last(100));
+  }
   if (parameters.publish_range_image || parameters.publish_bitmap_images) {
     image_metadata_publisher_ = create_publisher<msg::ImageMetadata>(
       "image_metadata", rclcpp::SystemDefaultsQoS().keep_last(100));
@@ -394,6 +398,7 @@ void SonarDriver::release()
   intensity_image_publisher_.reset();
   shaded_image_publisher_.reset();
   image_metadata_publisher_.reset();
+  raw_packet_publisher_.reset();
   point_cloud_publisher_.reset();
   imu_publisher_.reset();
   receiver_.reset();
@@ -663,6 +668,16 @@ void SonarDriver::handle_datagram(const Datagram & datagram)
     return;
   }
 
+  const builtin_interfaces::msg::Time fallback_stamp = now();
+  if (has_subscribers(raw_packet_publisher_)) {
+    auto raw = std::make_unique<msg::RawPacket>();
+    raw->header.stamp = fallback_stamp;
+    raw->header.frame_id = settings_.frame_id;
+    raw->source_address = format_ipv4(datagram.source_address);
+    raw->packet_index = value(metrics_.datagrams) - 1;
+    raw->data = datagram.bytes;
+    raw_packet_publisher_->publish(std::move(raw));
+  }
   protocol::DecodedPacket packet{protocol::ProtocolVersion::RIP1, protocol::UnknownMessage{}};
   try {
     packet = protocol::decode_packet(datagram.bytes);
@@ -682,8 +697,6 @@ void SonarDriver::handle_datagram(const Datagram & datagram)
 
   metrics_.valid_packets.fetch_add(1, std::memory_order_relaxed);
   last_valid_packet_steady_ns_.store(steady_time_nanoseconds(), std::memory_order_relaxed);
-  const builtin_interfaces::msg::Time fallback_stamp = now();
-
   try {
     std::visit(
       [this, &fallback_stamp](auto & message) {
@@ -716,7 +729,9 @@ void SonarDriver::handle_range_image(
   protocol::RangeImage && image,
   const builtin_interfaces::msg::Time & fallback_stamp)
 {
-  observe_sequence(range_sequence_, image.header.sequence_id);
+  if (!observe_sequence(range_sequence_, image.header.sequence_id, image.header.timestamp)) {
+    return;
+  }
   range_rate_.tick();
   observe_image_geometry(image.horizontal_fov_degrees, image.vertical_fov_degrees);
   const auto header = conversions::make_header(
@@ -801,11 +816,17 @@ void SonarDriver::handle_bitmap_image(
   Publisher<sensor_msgs::msg::Image> publisher;
   switch (image.type) {
     case protocol::BitmapImageType::SIGNAL_STRENGTH_IMAGE:
-      observe_sequence(intensity_sequence_, image.header.sequence_id);
+      if (!observe_sequence(intensity_sequence_, image.header.sequence_id,
+        image.header.timestamp))
+      {
+        return;
+      }
       publisher = intensity_image_publisher_;
       break;
     case protocol::BitmapImageType::SHADED_IMAGE:
-      observe_sequence(shaded_sequence_, image.header.sequence_id);
+      if (!observe_sequence(shaded_sequence_, image.header.sequence_id, image.header.timestamp)) {
+        return;
+      }
       publisher = shaded_image_publisher_;
       break;
     default:
@@ -845,12 +866,15 @@ void SonarDriver::handle_imu_batch(
   const protocol::ImuBatch & batch,
   const builtin_interfaces::msg::Time & fallback_stamp)
 {
-  observe_sequence(imu_sequence_, batch.sequence_id);
+  const auto newest_stamp = batch.timestamps.empty() ?
+    std::nullopt : std::optional{batch.timestamps.back()};
+  if (!observe_sequence(imu_sequence_, batch.sequence_id, newest_stamp)) {
+    return;
+  }
   // The newest sample has the least transport delay, so it best constrains the
   // clock offset; every sample shares that offset and keeps its spacing.
   const auto offset = sensor_clock_offset(
-    batch.timestamps.empty() ? std::nullopt : std::optional{batch.timestamps.back()},
-    fallback_stamp);
+    newest_stamp, fallback_stamp);
   if (has_subscribers(imu_publisher_)) {
     auto messages = conversions::make_imu_messages(
       batch,
@@ -879,8 +903,9 @@ std::int64_t SonarDriver::sensor_clock_offset(
   const auto receive = rclcpp::Time(receive_stamp).nanoseconds();
   const auto offset = receive - *sensor;
   last_sensor_clock_offset_ns_.store(offset, std::memory_order_relaxed);
+  const auto estimated_offset = clock_offset_.update(offset, receive);
   const bool synchronized = settings_.max_sensor_clock_offset_ns == 0 ||
-    std::llabs(offset) <= settings_.max_sensor_clock_offset_ns;
+    std::llabs(estimated_offset) <= settings_.max_sensor_clock_offset_ns;
   const auto source = synchronized ? TimestampSource::SENSOR : TimestampSource::RECEIVE;
   if (timestamp_source_.exchange(source) != source) {
     if (synchronized) {
@@ -898,40 +923,71 @@ std::int64_t SonarDriver::sensor_clock_offset(
     }
   }
   if (synchronized) {
-    clock_offset_.reset();
     return 0;
   }
   metrics_.sensor_clock_fallbacks.fetch_add(1, std::memory_order_relaxed);
-  return clock_offset_.update(offset, receive);
+  return estimated_offset;
 }
 
-void SonarDriver::observe_sequence(SequenceState & state, std::uint32_t sequence_id)
+bool SonarDriver::observe_sequence(
+  SequenceState & state, std::uint32_t sequence_id,
+  const std::optional<protocol::Timestamp> & timestamp)
 {
+  const auto stamp = conversions::sensor_nanoseconds(timestamp);
+  const auto arrival = steady_time_nanoseconds();
+  const auto accept = [&]() {
+      state.last = sequence_id;
+      state.stamp = stamp;
+      state.arrival = arrival;
+      state.restart_last.reset();
+      state.restart_samples = 0;
+      return true;
+    };
   if (!state.last) {
-    state.last = sequence_id;
-    return;
+    return accept();
   }
 
   const auto previous = *state.last;
   const auto forward_delta = sequence_id - previous;
-  if (forward_delta == 0) {
+  if (forward_delta == 0 && (!stamp || !state.stamp || *stamp == *state.stamp)) {
     metrics_.duplicate_messages.fetch_add(1, std::memory_order_relaxed);
-    return;
+    return false;
   }
-  if (forward_delta < (std::uint32_t{1} << 31U)) {
+  if (forward_delta != 0 && forward_delta < (std::uint32_t{1} << 31U)) {
     metrics_.sequence_gaps.fetch_add(forward_delta - 1U, std::memory_order_relaxed);
-    state.last = sequence_id;
-    return;
+    return accept();
   }
 
-  const auto backward_delta = previous - sequence_id;
-  constexpr std::uint32_t kMaximumReorderingDistance = 64;
-  if (backward_delta > kMaximumReorderingDistance) {
-    metrics_.sequence_resets.fetch_add(1, std::memory_order_relaxed);
-    state.last = sequence_id;
-  } else {
-    metrics_.out_of_order_messages.fetch_add(1, std::memory_order_relaxed);
+  // A restarted counter with a newer acquisition timestamp is unambiguous.
+  // If the sensor clock also reset, require a stale stream and three advancing
+  // packets. A single delayed packet, however far behind, is never a restart.
+  bool restarted = stamp && state.stamp && *stamp > *state.stamp;
+  if (!restarted && static_cast<double>(arrival - state.arrival) / 1.0e9 >
+    settings_.packet_stale_timeout)
+  {
+    const auto delta = state.restart_last ? sequence_id - *state.restart_last : 0;
+    if (state.restart_last && delta == 0) {
+      metrics_.duplicate_messages.fetch_add(1, std::memory_order_relaxed);
+      return false;
+    }
+    const bool advancing = state.restart_last && delta < 64 &&
+      (!stamp || !state.restart_stamp || *stamp > *state.restart_stamp);
+    if (!advancing) {
+      state.restart_arrival = arrival;
+    }
+    state.restart_samples = advancing ? state.restart_samples + 1 : 1;
+    state.restart_last = sequence_id;
+    state.restart_stamp = stamp;
+    restarted = state.restart_samples >= 3 && arrival - state.restart_arrival >= 50'000'000;
   }
+  if (!restarted) {
+    metrics_.out_of_order_messages.fetch_add(1, std::memory_order_relaxed);
+    return false;
+  }
+  metrics_.sequence_resets.fetch_add(1, std::memory_order_relaxed);
+  clock_offset_.reset();
+  pairing_.clear();
+  return accept();
 }
 
 void SonarDriver::diagnose_stream(diagnostic_updater::DiagnosticStatusWrapper & status)
@@ -1045,6 +1101,12 @@ void SonarDriver::diagnose_stream(diagnostic_updater::DiagnosticStatusWrapper & 
       case TimestampSource::SENSOR:
         status.add("timestamp_source", "sensor");
         status.add("sensor_clock_offset_seconds", offset_seconds);
+        if (settings_.max_sensor_clock_offset_ns > 0 &&
+          std::llabs(last_sensor_clock_offset_ns_.load()) > settings_.max_sensor_clock_offset_ns)
+        {
+          status.mergeSummary(
+            DiagnosticStatus::WARN, "late acquisition timestamp or unconfirmed sonar clock step");
+        }
         break;
       case TimestampSource::RECEIVE:
         status.add("timestamp_source", "receive-aligned (sensor clock unsynchronized)");

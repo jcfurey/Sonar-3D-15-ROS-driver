@@ -47,7 +47,7 @@ Visualization Manager:
       Max Value: 255
       Median window: 1
       Topic:
-        Value: quantitative_image
+        Value: quantitative_image/compressed
         Reliability Policy: Reliable
         Durability Policy: Transient Local
         History Policy: Keep Last

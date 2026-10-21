@@ -352,6 +352,15 @@ DecodedPacket decode_packet(std::span<const std::uint8_t> bytes)
 
 std::optional<DecodedPacket> read_packet(std::istream & stream)
 {
+  return read_packet(stream, nullptr);
+}
+
+std::optional<DecodedPacket> read_packet(
+  std::istream & stream, std::vector<std::uint8_t> * raw_packet)
+{
+  if (raw_packet != nullptr) {
+    raw_packet->clear();
+  }
   std::array<std::uint8_t, kHeaderSize> header{};
   stream.read(reinterpret_cast<char *>(header.data()), static_cast<std::streamsize>(header.size()));
   const auto header_bytes = static_cast<std::size_t>(stream.gcount());
@@ -380,6 +389,10 @@ std::optional<DecodedPacket> read_packet(std::istream & stream)
     throw ProtocolError(ErrorCode::INCOMPLETE_PACKET, false, "incomplete RIP packet in recording");
   }
 
+  if (raw_packet != nullptr) {
+    *raw_packet = std::move(packet);
+    return decode_packet(*raw_packet);
+  }
   return decode_packet(packet);
 }
 

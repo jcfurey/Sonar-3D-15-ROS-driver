@@ -44,6 +44,7 @@ PARAMETER_TYPES = {
     'publish_tf': bool,
     'point_cloud_intensity': bool,
     'publish_point_cloud': bool,
+    'publish_raw_packets': bool,
     'publish_range_image': bool,
     'publish_bitmap_images': bool,
     'publish_imu': bool,

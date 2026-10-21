@@ -59,7 +59,7 @@ protected:
     options.append_parameter_override("diagnostic_updater.period", 0.1);
     options.append_parameter_override("max_sensor_clock_offset", max_sensor_clock_offset);
     for (const auto * parameter : {"publish_range_image", "publish_point_cloud",
-        "publish_bitmap_images", "publish_imu"})
+        "publish_bitmap_images", "publish_imu", "publish_raw_packets"})
     {
       options.append_parameter_override(parameter, enable_products);
     }
@@ -731,6 +731,132 @@ TEST_P(DriverStream, ImageMetadataMatchesEveryRawImageWithReceiveTimeHeaders)
   }
 }
 // *INDENT-ON*
+
+// *INDENT-OFF*
+TEST_P(DriverStream, RawPacketsPreserveDuplicatesUnsupportedProductsAndDamagedBytes)
+{
+  start();
+  subscribe();
+  std::vector<sonar3d::msg::RawPacket::ConstSharedPtr> raw;
+  const auto subscription = observer_->create_subscription<sonar3d::msg::RawPacket>(
+    "raw_packet", rclcpp::QoS(100),
+    [&raw](sonar3d::msg::RawPacket::ConstSharedPtr message) {raw.push_back(message);});
+  ASSERT_TRUE(discovered());
+  ASSERT_TRUE(wait_for([this] {return driver_->count_subscribers("raw_packet") == 1;}));
+  const auto range = sonar3d::protocol::encode_packet(sonar3d::testing::range_image(0));
+  auto unsupported = sonar3d::testing::bitmap_image(0, BitmapImageType::SIGNAL_STRENGTH_IMAGE);
+  unsupported.type = static_cast<BitmapImageType>(99);
+  auto damaged = range;
+  damaged.at(damaged.size() - 1) ^= 1;
+  const std::vector<std::vector<std::uint8_t>> packets{
+    range, range, sonar3d::protocol::encode_packet(unsupported), damaged};
+  for (const auto & bytes : packets) {
+    sender_.send(port_, bytes, destination_.c_str());
+  }
+  ASSERT_TRUE(wait_for([&raw] {return raw.size() == 4;}));
+  for (std::size_t index = 0; index < raw.size(); ++index) {
+    EXPECT_EQ(raw[index]->data, packets[index]);
+    EXPECT_EQ(raw[index]->packet_index, index);
+    EXPECT_EQ(raw[index]->source_address, "127.0.0.1");
+    EXPECT_EQ(raw[index]->header.frame_id, "test_sonar");
+    EXPECT_NEAR((driver_->now() - rclcpp::Time(raw[index]->header.stamp)).seconds(), 0.0, 0.5);
+  }
+  ASSERT_TRUE(wait_for([this] {return metric("crc_failures") == 1;}));
+  EXPECT_EQ(ranges_.size(), 1U);
+}
+// *INDENT-ON*
+
+TEST_P(DriverStream, DuplicateProductsAndLatePacketsNeverReachConsumersOrTheClockFit)
+{
+  start(true, 1.0);
+  subscribe();
+  ASSERT_TRUE(discovered());
+  send_frame(100, ProtocolVersion::RIP2);
+  ASSERT_TRUE(wait_for([this] {return ranges_.size() == 1 && imus_.size() == 5;}));
+  send_frame(100, ProtocolVersion::RIP2);
+  send_frame(99, ProtocolVersion::RIP2);
+  send_frame(1, ProtocolVersion::RIP2);
+  ASSERT_TRUE(wait_for([this] {return metric("duplicates") == 4 && metric("out_of_order") == 8;}));
+  EXPECT_EQ(ranges_.size(), 1U);
+  EXPECT_EQ(clouds_.size(), 1U);
+  EXPECT_EQ(intensities_.size(), 1U);
+  EXPECT_EQ(shaded_.size(), 1U);
+  EXPECT_EQ(imus_.size(), 5U);
+  EXPECT_EQ(metric("sensor_clock_fallbacks"), 4U);
+  send_frame(101, ProtocolVersion::RIP2);
+  ASSERT_TRUE(wait_for([this] {return ranges_.size() == 2 && imus_.size() == 10;}));
+}
+
+TEST_P(DriverStream, SynchronizedClockDoesNotRelabelOneLateInOrderImage)
+{
+  start(true, 1.0, {rclcpp::Parameter("point_cloud_intensity", false)});
+  subscribe();
+  ASSERT_TRUE(discovered());
+  auto image = sonar3d::testing::range_image(100);
+  const auto stamp = driver_->now().nanoseconds() - 10'000'000;
+  image.header.timestamp = sonar3d::testing::timestamp(stamp);
+  sender_.send(port_, sonar3d::protocol::encode_packet(image), destination_.c_str());
+  ASSERT_TRUE(wait_for([this] {return ranges_.size() == 1;}));
+  std::this_thread::sleep_for(1100ms);
+  image.header.sequence_id = 101;
+  image.header.timestamp = sonar3d::testing::timestamp(stamp + 50'000'000);
+  sender_.send(port_, sonar3d::protocol::encode_packet(image), destination_.c_str());
+  ASSERT_TRUE(wait_for([this] {return ranges_.size() == 2;}));
+  EXPECT_EQ(rclcpp::Time(ranges_[1]->header.stamp).nanoseconds(), stamp + 50'000'000);
+  ASSERT_TRUE(wait_for([this] {return value("timestamp_source") == "sensor";}));
+  EXPECT_EQ(metric("sensor_clock_fallbacks"), 0U);
+}
+
+TEST_P(DriverStream, SequenceWrapAndDeviceRestartResumeWithoutAcceptingOldPackets)
+{
+  start(true, 1.0, {rclcpp::Parameter("packet_stale_timeout", 0.1)});
+  subscribe();
+  ASSERT_TRUE(discovered());
+  auto image = sonar3d::testing::range_image(0);
+  image.header.sequence_id = UINT32_MAX;
+  sender_.send(port_, sonar3d::protocol::encode_packet(image), destination_.c_str());
+  ASSERT_TRUE(wait_for([this] {return ranges_.size() == 1;}));
+  image.header.sequence_id = 0;
+  image.header.timestamp->nanoseconds += 50'000'000;
+  sender_.send(port_, sonar3d::protocol::encode_packet(image), destination_.c_str());
+  ASSERT_TRUE(wait_for([this] {return ranges_.size() == 2;}));
+  image.header.sequence_id = 100;
+  image.header.timestamp->nanoseconds += 50'000'000;
+  sender_.send(port_, sonar3d::protocol::encode_packet(image), destination_.c_str());
+  ASSERT_TRUE(wait_for([this] {return ranges_.size() == 3;}));
+  // A reboot resets both the sequence and the arbitrary sonar clock. Require
+  // a stale stream and consecutive new packets before accepting this epoch.
+  std::this_thread::sleep_for(120ms);
+  for (std::uint32_t sequence = 0; sequence < 3; ++sequence) {
+    image.header.sequence_id = sequence;
+    image.header.timestamp = sonar3d::testing::timestamp(100'000'000'000LL + sequence *
+        50'000'000LL);
+    sender_.send(port_, sonar3d::protocol::encode_packet(image), destination_.c_str());
+    std::this_thread::sleep_for(30ms);
+  }
+  ASSERT_TRUE(wait_for([this] {return ranges_.size() == 4;}));
+  ASSERT_TRUE(wait_for([this] {return metric("sequence_resets") == 1;}));
+  EXPECT_EQ(metric("out_of_order"), 2U);
+  EXPECT_NEAR((driver_->now() - rclcpp::Time(ranges_.back()->header.stamp)).seconds(), 0.0, 0.5);
+}
+
+TEST_P(DriverStream, QueuedOldBurstAfterSilenceDoesNotRestartTheStream)
+{
+  start(true, 1.0, {rclcpp::Parameter("packet_stale_timeout", 0.1)});
+  subscribe();
+  ASSERT_TRUE(discovered());
+  send_frame(100, ProtocolVersion::RIP2);
+  ASSERT_TRUE(wait_for([this] {return ranges_.size() == 1;}));
+  std::this_thread::sleep_for(120ms);
+  for (std::uint32_t sequence = 0; sequence < 3; ++sequence) {
+    send_frame(sequence, ProtocolVersion::RIP2);
+  }
+  ASSERT_TRUE(wait_for([this] {return metric("valid_packets") == 16;}));
+  EXPECT_EQ(ranges_.size(), 1U);
+  EXPECT_EQ(metric("sequence_resets"), 0U);
+  send_frame(101, ProtocolVersion::RIP2);
+  ASSERT_TRUE(wait_for([this] {return ranges_.size() == 2;}));
+}
 
 INSTANTIATE_TEST_SUITE_P(Transport, DriverStream, ::testing::Bool());
 

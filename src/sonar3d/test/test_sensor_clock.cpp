@@ -26,6 +26,12 @@ TEST(SensorClockOffset, KeepsTheSmallestDelayAndIgnoresLatencySpikes)
   EXPECT_EQ(clock.update(offset + 5 * kMillisecond, kSecond), offset + 5 * kMillisecond);
   EXPECT_EQ(clock.update(offset + 300 * kMillisecond, 2 * kSecond), offset + 5 * kMillisecond);
   EXPECT_EQ(clock.update(offset + 8 * kMillisecond, 3 * kSecond), offset + 5 * kMillisecond);
+  EXPECT_EQ(clock.update(offset + 2 * kSecond, 4 * kSecond), offset + 5 * kMillisecond);
+  EXPECT_EQ(clock.update(offset + 2 * kSecond, 4 * kSecond + kMillisecond),
+    offset + 5 * kMillisecond);
+  EXPECT_EQ(clock.update(offset + 2 * kSecond, 4 * kSecond + 2 * kMillisecond),
+    offset + 5 * kMillisecond);
+  EXPECT_EQ(clock.update(offset + 8 * kMillisecond, 5 * kSecond), offset + 5 * kMillisecond);
 }
 
 TEST(SensorClockOffset, FollowsDriftAfterTwoWindows)
@@ -46,9 +52,9 @@ TEST(SensorClockOffset, RestartsWhenTheSonarClockSteps)
   EXPECT_EQ(clock.update(1'000 * kSecond, 0), 1'000 * kSecond);
   // NTP moves the sonar clock forward: a smaller offset is accepted at once.
   EXPECT_EQ(clock.update(20 * kMillisecond, kSecond), 20 * kMillisecond);
-  // A backward step beyond the threshold restarts instead of being ignored,
-  // and later faster deliveries still lower the new estimate.
-  EXPECT_EQ(clock.update(5 * kSecond, 2 * kSecond), 5 * kSecond);
+  // A backward step must persist, rather than being inferred from a late packet.
+  EXPECT_EQ(clock.update(4 * kSecond, 2 * kSecond), 20 * kMillisecond);
+  EXPECT_EQ(clock.update(4 * kSecond, 2 * kSecond + 500 * kMillisecond), 20 * kMillisecond);
   EXPECT_EQ(clock.update(4 * kSecond, 3 * kSecond), 4 * kSecond);
   // A spike within the threshold is still ignored.
   EXPECT_EQ(clock.update(4 * kSecond + 900 * kMillisecond, 4 * kSecond), 4 * kSecond);

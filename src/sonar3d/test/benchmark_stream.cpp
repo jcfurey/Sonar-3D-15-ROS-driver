@@ -178,7 +178,7 @@ int live(int rate, int count, const std::string & products, ProtocolVersion vers
   const bool want_range = products == "range" || products == "all";
   const bool want_cloud = products == "cloud" || products == "all";
   const bool want_other = products == "all";
-  std::size_t ranges = 0, clouds = 0, bitmaps = 0, samples = 0;
+  std::size_t ranges = 0, clouds = 0, bitmaps = 0, samples = 0, raw_packets = 0, metadata = 0;
   std::vector<Clock::time_point> sent(count);
   std::vector<double> latencies;
   const auto latency = [&](const std_msgs::msg::Header & header) {
@@ -204,6 +204,10 @@ int live(int rate, int count, const std::string & products, ProtocolVersion vers
         }));
   }
   if (want_other) {
+    subscriptions.push_back(observer->create_subscription<sonar3d::msg::RawPacket>(
+        "raw_packet", qos, [&](sonar3d::msg::RawPacket::ConstSharedPtr) {++raw_packets;}));
+    subscriptions.push_back(observer->create_subscription<sonar3d::msg::ImageMetadata>(
+        "image_metadata", qos, [&](sonar3d::msg::ImageMetadata::ConstSharedPtr) {++metadata;}));
     for (const auto * topic : {"intensity_image", "shaded_image"}) {
       subscriptions.push_back(observer->create_subscription<sensor_msgs::msg::Image>(
           topic, qos, [&](sensor_msgs::msg::Image::ConstSharedPtr) {++bitmaps;}));
@@ -251,10 +255,13 @@ int live(int rate, int count, const std::string & products, ProtocolVersion vers
     " RIP" << static_cast<int>(version) << " ipc=" << ipc << " cpu_percent=" <<
     100.0 * cpu_elapsed / wall << " valid=" << valid << " gaps=" << gaps <<
     " range=" << ranges << " cloud=" << clouds << " bitmap=" << bitmaps << " imu=" <<
-    samples << " latency_p99_ms=" << p99 << '\n';
+    samples << " raw=" << raw_packets << " metadata=" << metadata <<
+    " latency_p99_ms=" << p99 << '\n';
   return valid == count * 4U && gaps == 0 && ranges == (want_range ? count : 0U) &&
          clouds == (want_cloud ? count : 0U) && bitmaps == (want_other ? count * 2U : 0U) &&
-         samples == (want_other ? count * 100U / rate : 0U) ? 0 : 1;
+         samples == (want_other ? count * 100U / rate : 0U) &&
+         raw_packets == (want_other ? count * 4U : 0U) &&
+         metadata == (want_other ? count * 3U : 0U) ? 0 : 1;
 }
 
 }  // namespace

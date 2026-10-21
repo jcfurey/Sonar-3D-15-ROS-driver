@@ -9,15 +9,17 @@
 """Publish the shared quantitative figure as a display-only RGB image for RViz."""
 
 import argparse
+import io
 
 import matplotlib
-from matplotlib import pyplot as plt
+from PIL import Image as PillowImage
 import rclpy
+from rclpy.clock import Clock, ClockType
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from rclpy.utilities import remove_ros_args
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import CompressedImage, Image
 from sonar3d.msg import ImageMetadata
 
 from sonar_image_science import ImageMatcher, PlotConfig, ScientificFigure, Shots
@@ -39,16 +41,21 @@ class ImagePublisher(Node):
         self.plot.figure.set_dpi(config.dpi)
         self.matcher, self.shots = ImageMatcher(), Shots()
         self.signature = None
-        inputs = QoSProfile(depth=100, reliability=ReliabilityPolicy.RELIABLE)
+        inputs = QoSProfile(depth=100, reliability=ReliabilityPolicy.BEST_EFFORT)
         outputs = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
                              durability=DurabilityPolicy.TRANSIENT_LOCAL)
         self.publisher = self.create_publisher(Image, 'quantitative_image', outputs)
+        self.compressed_publisher = self.create_publisher(
+            CompressedImage, 'quantitative_image/compressed', outputs)
         self.image_subscriptions = [self.create_subscription(
             Image, product, lambda msg, product=product: self.image(product, msg), inputs)
             for product in ('range_image', 'intensity_image')]
         self.image_subscriptions.append(self.create_subscription(
             ImageMetadata, 'image_metadata', self.metadata, inputs))
-        self.timer = self.create_timer(1 / args.refresh_hz, self.render)
+        # Keep display cost bounded in real time, including accelerated replay,
+        # and serve late viewers while the bag's ROS clock is paused.
+        self.display_clock = Clock(clock_type=ClockType.STEADY_TIME)
+        self.timer = self.create_timer(1 / args.refresh_hz, self.render, clock=self.display_clock)
 
     def accept(self, plane):
         """Retain complete products by original source shot, never by receive time."""
@@ -74,13 +81,15 @@ class ImagePublisher(Node):
     def render(self):
         """Sample the latest ready shot without averaging or modifying measurements."""
         frame = self.shots.latest()
-        if frame is None or not self.publisher.get_subscription_count():
+        raw = self.publisher.get_subscription_count() > 0
+        compressed = self.compressed_publisher.get_subscription_count() > 0
+        if frame is None or not (raw or compressed):
             return
-        signature = (frame['index'], tuple(frame['planes']))
+        signature = (frame['index'], tuple(frame['planes']), raw, compressed)
         if signature == self.signature:
             return
         try:
-            self.plot.update(frame['planes'])
+            self.plot.update(frame['planes'], draw=False)
             rgb = self.plot.rgb8()
         except ValueError as error:
             self.get_logger().warning(f'Figure rejected: {error}')
@@ -90,16 +99,26 @@ class ImagePublisher(Node):
         message.header.frame_id = header['frame_id']
         message.header.stamp.sec = header['stamp']['sec']
         message.header.stamp.nanosec = header['stamp']['nanosec']
-        message.height, message.width = rgb.shape[:2]
-        message.encoding = 'rgb8'
-        message.is_bigendian = False
-        message.step = message.width * 3
-        message.data = rgb.tobytes()
-        self.publisher.publish(message)
+        if raw:
+            message.height, message.width = rgb.shape[:2]
+            message.encoding = 'rgb8'
+            message.is_bigendian = False
+            message.step = message.width * 3
+            message.data = rgb.tobytes()
+            self.publisher.publish(message)
+        if compressed:
+            output = CompressedImage(header=message.header)
+            # OpenCV, used by compressed_image_transport, decodes PNG as BGR.
+            output.format = 'rgb8; png compressed bgr8'
+            buffer = io.BytesIO()
+            PillowImage.fromarray(rgb).save(buffer, format='PNG', compress_level=1)
+            output.data = buffer.getvalue()
+            self.compressed_publisher.publish(output)
         self.signature = signature
 
     def destroy_node(self):
         """Release the headless figure with the ROS node."""
+        from matplotlib import pyplot as plt
         plt.close(self.plot.figure)
         return super().destroy_node()
 

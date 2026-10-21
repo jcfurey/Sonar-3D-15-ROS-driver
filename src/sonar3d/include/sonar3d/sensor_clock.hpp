@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <optional>
 #include <stdexcept>
 
@@ -32,12 +33,28 @@ public:
     }
   }
 
-  // Record a receive-minus-sensor observation and return the offset to add to
-  // sensor timestamps. A difference far above the estimate means the sonar
-  // clock stepped backward, so the estimate restarts from that observation.
+  // A positive jump may be delivery delay rather than a backward clock step.
+  // Require consistent observations spanning the reset threshold before
+  // restarting; isolated or burst-delivered late packets cannot reset the fit.
   [[nodiscard]] std::int64_t update(std::int64_t receive_minus_sensor, std::int64_t receive_time)
   {
-    if (!current_ || receive_minus_sensor - estimate() > reset_threshold_) {
+    if (current_ && receive_minus_sensor - estimate() > reset_threshold_) {
+      const auto tolerance = reset_threshold_ / 10;
+      if (!step_ || std::abs(receive_minus_sensor - *step_) > tolerance) {
+        step_ = receive_minus_sensor;
+        step_start_ = receive_time;
+        step_samples_ = 1;
+      } else {
+        ++step_samples_;
+      }
+      if (step_samples_ < 3 || receive_time - step_start_ < reset_threshold_) {
+        return estimate();
+      }
+      reset();
+    } else {
+      step_.reset();
+    }
+    if (!current_) {
       current_ = receive_minus_sensor;
       previous_.reset();
       window_start_ = receive_time;
@@ -55,6 +72,7 @@ public:
   {
     current_.reset();
     previous_.reset();
+    step_.reset();
   }
 
 private:
@@ -67,6 +85,9 @@ private:
   std::int64_t reset_threshold_;
   std::optional<std::int64_t> current_;
   std::optional<std::int64_t> previous_;
+  std::optional<std::int64_t> step_;
+  std::int64_t step_start_{};
+  unsigned step_samples_{};
   std::int64_t window_start_{};
 };
 
