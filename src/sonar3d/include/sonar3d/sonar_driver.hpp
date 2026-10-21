@@ -8,6 +8,7 @@
 #pragma once
 
 #include <atomic>
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <map>
@@ -180,6 +181,19 @@ private:
   void stop_streaming();
   void stop_configuration();
 
+  enum class Warning : std::size_t
+  {
+    SOCKET,
+    DEFERRED_RANGE,
+    PACKET,
+    MESSAGE,
+    GEOMETRY,
+    BITMAP,
+    COUNT,
+  };
+  // Receive-thread warnings are throttled independently for each component.
+  [[nodiscard]] bool should_log(Warning warning);
+
   // Runs on receive_thread_ while active: blocks on the socket and publishes
   // each product as soon as its datagram arrives.
   void receive_loop(const std::stop_token & stop);
@@ -249,6 +263,8 @@ private:
   std::unordered_set<std::uint32_t> warned_sources_;
   CloudPairing pairing_;
   std::optional<ImageGeometry> last_image_geometry_;
+  std::array<std::optional<std::chrono::steady_clock::time_point>,
+    static_cast<std::size_t>(Warning::COUNT)> last_warning_;
 
   // Shared with the diagnostics timer.
   Metrics metrics_;

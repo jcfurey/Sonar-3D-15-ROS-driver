@@ -19,6 +19,7 @@
 #include <fstream>
 #include <map>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -350,6 +351,26 @@ TEST_F(ReplayTest, InterruptStopsPlaybackCleanlyWithAnIncompleteSummary)
   EXPECT_EQ(process.output().find("failed to create guard condition"), std::string::npos);
 }
 
+TEST_F(ReplayTest, MalformedFuturePacketCannotDelayPlaybackOrHideWithoutSubscribers)
+{
+  auto invalid = sonar3d::testing::range_image(1);
+  invalid.pixel_scale = -1;
+  invalid.header.timestamp->seconds += 3600;
+  auto overflow = invalid;
+  overflow.pixel_scale = std::numeric_limits<float>::max();
+  const Recording recording({
+      sonar3d::protocol::encode_packet(sonar3d::testing::range_image(0)),
+      sonar3d::protocol::encode_packet(invalid),
+      sonar3d::protocol::encode_packet(overflow),
+      sonar3d::protocol::encode_packet(sonar3d::testing::range_image(1))});
+  PlayerProcess process(recording.path(), std::vector<std::string>{"--startup-delay", "0"});
+  ASSERT_TRUE(process.wait()) << process.output();
+  EXPECT_TRUE(process.succeeded()) << process.output();
+  EXPECT_NE(process.output().find(
+      "Processed 2 supported packets; unsupported 0; damaged 0; malformed 2; framing errors 0"),
+    std::string::npos) << process.output();
+}
+
 TEST_F(ReplayTest, MissingSignalReleasesCloudBeforeTheNextRecordedRangeImage)
 {
   auto first = sonar3d::testing::range_image(0);
@@ -378,6 +399,46 @@ TEST_F(ReplayTest, MissingSignalReleasesCloudBeforeTheNextRecordedRangeImage)
   ASSERT_EQ(ages.size(), 2U);
   EXPECT_GE(ages[0], 0.020);
   EXPECT_LT(ages[0], 0.2);
+}
+
+TEST_F(ReplayTest, RecordingCounterAndClockRestartsDiscardCachedSignalsFromThePreviousSegment)
+{
+  for (const bool clock_reset : {false, true}) {
+    const auto first = sonar3d::testing::range_image(10);
+    auto next = sonar3d::testing::range_image(1);
+    next.header.timestamp = sonar3d::testing::timestamp(
+      *sonar3d::conversions::sensor_nanoseconds(first.header.timestamp) +
+      (clock_reset ? -2'000'000'000LL : 100'000'000LL));
+    auto signal = sonar3d::testing::bitmap_image(1, BitmapImageType::SIGNAL_STRENGTH_IMAGE);
+    signal.header = next.header;
+    const Recording recording({sonar3d::protocol::encode_packet(first),
+        sonar3d::protocol::encode_packet(sonar3d::testing::bitmap_image(
+            11, BitmapImageType::SIGNAL_STRENGTH_IMAGE)),
+        sonar3d::protocol::encode_packet(next), sonar3d::protocol::encode_packet(signal)});
+    auto observer = std::make_shared<rclcpp::Node>("observer", "/sonar3d_replay_test");
+    rclcpp::executors::SingleThreadedExecutor executor;
+    executor.add_node(observer);
+    std::vector<Cloud::ConstSharedPtr> clouds;
+    const auto receive_cloud = [&clouds](Cloud::ConstSharedPtr message) {
+        clouds.push_back(message);
+      };
+    const auto subscription = observer->create_subscription<Cloud>(
+      "points", rclcpp::QoS(10), receive_cloud);
+    PlayerProcess process(recording.path(), std::vector<std::string>{"--startup-delay", "0.5"});
+    const auto deadline = std::chrono::steady_clock::now() + 5s;
+    while (std::chrono::steady_clock::now() < deadline &&
+      (!process.finished() || clouds.size() < 2))
+    {
+      executor.spin_some();
+      std::this_thread::sleep_for(2ms);
+    }
+    ASSERT_TRUE(process.finished()) << process.output();
+    ASSERT_TRUE(process.succeeded()) << process.output();
+    ASSERT_EQ(clouds.size(), 2U);
+    const auto header = sonar3d::conversions::make_header(
+      next.header, "sonar3d_link", builtin_interfaces::msg::Time{});
+    EXPECT_EQ(*clouds.back(), sonar3d::conversions::make_point_cloud(next, header, true, &signal));
+  }
 }
 
 TEST_F(ReplayTest, OutputWritesEveryProductToABagWithoutPacing)

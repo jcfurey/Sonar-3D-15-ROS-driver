@@ -9,6 +9,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <string>
 #include <thread>
@@ -44,7 +45,8 @@ protected:
     bool enable_products = true, double max_sensor_clock_offset = 0.0,
     const std::vector<rclcpp::Parameter> & overrides = {})
   {
-    port_ = sonar3d::testing::unused_udp_port();
+    auto port_reservation = std::make_unique<sonar3d::testing::UdpSender>();
+    port_ = port_reservation->reserve_multicast_port();
     rclcpp::NodeOptions options;
     options.use_intra_process_comms(GetParam());
     options.arguments({"--ros-args", "-r", "__ns:=/sonar3d_stream_test"});
@@ -85,6 +87,9 @@ protected:
       });
     executor_.add_node(driver_->get_node_base_interface());
     executor_.add_node(observer_);
+    if (driver_->get_parameter("udp_mode").as_string() == "unicast") {
+      port_reservation.reset();
+    }
     ASSERT_EQ(driver_->configure().id(), lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE);
     ASSERT_EQ(driver_->activate().id(), lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE);
   }
@@ -216,6 +221,52 @@ protected:
   std::vector<rclcpp::SubscriptionBase::SharedPtr> subscriptions_;
   rclcpp::Subscription<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr diagnostics_;
 };
+
+TEST_P(DriverStream, MalformedUnsubscribedProductsCannotPoisonSequenceTracking)
+{
+  start();
+  auto range = sonar3d::testing::range_image(100);
+  range.pixels.pop_back();
+  auto signal = sonar3d::testing::bitmap_image(100, BitmapImageType::SIGNAL_STRENGTH_IMAGE);
+  signal.pixels.pop_back();
+  auto imu = sonar3d::testing::imu_batch(100);
+  imu.specific_force[0] = std::numeric_limits<float>::quiet_NaN();
+  for (const auto & packet : {sonar3d::protocol::encode_packet(range),
+      sonar3d::protocol::encode_packet(signal), sonar3d::protocol::encode_packet(imu)})
+  {
+    sender_.send(port_, packet, destination_.c_str());
+  }
+  ASSERT_TRUE(wait_for([this] {return metric("malformed_packets") == 3;}));
+  EXPECT_EQ(metric("range_images"), 0U);
+  EXPECT_EQ(metric("bitmap_images"), 0U);
+  EXPECT_EQ(metric("imu_batches"), 0U);
+  subscribe();
+  ASSERT_TRUE(discovered());
+  send_frame(1, ProtocolVersion::RIP1);
+  ASSERT_TRUE(wait_for([this] {
+      return ranges_.size() == 1 && clouds_.size() == 1 && intensities_.size() == 1 &&
+             shaded_.size() == 1 && imus_.size() == 5;
+    }));
+  check_frame(1, 0);
+}
+
+TEST_P(DriverStream, PublisherQosCanBeConfiguredThroughStandardOverrides)
+{
+  const std::string prefix = "qos_overrides./sonar3d_stream_test/range_image.publisher.";
+  start(true, 0.0, {rclcpp::Parameter(prefix + "reliability", "best_effort"),
+      rclcpp::Parameter(prefix + "depth", 2)});
+  subscribe();
+  ASSERT_TRUE(discovered());
+  ASSERT_TRUE(wait_for([this] {
+      const auto publishers = observer_->get_publishers_info_by_topic("range_image");
+      return publishers.size() == 1 &&
+             publishers.front().qos_profile().reliability() ==
+             rclcpp::ReliabilityPolicy::BestEffort;
+    }));
+  EXPECT_EQ(driver_->get_parameter(prefix + "depth").as_int(), 2);
+  send_frame(1, ProtocolVersion::RIP2);
+  ASSERT_TRUE(wait_for([this] {return ranges_.size() == 1;}));
+}
 
 TEST_P(DriverStream, BothProtocolVersionsDeliverEveryProductFromOneSonar)
 {
@@ -487,13 +538,14 @@ TEST_P(DriverStream, RangeImageRateIsDiagnosedWhileActive)
 
 TEST_P(DriverStream, AutostartParameterActivatesOnceSpinning)
 {
+  const sonar3d::testing::UdpSender port_reservation;
   rclcpp::NodeOptions options;
   options.use_intra_process_comms(GetParam());
   options.arguments({"--ros-args", "-r", "__ns:=/sonar3d_autostart_test"});
   options.append_parameter_override("autostart", true);
   options.append_parameter_override("configure_sonar", false);
   options.append_parameter_override("multicast_group", "239.255.96.15");
-  options.append_parameter_override("udp_port", sonar3d::testing::unused_udp_port());
+  options.append_parameter_override("udp_port", port_reservation.reserve_multicast_port());
   options.append_parameter_override("interface_address", "127.0.0.1");
   const auto driver = std::make_shared<sonar3d::SonarDriver>(options);
   EXPECT_EQ(

@@ -280,11 +280,10 @@ DecodedPacket decode_packet(std::span<const std::uint8_t> bytes)
 
   const auto encoded_payload = bytes.subspan(kHeaderSize, bytes.size() - kMinimumPacketSize);
   std::string decoded_payload;
-  if (version == ProtocolVersion::RIP1) {
-    decoded_payload.assign(
-      reinterpret_cast<const char *>(encoded_payload.data()),
-      encoded_payload.size());
-  } else {
+  // RIP1 already contains protobuf bytes; parse the caller's buffer directly.
+  std::string_view payload(reinterpret_cast<const char *>(encoded_payload.data()),
+    encoded_payload.size());
+  if (version == ProtocolVersion::RIP2) {
     std::size_t decoded_size{};
     if (!snappy::GetUncompressedLength(
         reinterpret_cast<const char *>(encoded_payload.data()), encoded_payload.size(),
@@ -307,15 +306,16 @@ DecodedPacket decode_packet(std::span<const std::uint8_t> bytes)
       throw ProtocolError(ErrorCode::DECOMPRESSION_FAILED, true,
           "failed to decompress RIP2 payload");
     }
+    payload = decoded_payload;
   }
 
-  if (decoded_payload.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+  if (payload.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
     throw ProtocolError(ErrorCode::PAYLOAD_TOO_LARGE, true,
         "protobuf payload cannot be represented safely");
   }
 
   vendor::Packet packet;
-  if (!packet.ParseFromArray(decoded_payload.data(), static_cast<int>(decoded_payload.size())) ||
+  if (!packet.ParseFromArray(payload.data(), static_cast<int>(payload.size())) ||
     !packet.has_msg())
   {
     throw ProtocolError(ErrorCode::PROTOBUF_PARSE_FAILED, true,

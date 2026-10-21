@@ -7,8 +7,13 @@
 
 #include <gtest/gtest.h>
 
+#include <pthread.h>
+
 #include <chrono>
+#include <atomic>
+#include <csignal>
 #include <cstdint>
+#include <future>
 #include <stdexcept>
 #include <system_error>
 #include <thread>
@@ -114,6 +119,61 @@ TEST(UdpReceiver, RejectsNegativeBufferRequests)
 {
   EXPECT_THROW(
     sonar3d::UdpReceiver("239.255.96.15", 4747, "127.0.0.1", -1), std::invalid_argument);
+}
+
+TEST(UdpReceiver, MulticastListenersOnOnePortReceiveOnlyTheirOwnGroup)
+{
+  const auto port = sonar3d::testing::unused_udp_port();
+  sonar3d::UdpReceiver first("239.255.96.15", port, "127.0.0.1");
+  sonar3d::UdpReceiver second("239.255.96.16", port, "127.0.0.1");
+  const sonar3d::testing::UdpSender sender;
+  const auto a = sonar3d::protocol::encode_packet(sonar3d::testing::range_image(1));
+  const auto b = sonar3d::protocol::encode_packet(sonar3d::testing::range_image(2));
+  sender.send(port, a, "239.255.96.15");
+  sender.send(port, b, "239.255.96.16");
+  ASSERT_TRUE(first.wait(std::chrono::seconds(1)));
+  ASSERT_TRUE(second.wait(std::chrono::seconds(1)));
+  const auto received_a = first.receive();
+  const auto received_b = second.receive();
+  ASSERT_TRUE(received_a);
+  ASSERT_TRUE(received_b);
+  EXPECT_EQ(received_a->bytes, a);
+  EXPECT_EQ(received_b->bytes, b);
+  EXPECT_FALSE(first.receive());
+  EXPECT_FALSE(second.receive());
+}
+
+TEST(UdpReceiver, SignalsDoNotRestartAFiniteWait)
+{
+  using namespace std::chrono_literals;
+  const auto port = sonar3d::testing::unused_udp_port();
+  sonar3d::UdpReceiver receiver("239.255.96.15", port, "127.0.0.1");
+  struct sigaction handler{};
+  struct sigaction previous{};
+  handler.sa_handler = [](int) {};
+  sigemptyset(&handler.sa_mask);
+  ASSERT_EQ(sigaction(SIGUSR1, &handler, &previous), 0);
+  std::promise<void> started;
+  auto running = started.get_future();
+  std::atomic<bool> finished{false};
+  bool ready = true;
+  std::thread waiter([&] {
+      started.set_value();
+      ready = receiver.wait(25ms);
+      finished = true;
+    });
+  running.wait();
+  // Keep interrupting much longer than the requested timeout. A finite wait
+  // must still finish while signals continue to arrive.
+  for (unsigned count = 0; count < 100 && !finished; ++count) {
+    pthread_kill(waiter.native_handle(), SIGUSR1);
+    std::this_thread::sleep_for(3ms);
+  }
+  const bool finished_during_signals = finished;
+  waiter.join();
+  sigaction(SIGUSR1, &previous, nullptr);
+  EXPECT_FALSE(ready);
+  EXPECT_TRUE(finished_during_signals);
 }
 
 }  // namespace

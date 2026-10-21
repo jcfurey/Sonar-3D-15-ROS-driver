@@ -42,12 +42,12 @@ public:
   UdpSender(const UdpSender &) = delete;
   UdpSender & operator=(const UdpSender &) = delete;
 
-  // Ask the OS for an unused port; the driver binds it immediately afterward.
+  // Bind on all local addresses so another interface cannot already use it.
   std::uint16_t unused_port() const
   {
     sockaddr_in address{};
     address.sin_family = AF_INET;
-    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_addr.s_addr = htonl(INADDR_ANY);
     if (bind(socket_, reinterpret_cast<const sockaddr *>(&address), sizeof(address)) < 0) {
       throw std::system_error(errno, std::generic_category(), "bind test UDP socket");
     }
@@ -56,6 +56,18 @@ public:
       throw std::system_error(errno, std::generic_category(), "read test UDP port");
     }
     return ntohs(address.sin_port);
+  }
+
+  // Keep the port reserved while a multicast receiver sharing it is configured.
+  std::uint16_t reserve_multicast_port() const
+  {
+    const int reuse_address = 1;
+    if (setsockopt(socket_, SOL_SOCKET, SO_REUSEADDR, &reuse_address,
+      sizeof(reuse_address)) < 0)
+    {
+      throw std::system_error(errno, std::generic_category(), "reserve test multicast port");
+    }
+    return unused_port();
   }
 
   void send(

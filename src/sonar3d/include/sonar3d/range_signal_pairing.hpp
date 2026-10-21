@@ -22,6 +22,7 @@ namespace sonar3d
 // the same sequence ID and size. A range image whose signal image is lost is
 // released unpaired when the next range image arrives, when a newer signal
 // image arrives, or when the caller calls release() after a short wait.
+// Call clear() when the device or recording starts a new sequence/clock epoch.
 template<typename Context>
 class RangeSignalPairing
 {
@@ -65,7 +66,7 @@ public:
     } else if (pending_range_ && newer(signal, pending_range_->range)) {
       ready.push_back(take_pending_range());
       pending_signal_ = std::move(signal);
-    } else if (!pending_range_) {
+    } else if (!pending_range_ && (!pending_signal_ || newer(signal, *pending_signal_))) {
       pending_signal_ = std::move(signal);
     }
     // Otherwise the signal image is older than the waiting range image: stale.
@@ -110,9 +111,9 @@ private:
 
   Pair take_pending_range()
   {
-    std::optional<Pair> taken;
-    taken.swap(pending_range_);
-    return std::move(*taken);
+    auto taken = std::move(*pending_range_);
+    pending_range_.reset();
+    return taken;
   }
 
   std::optional<Pair> pending_range_;

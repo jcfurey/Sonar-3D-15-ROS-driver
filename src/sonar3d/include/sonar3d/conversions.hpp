@@ -45,6 +45,8 @@ struct RangePoint
 // out-of-range timestamps return nullopt; this never throws.
 [[nodiscard]] std::optional<std::int64_t> sensor_nanoseconds(
   const std::optional<protocol::Timestamp> & stamp);
+// Missing/zero sensor time is allowed; malformed timestamps throw.
+void validate_sensor_timestamp(const std::optional<protocol::Timestamp> & stamp);
 
 // sensor_offset_nanoseconds is added to a valid sensor timestamp. A driver uses
 // it to map an unsynchronized sonar clock onto ROS time.
@@ -70,6 +72,8 @@ struct RangePoint
 // Throws std::invalid_argument unless the image can be converted to a point
 // cloud; lets callers that defer the cloud reject a malformed image at once.
 void validate_point_cloud_source(const protocol::RangeImage & image);
+void validate_bitmap_source(const protocol::BitmapImage & image);
+void validate_imu_source(const protocol::ImuBatch & batch, bool use_sensor_timestamp = true);
 
 // Linear signal strength (about 30 to 10600) for a SIGNAL_STRENGTH_IMAGE
 // pixel, which Water Linked encodes as 100 log10(strength / 30); zero is no

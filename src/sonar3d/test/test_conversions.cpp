@@ -323,6 +323,44 @@ TEST(Conversions, RejectsMalformedImageAndImuDimensions)
     std::invalid_argument);
 }
 
+TEST(Conversions, RejectsNonFiniteImuMeasurementsAndOverflowingNoiseVariance)
+{
+  sonar3d::protocol::ImuBatch batch;
+  batch.sample_count = 1;
+  batch.timestamps = {{10, 20}};
+  batch.specific_force = {0.0F, 0.0F, -9.81F};
+  batch.rate_of_turn = {0.0F, 0.0F, 0.0F};
+  const auto convert = [&] {
+      return sonar3d::conversions::make_imu_messages(batch, "imu", builtin_interfaces::msg::Time{});
+    };
+  batch.specific_force[0] = std::numeric_limits<float>::quiet_NaN();
+  EXPECT_THROW(static_cast<void>(convert()), std::invalid_argument);
+  batch.specific_force[0] = 0;
+  batch.rate_of_turn[1] = std::numeric_limits<float>::infinity();
+  EXPECT_THROW(static_cast<void>(convert()), std::invalid_argument);
+  batch.rate_of_turn[1] = 0;
+  batch.timestamps[0].nanoseconds = 1'000'000'000;
+  EXPECT_THROW(static_cast<void>(convert()), std::invalid_argument);
+  EXPECT_NO_THROW(static_cast<void>(sonar3d::conversions::make_imu_messages(
+      batch, "imu", builtin_interfaces::msg::Time{}, false)));
+  batch.timestamps[0].nanoseconds = 20;
+  EXPECT_THROW(static_cast<void>(sonar3d::conversions::make_imu_messages(
+      batch, "imu", builtin_interfaces::msg::Time{}, true, 0, {1.0e200, 0.0})),
+      std::invalid_argument);
+}
+
+TEST(Conversions, DeferredCloudValidationRejectsOverflowBeforeAnyProductsAreEmitted)
+{
+  auto range = test_range_image();
+  range.pixel_scale = std::numeric_limits<float>::max();
+  EXPECT_THROW(sonar3d::conversions::validate_point_cloud_source(range), std::invalid_argument);
+  // An unusually large but still representable range is accepted.
+  range.width = 1;
+  range.height = 1;
+  range.pixels = {1};
+  EXPECT_NO_THROW(sonar3d::conversions::validate_point_cloud_source(range));
+}
+
 TEST(Conversions, DirectBuffersMatchPixelGeometryAtFullResolutionAndDegenerateSizes)
 {
   // Independent per-pixel equations check both the packed cloud and the public

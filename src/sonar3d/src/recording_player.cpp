@@ -236,6 +236,30 @@ enum class OutputMode
   BAG,
 };
 
+// Validate before pacing or updating the cloud pairing state, including when
+// nothing subscribes to a product. Invalid timestamps must never move the
+// playback clock's anchor and delay later valid packets.
+void validate_recorded_message(const protocol::Message & source, bool use_sensor_timestamps)
+{
+  std::visit(
+    [use_sensor_timestamps](const auto & message) {
+      using MessageType = std::decay_t<decltype(message)>;
+      if constexpr (std::is_same_v<MessageType, protocol::RangeImage>) {
+        conversions::validate_point_cloud_source(message);
+        if (use_sensor_timestamps) {
+          conversions::validate_sensor_timestamp(message.header.timestamp);
+        }
+      } else if constexpr (std::is_same_v<MessageType, protocol::BitmapImage>) {
+        conversions::validate_bitmap_source(message);
+        if (use_sensor_timestamps) {
+          conversions::validate_sensor_timestamp(message.header.timestamp);
+        }
+      } else if constexpr (std::is_same_v<MessageType, protocol::ImuBatch>) {
+        conversions::validate_imu_source(message, use_sensor_timestamps);
+      }
+    }, source);
+}
+
 class RecordingPlayer final : public rclcpp::Node
 {
 public:
@@ -303,6 +327,7 @@ public:
 
   void process_message(protocol::Message && source)
   {
+    observe_recording_epoch(source);
     const builtin_interfaces::msg::Time fallback_stamp = now();
     std::visit(
       [this, &fallback_stamp](auto & message) {
@@ -420,6 +445,39 @@ public:
   void finish() {writer_.reset();}
 
 private:
+  void observe_recording_epoch(const protocol::Message & source)
+  {
+    const auto * range = std::get_if<protocol::RangeImage>(&source);
+    const auto * bitmap = std::get_if<protocol::BitmapImage>(&source);
+    if (!range && (!bitmap || bitmap->type != protocol::BitmapImageType::SIGNAL_STRENGTH_IMAGE)) {
+      return;
+    }
+    const auto & header = range ? range->header : bitmap->header;
+    auto & previous = range ? last_range_header_ : last_signal_header_;
+    const auto stamp = conversions::sensor_nanoseconds(header.timestamp);
+    const auto previous_stamp = previous ?
+      conversions::sensor_nanoseconds(previous->timestamp) : std::nullopt;
+    bool restarted = stamp && latest_image_stamp_ && *latest_image_stamp_ - *stamp > 1'000'000'000;
+    if (previous) {
+      const auto delta = header.sequence_id - previous->sequence_id;
+      // A repeated/backward counter with newer acquisition time is a new
+      // recording segment. A late packet with an older stamp is just reordered.
+      restarted |= (delta == 0 || delta >= (std::uint32_t{1} << 31U)) &&
+        stamp && previous_stamp && *stamp > *previous_stamp;
+    }
+    if (restarted) {
+      flush();
+      pairing_.clear();
+      last_range_header_.reset();
+      last_signal_header_.reset();
+      latest_image_stamp_.reset();
+    }
+    previous = header;
+    if (stamp) {
+      latest_image_stamp_ = latest_image_stamp_ ? std::max(*latest_image_stamp_, *stamp) : *stamp;
+    }
+  }
+
   struct CloudContext
   {
     std_msgs::msg::Header header;
@@ -484,6 +542,9 @@ private:
   bool intensity_;
   OutputMode mode_;
   CloudPairing pairing_;
+  std::optional<protocol::MessageHeader> last_range_header_;
+  std::optional<protocol::MessageHeader> last_signal_header_;
+  std::optional<std::int64_t> latest_image_stamp_;
   std::uint64_t unpaired_range_images_{};
   std::map<std::string, std::uint64_t> outputs_;
   std::unique_ptr<rosbag2_cpp::Writer> writer_;
@@ -582,6 +643,14 @@ std::optional<std::int64_t> first_recorded_stamp(std::istream & stream)
       node->process_packet(std::move(raw_packet), sensor_time_nanoseconds(packet->message));
       ++unsupported;
       ++unsupported_types[*type];
+      continue;
+    }
+    try {
+      validate_recorded_message(packet->message, options.use_sensor_timestamps);
+    } catch (const std::exception & error) {
+      node->process_packet(std::move(raw_packet), sensor_time_nanoseconds(packet->message));
+      ++malformed;
+      RCLCPP_WARN(node->get_logger(), "Skipping malformed decoded message: %s", error.what());
       continue;
     }
     if (paced) {

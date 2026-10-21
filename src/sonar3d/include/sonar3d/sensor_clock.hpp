@@ -38,6 +38,12 @@ public:
   // restarting; isolated or burst-delivered late packets cannot reset the fit.
   [[nodiscard]] std::int64_t update(std::int64_t receive_minus_sensor, std::int64_t receive_time)
   {
+    // A ROS clock reset starts a new epoch. Old minima and step confirmation
+    // must not survive a bag loop or a backward /clock jump.
+    if (last_receive_time_ && receive_time < *last_receive_time_) {
+      reset();
+    }
+    last_receive_time_ = receive_time;
     if (current_ && receive_minus_sensor - estimate() > reset_threshold_) {
       const auto tolerance = reset_threshold_ / 10;
       if (!step_ || std::abs(receive_minus_sensor - *step_) > tolerance) {
@@ -51,6 +57,7 @@ public:
         return estimate();
       }
       reset();
+      last_receive_time_ = receive_time;
     } else {
       step_.reset();
     }
@@ -73,6 +80,7 @@ public:
     current_.reset();
     previous_.reset();
     step_.reset();
+    last_receive_time_.reset();
   }
 
 private:
@@ -86,6 +94,7 @@ private:
   std::optional<std::int64_t> current_;
   std::optional<std::int64_t> previous_;
   std::optional<std::int64_t> step_;
+  std::optional<std::int64_t> last_receive_time_;
   std::int64_t step_start_{};
   unsigned step_samples_{};
   std::int64_t window_start_{};

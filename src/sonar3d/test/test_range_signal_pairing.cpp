@@ -81,7 +81,8 @@ TEST(RangeSignalPairing, ReleasesRangeImagesWhoseSignalWasLost)
   const auto released = pairing.release();
   ASSERT_TRUE(released);
   EXPECT_EQ(released->context, 4);
-  EXPECT_FALSE(pairing.release());
+  const auto empty = pairing.release();
+  EXPECT_FALSE(empty);
 }
 
 TEST(RangeSignalPairing, IgnoresStaleAndMismatchedSignals)
@@ -117,6 +118,25 @@ TEST(RangeSignalPairing, HandlesSequenceWraparound)
   ASSERT_EQ(ready.size(), 1U);
   EXPECT_FALSE(ready[0].signal);
   EXPECT_EQ(pairing.add_range(range(0), 2).size(), 1U);
+}
+
+TEST(RangeSignalPairing, LateSignalCannotReplaceANewerCachedSignal)
+{
+  Pairing pairing;
+  EXPECT_TRUE(pairing.add_signal(signal(10)).empty());
+  EXPECT_TRUE(pairing.add_signal(signal(9)).empty());
+  auto ready = pairing.add_range(range(10), 10);
+  ASSERT_EQ(ready.size(), 1U);
+  ASSERT_TRUE(ready.front().signal);
+  EXPECT_EQ(ready.front().signal->header.sequence_id, 10U);
+
+  // The same ordering rule must hold across the sequence counter wrap.
+  EXPECT_TRUE(pairing.add_signal(signal(0)).empty());
+  EXPECT_TRUE(pairing.add_signal(signal(std::numeric_limits<std::uint32_t>::max())).empty());
+  ready = pairing.add_range(range(0), 20);
+  ASSERT_EQ(ready.size(), 1U);
+  ASSERT_TRUE(ready.front().signal);
+  EXPECT_EQ(ready.front().signal->header.sequence_id, 0U);
 }
 
 }  // namespace

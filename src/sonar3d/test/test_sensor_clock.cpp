@@ -69,4 +69,15 @@ TEST(SensorClockOffset, RejectsNonPositiveSettings)
   EXPECT_THROW(sonar3d::SensorClockOffset(kSecond, 0), std::invalid_argument);
 }
 
+TEST(SensorClockOffset, BackwardRosClockJumpClearsThePreviousEpochAndStepConfirmation)
+{
+  sonar3d::SensorClockOffset clock(10 * kSecond, kSecond);
+  EXPECT_EQ(clock.update(100 * kSecond, 20 * kSecond), 100 * kSecond);
+  EXPECT_EQ(clock.update(102 * kSecond, 21 * kSecond), 100 * kSecond);
+  // A bag loop can reset receive and sensor time together. The new clock fit
+  // must take effect immediately even if its offset is larger than before.
+  EXPECT_EQ(clock.update(105 * kSecond, kSecond), 105 * kSecond);
+  EXPECT_EQ(clock.update(105 * kSecond + kMillisecond, 2 * kSecond), 105 * kSecond);
+}
+
 }  // namespace

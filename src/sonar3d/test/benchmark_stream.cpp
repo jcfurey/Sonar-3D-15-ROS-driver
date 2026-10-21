@@ -136,7 +136,8 @@ std::vector<Frame> packets(int rate, int count, ProtocolVersion version)
 int live(int rate, int count, const std::string & products, ProtocolVersion version, bool ipc)
 {
   const auto frames = packets(rate, count, version);
-  const auto port = sonar3d::testing::unused_udp_port();
+  auto port_reservation = std::make_unique<sonar3d::testing::UdpSender>();
+  const auto port = port_reservation->reserve_multicast_port();
   rclcpp::NodeOptions options;
   options.use_intra_process_comms(ipc);
   options.arguments({"--ros-args", "-r", "__ns:=/sonar3d_benchmark"});
@@ -158,6 +159,7 @@ int live(int rate, int count, const std::string & products, ProtocolVersion vers
   rclcpp::executors::SingleThreadedExecutor executor;
   executor.add_node(driver->get_node_base_interface());
   driver->configure();
+  port_reservation.reset();
   if (driver->activate().id() != lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE) {
     throw std::runtime_error("driver did not activate");
   }

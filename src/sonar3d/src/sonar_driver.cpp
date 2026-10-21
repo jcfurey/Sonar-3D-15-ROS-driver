@@ -26,6 +26,7 @@
 #include <diagnostic_msgs/msg/diagnostic_status.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <lifecycle_msgs/msg/state.hpp>
+#include <rclcpp/qos_overriding_options.hpp>
 #include <rclcpp_components/register_node_macro.hpp>
 
 #include "sonar3d/http_client.hpp"
@@ -246,30 +247,34 @@ void SonarDriver::configure_driver()
   // reliable subscribers and SensorDataQoS (best-effort) subscribers connect.
   // IMU samples arrive in batches of up to 20, so keep a second of history.
   const auto product_qos = rclcpp::SystemDefaultsQoS().keep_last(5);
+  rclcpp::PublisherOptions product_options;
+  product_options.qos_overriding_options = rclcpp::QosOverridingOptions::with_default_policies();
   if (parameters.publish_raw_packets) {
     raw_packet_publisher_ = create_publisher<msg::RawPacket>(
-      "raw_packet", rclcpp::SystemDefaultsQoS().keep_last(100));
+      "raw_packet", rclcpp::SystemDefaultsQoS().keep_last(100), product_options);
   }
   if (parameters.publish_range_image || parameters.publish_bitmap_images) {
     image_metadata_publisher_ = create_publisher<msg::ImageMetadata>(
-      "image_metadata", rclcpp::SystemDefaultsQoS().keep_last(100));
+      "image_metadata", rclcpp::SystemDefaultsQoS().keep_last(100), product_options);
   }
   if (parameters.publish_range_image) {
-    range_image_publisher_ = create_publisher<sensor_msgs::msg::Image>("range_image", product_qos);
+    range_image_publisher_ = create_publisher<sensor_msgs::msg::Image>("range_image", product_qos,
+        product_options);
   }
   if (parameters.publish_point_cloud) {
-    point_cloud_publisher_ = create_publisher<sensor_msgs::msg::PointCloud2>("points", product_qos);
+    point_cloud_publisher_ = create_publisher<sensor_msgs::msg::PointCloud2>("points", product_qos,
+        product_options);
   }
   if (parameters.publish_bitmap_images) {
     intensity_image_publisher_ =
-      create_publisher<sensor_msgs::msg::Image>("intensity_image", product_qos);
+      create_publisher<sensor_msgs::msg::Image>("intensity_image", product_qos, product_options);
     shaded_image_publisher_ =
-      create_publisher<sensor_msgs::msg::Image>("shaded_image", product_qos);
+      create_publisher<sensor_msgs::msg::Image>("shaded_image", product_qos, product_options);
   }
   if (parameters.publish_imu) {
     // REP-145: accelerometer and gyroscope samples without orientation.
     imu_publisher_ = create_publisher<sensor_msgs::msg::Imu>(
-      "imu/data_raw", rclcpp::SystemDefaultsQoS().keep_last(100));
+      "imu/data_raw", rclcpp::SystemDefaultsQoS().keep_last(100), product_options);
   }
   if (parameters.publish_tf) {
     static_transform_broadcaster_ = std::make_unique<tf2_ros::StaticTransformBroadcaster>(*this);
@@ -316,6 +321,7 @@ SonarDriver::CallbackReturn SonarDriver::on_activate(const rclcpp_lifecycle::Sta
   shaded_sequence_ = {};
   imu_sequence_ = {};
   clock_offset_.reset();
+  last_warning_ = {};
   timestamp_source_.store(TimestampSource::NONE);
   last_valid_packet_steady_ns_.store(-1);
   pairing_.clear();
@@ -594,6 +600,17 @@ void SonarDriver::poll_device(const std::stop_token & stop, std::chrono::millise
   }
 }
 
+bool SonarDriver::should_log(Warning warning)
+{
+  const auto current = std::chrono::steady_clock::now();
+  auto & last = last_warning_[static_cast<std::size_t>(warning)];
+  if (last && current - *last < std::chrono::seconds(5)) {
+    return false;
+  }
+  last = current;
+  return true;
+}
+
 void SonarDriver::receive_loop(const std::stop_token & stop)
 {
   auto timeout = std::chrono::milliseconds(-1);
@@ -612,12 +629,9 @@ void SonarDriver::receive_loop(const std::stop_token & stop)
       timeout = release_overdue_cloud();
     } catch (const std::exception & error) {
       metrics_.socket_errors.fetch_add(1, std::memory_order_relaxed);
-      RCLCPP_ERROR_THROTTLE(
-        get_logger(),
-        *get_clock(),
-        5000,
-        "Sonar UDP receive failed: %s",
-        error.what());
+      if (should_log(Warning::SOCKET)) {
+        RCLCPP_ERROR(get_logger(), "Sonar UDP receive failed: %s", error.what());
+      }
       // Avoid spinning on a persistent socket error.
       std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
@@ -640,9 +654,9 @@ std::chrono::milliseconds SonarDriver::release_overdue_cloud()
       publish_cloud(std::move(*pair));
     } catch (const std::exception & error) {
       metrics_.malformed_packets.fetch_add(1, std::memory_order_relaxed);
-      RCLCPP_WARN_THROTTLE(
-        get_logger(), *get_clock(), 5000, "Rejected malformed Sonar 3D-15 range image: %s",
-        error.what());
+      if (should_log(Warning::DEFERRED_RANGE)) {
+        RCLCPP_WARN(get_logger(), "Rejected malformed Sonar 3D-15 range image: %s", error.what());
+      }
     }
   }
   return std::chrono::milliseconds(-1);
@@ -686,12 +700,9 @@ void SonarDriver::handle_datagram(const Datagram & datagram)
     if (error.code() == protocol::ErrorCode::CRC_MISMATCH) {
       metrics_.crc_failures.fetch_add(1, std::memory_order_relaxed);
     }
-    RCLCPP_WARN_THROTTLE(
-      get_logger(),
-      *get_clock(),
-      5000,
-      "Rejected malformed RIP packet: %s",
-      error.what());
+    if (should_log(Warning::PACKET)) {
+      RCLCPP_WARN(get_logger(), "Rejected malformed RIP packet: %s", error.what());
+    }
     return;
   }
 
@@ -716,12 +727,9 @@ void SonarDriver::handle_datagram(const Datagram & datagram)
       packet.message);
   } catch (const std::exception & error) {
     metrics_.malformed_packets.fetch_add(1, std::memory_order_relaxed);
-    RCLCPP_WARN_THROTTLE(
-      get_logger(),
-      *get_clock(),
-      5000,
-      "Rejected malformed Sonar 3D-15 message: %s",
-      error.what());
+    if (should_log(Warning::MESSAGE)) {
+      RCLCPP_WARN(get_logger(), "Rejected malformed Sonar 3D-15 message: %s", error.what());
+    }
   }
 }
 
@@ -729,6 +737,12 @@ void SonarDriver::handle_range_image(
   protocol::RangeImage && image,
   const builtin_interfaces::msg::Time & fallback_stamp)
 {
+  conversions::validate_point_cloud_source(image);
+  // Validate before observing the sequence or updating the shared clock.
+  // A damaged packet must not suppress a corrected retransmission.
+  if (settings_.use_sensor_timestamps) {
+    conversions::validate_sensor_timestamp(image.header.timestamp);
+  }
   if (!observe_sequence(range_sequence_, image.header.sequence_id, image.header.timestamp)) {
     return;
   }
@@ -751,8 +765,6 @@ void SonarDriver::handle_range_image(
   }
   if (has_subscribers(point_cloud_publisher_)) {
     if (settings_.point_cloud_intensity) {
-      // Reject a malformed image now rather than when its pair completes.
-      conversions::validate_point_cloud_source(image);
       for (auto & pair : pairing_.add_range(
           std::move(image), CloudContext{header, std::chrono::steady_clock::now()}))
       {
@@ -787,10 +799,12 @@ void SonarDriver::observe_image_geometry(float horizontal_fov_degrees, float ver
   }
   const auto fov = format_fov(horizontal_fov_degrees, vertical_fov_degrees);
   if (geometry.mode == AcousticsMode::UNKNOWN) {
-    RCLCPP_WARN_THROTTLE(
-      get_logger(), *get_clock(), 5000,
-      "Sonar 3D-15 range images have a %s degree field of view, which matches neither "
-      "acoustics mode (90 x 40 low-frequency, 40 x 40 high-frequency)", fov.c_str());
+    if (should_log(Warning::GEOMETRY)) {
+      RCLCPP_WARN(
+        get_logger(),
+        "Sonar 3D-15 range images have a %s degree field of view, which matches neither "
+        "acoustics mode (90 x 40 low-frequency, 40 x 40 high-frequency)", fov.c_str());
+    }
   } else if (previous_mode != geometry.mode) {
     RCLCPP_INFO(
       get_logger(), "Sonar 3D-15 is imaging in %s mode (%s degree field of view)",
@@ -813,6 +827,10 @@ void SonarDriver::handle_bitmap_image(
   protocol::BitmapImage && image,
   const builtin_interfaces::msg::Time & fallback_stamp)
 {
+  conversions::validate_bitmap_source(image);
+  if (settings_.use_sensor_timestamps) {
+    conversions::validate_sensor_timestamp(image.header.timestamp);
+  }
   Publisher<sensor_msgs::msg::Image> publisher;
   switch (image.type) {
     case protocol::BitmapImageType::SIGNAL_STRENGTH_IMAGE:
@@ -831,12 +849,10 @@ void SonarDriver::handle_bitmap_image(
       break;
     default:
       metrics_.unknown_messages.fetch_add(1, std::memory_order_relaxed);
-      RCLCPP_WARN_THROTTLE(
-        get_logger(),
-        *get_clock(),
-        5000,
-        "Ignoring bitmap with unknown image type %d",
-        static_cast<int>(image.type));
+      if (should_log(Warning::BITMAP)) {
+        RCLCPP_WARN(get_logger(), "Ignoring bitmap with unknown image type %d",
+          static_cast<int>(image.type));
+      }
       return;
   }
   const auto offset = sensor_clock_offset(image.header.timestamp, fallback_stamp);
@@ -866,6 +882,7 @@ void SonarDriver::handle_imu_batch(
   const protocol::ImuBatch & batch,
   const builtin_interfaces::msg::Time & fallback_stamp)
 {
+  conversions::validate_imu_source(batch, settings_.use_sensor_timestamps);
   const auto newest_stamp = batch.timestamps.empty() ?
     std::nullopt : std::optional{batch.timestamps.back()};
   if (!observe_sequence(imu_sequence_, batch.sequence_id, newest_stamp)) {

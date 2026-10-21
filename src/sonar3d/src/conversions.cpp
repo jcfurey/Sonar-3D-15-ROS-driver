@@ -263,6 +263,13 @@ std::optional<std::int64_t> sensor_nanoseconds(const std::optional<protocol::Tim
   return stamp->seconds * kNanosecondsPerSecond + stamp->nanoseconds;
 }
 
+void validate_sensor_timestamp(const std::optional<protocol::Timestamp> & stamp)
+{
+  if (stamp && (stamp->seconds != 0 || stamp->nanoseconds != 0) && !sensor_nanoseconds(stamp)) {
+    throw std::invalid_argument("sonar timestamp is outside the ROS message range");
+  }
+}
+
 std_msgs::msg::Header make_header(
   const protocol::MessageHeader & source,
   const std::string & frame_id,
@@ -311,6 +318,44 @@ sensor_msgs::msg::Image make_range_image(
 void validate_point_cloud_source(const protocol::RangeImage & image)
 {
   validate_range_image(image, true);
+  // Normal scales are safe for every uint32 pixel. Inspect pixels only for
+  // extreme scales, before a deferred cloud or playback clock sees them.
+  constexpr auto maximum_scale = std::numeric_limits<float>::max() /
+    static_cast<float>(std::numeric_limits<std::uint32_t>::max());
+  if (image.pixel_scale > maximum_scale && !std::isfinite(
+      static_cast<float>(*std::max_element(image.pixels.begin(),
+      image.pixels.end())) * image.pixel_scale))
+  {
+    throw std::invalid_argument("range image produces a non-finite distance");
+  }
+}
+
+void validate_bitmap_source(const protocol::BitmapImage & image)
+{
+  static_cast<void>(expected_pixel_count(
+      image.width, image.height, image.pixels.size(), "bitmap image"));
+}
+
+void validate_imu_source(const protocol::ImuBatch & batch, bool use_sensor_timestamp)
+{
+  const auto sample_count = static_cast<std::uint64_t>(batch.sample_count);
+  if (batch.timestamps.size() != sample_count ||
+    batch.specific_force.size() != sample_count * 3U ||
+    batch.rate_of_turn.size() != sample_count * 3U)
+  {
+    throw std::invalid_argument("IMU batch array sizes do not match its sample count");
+  }
+  const auto finite = [](float value) {return std::isfinite(value);};
+  if (!std::all_of(batch.specific_force.begin(), batch.specific_force.end(), finite) ||
+    !std::all_of(batch.rate_of_turn.begin(), batch.rate_of_turn.end(), finite))
+  {
+    throw std::invalid_argument("IMU batch contains a non-finite measurement");
+  }
+  if (use_sensor_timestamp) {
+    for (const auto & stamp : batch.timestamps) {
+      validate_sensor_timestamp(stamp);
+    }
+  }
 }
 
 float linear_signal_strength(std::uint8_t pixel)
@@ -378,8 +423,7 @@ sensor_msgs::msg::Image make_bitmap_image(
   const protocol::BitmapImage & source,
   const std_msgs::msg::Header & header)
 {
-  static_cast<void>(
-    expected_pixel_count(source.width, source.height, source.pixels.size(), "bitmap image"));
+  validate_bitmap_source(source);
   sensor_msgs::msg::Image message;
   message.header = header;
   message.width = source.width;
@@ -405,18 +449,15 @@ std::vector<sensor_msgs::msg::Imu> make_imu_messages(
   std::int64_t sensor_offset_nanoseconds,
   const ImuNoise & noise)
 {
-  if (!std::isfinite(noise.linear_acceleration_stddev) || noise.linear_acceleration_stddev < 0.0 ||
-    !std::isfinite(noise.angular_velocity_stddev) || noise.angular_velocity_stddev < 0.0)
+  if (!std::isfinite(noise.linear_acceleration_stddev * noise.linear_acceleration_stddev) ||
+    noise.linear_acceleration_stddev < 0.0 ||
+    !std::isfinite(noise.angular_velocity_stddev * noise.angular_velocity_stddev) ||
+    noise.angular_velocity_stddev < 0.0)
   {
     throw std::invalid_argument("IMU standard deviations must be finite and non-negative");
   }
+  validate_imu_source(source, use_sensor_timestamp);
   const auto sample_count = static_cast<std::size_t>(source.sample_count);
-  if (source.timestamps.size() != sample_count ||
-    source.specific_force.size() != sample_count * 3U ||
-    source.rate_of_turn.size() != sample_count * 3U)
-  {
-    throw std::invalid_argument("IMU batch array sizes do not match its sample count");
-  }
 
   std::vector<sensor_msgs::msg::Imu> messages;
   messages.reserve(sample_count);

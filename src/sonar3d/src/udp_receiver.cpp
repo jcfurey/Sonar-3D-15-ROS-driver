@@ -125,6 +125,14 @@ UdpReceiver::UdpReceiver(const UdpReceiverOptions & options)
     {
       close_and_throw(socket_, wake_event_, "enable SO_REUSEADDR");
     }
+    // Linux otherwise delivers traffic for every multicast group joined by
+    // any socket on this port, including other sonar instances.
+    const int multicast_all = 0;
+    if (setsockopt(socket_, IPPROTO_IP, IP_MULTICAST_ALL, &multicast_all,
+      sizeof(multicast_all)) < 0)
+    {
+      close_and_throw(socket_, wake_event_, "isolate multicast group membership");
+    }
   }
   if (options.receive_buffer_size > 0 && setsockopt(
       socket_, SOL_SOCKET, SO_RCVBUF, &options.receive_buffer_size,
@@ -197,11 +205,21 @@ bool UdpReceiver::wait(std::chrono::milliseconds timeout)
     {socket_, POLLIN, 0},
     {wake_event_, POLLIN, 0},
   }};
-  const auto timeout_ms = timeout.count() < 0 ? -1 : static_cast<int>(
+  auto timeout_ms = timeout.count() < 0 ? -1 : static_cast<int>(
     std::min<std::chrono::milliseconds::rep>(timeout.count(), std::numeric_limits<int>::max()));
+  const auto deadline = std::chrono::steady_clock::now() +
+    std::chrono::milliseconds(std::max(timeout_ms, 0));
   int ready{};
   do {
     ready = poll(descriptors.data(), descriptors.size(), timeout_ms);
+    if (ready < 0 && errno == EINTR && timeout_ms >= 0) {
+      const auto remaining = deadline - std::chrono::steady_clock::now();
+      if (remaining <= std::chrono::steady_clock::duration::zero()) {
+        return false;
+      }
+      timeout_ms =
+        static_cast<int>(std::chrono::ceil<std::chrono::milliseconds>(remaining).count());
+    }
   } while (ready < 0 && errno == EINTR);
   if (ready < 0) {
     throw std::system_error(errno, std::generic_category(), "wait for UDP packet");
@@ -217,14 +235,20 @@ void UdpReceiver::interrupt()
 {
   const std::uint64_t increment = 1;
   // EAGAIN only occurs when the counter is saturated, which still wakes waiters.
-  [[maybe_unused]] const auto written = write(wake_event_, &increment, sizeof(increment));
+  ssize_t written{};
+  do {
+    written = write(wake_event_, &increment, sizeof(increment));
+  } while (written < 0 && errno == EINTR);
 }
 
 void UdpReceiver::clear_interrupt()
 {
   // Reading an eventfd returns and resets its counter; EAGAIN means it was clear.
   std::uint64_t counter{};
-  [[maybe_unused]] const auto read_bytes = read(wake_event_, &counter, sizeof(counter));
+  ssize_t read_bytes{};
+  do {
+    read_bytes = read(wake_event_, &counter, sizeof(counter));
+  } while (read_bytes < 0 && errno == EINTR);
 }
 
 std::size_t UdpReceiver::discard_pending()

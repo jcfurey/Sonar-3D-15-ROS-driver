@@ -46,6 +46,37 @@ compressed transport over a tether, run `image_transport`'s republisher, e.g.
 in:=/sonar3d/intensity_image -r out/compressed:=/sonar3d/intensity_image/compressed`
 (`compressedDepth` handles the `32FC1` range image).
 
+Data publishers accept standard ROS 2 startup `qos_overrides` parameters for
+history, depth, and reliability. Use the fully resolved topic name, including
+any remapping. For example, in the node's `ros__parameters` section:
+
+```yaml
+qos_overrides:
+  /sonar3d/range_image:
+    publisher:
+      reliability: best_effort
+      history: keep_last
+      depth: 5
+```
+
+Image dimensions and IMU measurements are validated even without subscribers,
+before updating sequence tracking or the shared sensor clock. Malformed input
+cannot suppress a subsequent valid shot or poison the clock fit. Non-finite
+IMU measurements and overflowing noise variances are rejected. A backward ROS
+clock jump clears the previous clock fit, including pending step confirmation.
+Warnings are throttled per component on a steady clock, so concurrent sonar
+instances keep independent warning state even while ROS time is paused.
+
+Multicast sockets receive only their configured group, including when another
+listener joins a different group on the same port. UDP wait deadlines survive
+interrupted system calls. Range/intensity pairing retains a newer cached signal
+when an older signal arrives late, including across sequence wraparound.
+Playback clears cached pairs when newer acquisition times identify a counter
+restart, or image time steps backward by more than one second.
+Recording playback validates supported products before pacing or pairing them,
+even without subscribers; malformed future timestamps cannot stall replay.
+Range overflow is rejected before images, metadata, or deferred clouds are emitted.
+
 Topic names before version 0.5 carried a `sonar_` prefix. To keep old
 consumers working, remap the new names back, e.g. `-r points:=sonar_point_cloud
 -r range_image:=sonar_range_image -r imu/data_raw:=sonar_imu`. Version 0.6
