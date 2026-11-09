@@ -1,0 +1,50 @@
+[
+  {
+    "file": "167_ring.sonar",
+    "received": {
+      "orientation": 2068,
+      "range": 2068,
+      "signal": 2068,
+      "cloud": 2068,
+      "tf": 2068
+    },
+    "cloud_tf_stamps_match": true,
+    "errors": []
+  },
+  {
+    "file": "167_wheel.sonar",
+    "received": {
+      "range": 1228,
+      "signal": 1227,
+      "orientation": 1227,
+      "tf": 1227,
+      "cloud": 1227
+    },
+    "cloud_tf_stamps_match": true,
+    "errors": []
+  },
+  {
+    "file": "169_ring.sonar",
+    "received": {
+      "orientation": 2101,
+      "range": 2101,
+      "tf": 2101,
+      "signal": 2101,
+      "cloud": 2101
+    },
+    "cloud_tf_stamps_match": true,
+    "errors": []
+  },
+  {
+    "file": "169_wheel.sonar",
+    "received": {
+      "orientation": 1031,
+      "range": 1031,
+      "tf": 1031,
+      "signal": 1030,
+      "cloud": 1031
+    },
+    "cloud_tf_stamps_match": true,
+    "errors": []
+  }
+]

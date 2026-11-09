@@ -1,0 +1,196 @@
+{
+  "inferred_private_format": true,
+  "heading_and_sensor_mount_not_calibrated": true,
+  "public_protocol": "https://docs.waterlinked.com/sonar-3d/sonar-3d-15-api/",
+  "vendor_replayer": "https://sonar.replay.waterlinked.com/",
+  "source_file": "sonar-recording-2026-01-29-150548 (1).sonar",
+  "source_sha256": "d2707abc01aabb6769e0acf6dcfb466e63aadcc777bbdfbe6c39baa707fc74f2",
+  "raw_imu_samples": 12030,
+  "sample_dt_min_median_max": [
+    0.008301734924316406,
+    0.009999990463256836,
+    0.011969566345214844
+  ],
+  "candidate_conventions": [
+    {
+      "order": "wxyz",
+      "inverse": false,
+      "gyro_axis_correlations": [
+        0.9988101361980114,
+        0.9854760361979082,
+        0.9892268832198169
+      ],
+      "gyro_axis_rmse": [
+        0.008842523536481049,
+        0.008427849783765576,
+        0.01000298587789382
+      ],
+      "rotated_specific_force_mean": [
+        -0.008489970008834669,
+        -0.019754416372928248,
+        -9.719382068648079
+      ],
+      "rotated_specific_force_std": [
+        0.14723482513661665,
+        0.12042633587507603,
+        0.2056759889646401
+      ]
+    },
+    {
+      "order": "wxyz",
+      "inverse": true,
+      "gyro_axis_correlations": [
+        0.0885369129489773,
+        -0.903216684629997,
+        0.7583452744566244
+      ],
+      "gyro_axis_rmse": [
+        0.12368242686978802,
+        0.09000901487395514,
+        0.09183103328620813
+      ],
+      "rotated_specific_force_mean": [
+        -6.311770782747159,
+        -0.045481292145959855,
+        6.1984544952276455
+      ],
+      "rotated_specific_force_std": [
+        0.7189681953140804,
+        3.8336000776179144,
+        1.03468420746967
+      ]
+    },
+    {
+      "order": "xyzw",
+      "inverse": false,
+      "gyro_axis_correlations": [
+        0.9887021350408101,
+        0.903216684629997,
+        -0.6269000607014354
+      ],
+      "gyro_axis_rmse": [
+        0.02173250413128424,
+        0.020795377929225332,
+        0.09332844249179177
+      ],
+      "rotated_specific_force_mean": [
+        -0.32607500542603635,
+        0.5293413400675677,
+        9.57028260222378
+      ],
+      "rotated_specific_force_std": [
+        0.4094180873219595,
+        1.5288226224506587,
+        0.25214140956511905
+      ]
+    },
+    {
+      "order": "xyzw",
+      "inverse": true,
+      "gyro_axis_correlations": [
+        0.6553612410365683,
+        0.9854760361979082,
+        -0.6622902515433955
+      ],
+      "gyro_axis_rmse": [
+        0.09229395903330326,
+        0.008427849783765576,
+        0.16798367629993
+      ],
+      "rotated_specific_force_mean": [
+        -0.020403032611997544,
+        0.3713816954291671,
+        8.73344990823776
+      ],
+      "rotated_specific_force_std": [
+        0.15629413832281036,
+        4.114528028621211,
+        1.086313314994763
+      ]
+    }
+  ],
+  "hf_recordings": [
+    {
+      "file": "167_ring.sonar",
+      "sha256": "99cdce50ea313439c65cbe6a841af32df6637f8cc34c840699b19e77ff913fbe",
+      "product_counts": {
+        "range": 2068,
+        "signal": 2068,
+        "orientation": 2068
+      },
+      "missing_signal_sequences": [],
+      "missing_orientation_sequences": [],
+      "first_range_sequence": 3418,
+      "last_range_sequence": 5485,
+      "quaternion_norm_min_max": [
+        0.999999870724746,
+        1.0000001598919983
+      ],
+      "source_header_mismatch_sequences": []
+    },
+    {
+      "file": "167_wheel.sonar",
+      "sha256": "2756186ed98615d01438d935732981d891c6080605e49c989b674c23da22c909",
+      "product_counts": {
+        "range": 1228,
+        "signal": 1227,
+        "orientation": 1227
+      },
+      "missing_signal_sequences": [
+        1490
+      ],
+      "missing_orientation_sequences": [
+        263
+      ],
+      "first_range_sequence": 263,
+      "last_range_sequence": 1490,
+      "quaternion_norm_min_max": [
+        0.9999998366613543,
+        1.000000156273287
+      ],
+      "source_header_mismatch_sequences": []
+    },
+    {
+      "file": "169_ring.sonar",
+      "sha256": "9db9e009a14e53bb3dc0060ceebb49fa8ed3988d57053d9ddd89c7e745f46ba1",
+      "product_counts": {
+        "range": 2101,
+        "signal": 2101,
+        "orientation": 2101
+      },
+      "missing_signal_sequences": [],
+      "missing_orientation_sequences": [],
+      "first_range_sequence": 5495,
+      "last_range_sequence": 7595,
+      "quaternion_norm_min_max": [
+        0.999999846199756,
+        1.0000001537577579
+      ],
+      "source_header_mismatch_sequences": []
+    },
+    {
+      "file": "169_wheel.sonar",
+      "sha256": "cb954f1f6e7c4c6c64b1bc8e77c541deec0527b668a074253d72e91cfc7d67cb",
+      "product_counts": {
+        "range": 1031,
+        "signal": 1030,
+        "orientation": 1031
+      },
+      "missing_signal_sequences": [
+        1926
+      ],
+      "missing_orientation_sequences": [],
+      "first_range_sequence": 896,
+      "last_range_sequence": 1926,
+      "quaternion_norm_min_max": [
+        0.9999998816535426,
+        1.0000001543129344
+      ],
+      "source_header_mismatch_sequences": []
+    }
+  ],
+  "orientation_packet_coefficients_present_in_raw_samples": {
+    "exact_matches": 716,
+    "orientation_packets": 721
+  }
+}

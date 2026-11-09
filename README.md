@@ -32,6 +32,7 @@ or remapped normally.
 | `points` | `sensor_msgs/PointCloud2` | Valid returns with `x,y,z,intensity,range,azimuth,elevation` float32 fields |
 | `raw_packet` | `sonar3d/RawPacket` | Exact accepted-source RIP datagrams, including unknown messages, duplicates and damaged packets; host receipt stamp and sender address |
 | `imu/data_raw` | `sensor_msgs/Imu` | REP-145 specific force and angular rate without orientation, one message per sample |
+| `imu/data` | `sensor_msgs/Imu` | Opt-in experimental private vendor orientation only; local z-up reference, unverified heading, no angular velocity or acceleration |
 | `image_metadata` | `sonar3d/ImageMetadata` | Exact image header, source shot ID/clock, angular geometry, acquisition settings and driver source fingerprint; one message per range/bitmap image |
 | `quantitative_image` | `sensor_msgs/Image` | Optional headless renderer's display-only `rgb8` figure: labelled range and signal panels, fixed scales and no-return masks; measurements remain on the raw topics |
 | `/tf_static` | `tf2_msgs/TFMessage` | Documented `frame_id` to `imu_frame_id` offset (`publish_tf`) |
@@ -372,6 +373,7 @@ the lifecycle state and is OK with "not streaming" while inactive; the
 | `publish_range_image` | `true` | Enable the scaled range image |
 | `publish_bitmap_images` | `true` | Enable signal-strength and shaded bitmap topics |
 | `publish_imu` | `true` | Publish `ImuBatch` samples on `imu/data_raw` |
+| `publish_vendor_orientation` | `false` | Experimental: decode existing private `ImuOrientation` output into orientation-only `imu/data`; does not enable private output on the device |
 | `linear_acceleration_stddev` | `0.0` | REP-145 accelerometer noise in m/s²; zero reports the covariance as unknown |
 | `angular_velocity_stddev` | `0.0` | REP-145 gyroscope noise in rad/s; zero reports the covariance as unknown |
 | `packet_stale_timeout` | `2.0` | Time without valid packets before diagnostics report a stale stream |
@@ -470,9 +472,9 @@ Normal playback continues past recoverable damaged/malformed packets and fails
 if framing is lost.
 
 Some GUI recordings contain private `waterlinked.sonar.internal.ImuOrientation`
-and `ImuRaw` messages. Their payload schemas are absent from the public vendor
-protocol. They are reported as unsupported and are not converted into
-`imu/data_raw`; that topic supports the documented public `ImuBatch` format.
+and `ImuRaw` messages. `ImuOrientation` is decoded and validated; publication
+requires `--vendor-orientation` (see below). `ImuRaw` remains unsupported.
+Neither private type is substituted for the public `ImuBatch` on `imu/data_raw`.
 Keep the original recordings to retain private telemetry. For future recordings,
 enable public raw IMU output before recording. The vendor manual (Integration
 API, pages 36–38) describes 100 Hz `ImuBatch` output, disabled by default, and
@@ -497,6 +499,74 @@ curl --fail --show-error \
 Existing recordings need recorded public `ImuBatch` packets to replay samples
 on `imu/data_raw`; enabling device output later cannot add them.
 
+### Vendor orientation (experimental)
+
+The public [vendor integration protocol](https://docs.waterlinked.com/sonar-3d/sonar-3d-15-api/)
+does not define the private orientation schema. The public vendor replay app
+also does not decode it. The definition in
+`proto/WaterLinkedSonarInternalProtocol.proto` is inferred from recordings,
+not a vendor-supported API: field 1 is the public `Header`, fields 2 and 3
+are retained as opaque uint32 values, and field 4 is four packed float32
+quaternion coefficients. Unknown additional fields and the original datagram
+remain recoverable through `raw_packet`.
+
+The 2026-01-29 recording was used to distinguish quaternion conventions by
+comparing its private raw IMU quaternion samples (field 8) to angular rates
+(field 7) and specific force (field 6). Scalar-first **w,x,y,z**, body-to-world
+rotation gave gyro correlations of 0.999, 0.985 and 0.989 across the three axes.
+Rotated specific force had mean (-0.008, -0.020, -9.719) m/s² with standard
+deviations (0.147, 0.120, 0.206); inverse and scalar-last interpretations did
+not satisfy both checks. This is empirical evidence, not a calibrated
+attitude or heading reference. The HF packets match this wire layout and
+their quaternion norms are checked against unity before use.
+The check used 12,030 raw samples; 716 of 721 orientation packets have
+coefficients present byte-for-byte in those samples. Source SHA-256 hashes,
+alternative convention scores and boundary-packet audits are retained in
+[the research evidence](docs/vendor_orientation_evidence.json), and
+[full HF replay results](docs/hf_orientation_replay_results.json) verify every
+orientation/cloud count and the exact cloud-to-TF timestamp matches over DDS.
+
+Publication is opt-in:
+
+```bash
+ros2 run sonar3d sonar_replay --file survey.sonar --vendor-orientation \
+  --ros-args -r __ns:=/sonar3d
+# Live: only works when the device already transmits this private product.
+ros2 launch sonar3d sonar3d.launch.py publish_vendor_orientation:=true
+```
+
+`imu/data` carries only orientation at the source shot timestamp, in
+`imu_frame_id`. Both vendor body and reference bases are changed from z-down
+to z-up: `R_ros = C R_vendor C^-1`, where `C = diag(1,-1,-1)`; equivalently
+`(w,x,y,z)` becomes `(w,x,-y,-z)`. Near-unit quaternions are normalized;
+nonfinite, wrong-sized or non-unit estimates are rejected before sequence
+tracking or clock estimation. Orientation covariance is unknown (all zeros);
+angular velocity and acceleration are absent (their covariance[0] is -1).
+There is no claim of ENU alignment, north-referenced yaw or position.
+
+For an attitude-only RViz preview:
+
+```bash
+ros2 launch sonar3d sonar_replay.launch.py file:=/absolute/path/survey.sonar \
+  vendor_orientation:=true image_range_max:=5.0
+```
+
+This uses `sonar3d_attitude` as a local z-up fixed frame and publishes a
+rotation-only transform to `frame_id`, with zero translation. Each cloud TF
+uses the orientation with **the same source sequence and timestamp**, stamped
+at that image's ROS time, so delayed signal pairing cannot misalign the TF.
+An image without that exact orientation keeps its raw image products but is
+omitted from the attitude-only cloud preview and reported in the summary.
+Without the preview option all measured clouds are retained. The regular live
+driver still publishes only its documented static sonar-to-IMU transform.
+
+The four November HF recordings contain 256×64 images over 40°×40° at
+19.67–19.72 Hz. Each wheel clip ends after a range packet whose signal packet
+is absent: the final cloud is preserved with intensity zero, without copying
+another shot's intensity. `167_wheel` also starts with a range/signal pair
+whose orientation is absent. These are recording-boundary omissions, not CRC
+or decoding failures, and the missing measurements cannot be reconstructed.
+
 ### Standalone RViz playback
 
 ```bash
@@ -510,11 +580,13 @@ so no vehicle model or identity `odom` transform is needed. The viewer publishes
 the documented sensor-to-IMU static transform to provide a complete sensor TF
 tree and avoid RViz's missing-frame warning (the live driver broadcasts the
 same transform itself). Message stamps use
-the current ROS clock while pacing follows the recording. No vehicle motion or
-private IMU orientation is applied to the cloud.
+the current ROS clock while pacing follows the recording. The default view is
+in the sonar frame; `vendor_orientation:=true` enables the experimental
+attitude-only preview described above.
 
 Optional launch arguments are `realtime_factor`, `startup_delay`, `frame_id`,
-`imu_frame_id`, `namespace`, and `rviz` (`false` for headless replay). Closing RViz stops replay;
+`imu_frame_id`, `namespace`, `vendor_orientation`, `orientation_frame`, and
+`rviz` (`false` for headless replay). Closing RViz stops replay;
 after recording EOF, RViz stays open with the last frame.
 
 In the Nautilus workspace, the host helper stages a recording into the shared
