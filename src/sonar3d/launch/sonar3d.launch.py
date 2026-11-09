@@ -48,6 +48,7 @@ PARAMETER_TYPES = {
     'publish_range_image': bool,
     'publish_bitmap_images': bool,
     'publish_imu': bool,
+    'publish_vendor_orientation': bool,
     'linear_acceleration_stddev': float,
     'angular_velocity_stddev': float,
     'packet_stale_timeout': float,

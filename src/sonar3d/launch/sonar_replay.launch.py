@@ -8,13 +8,39 @@
 """View a standalone recording in its sonar frame, without vehicle TF."""
 
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, EmitEvent, RegisterEventHandler
+from launch.actions import (
+    DeclareLaunchArgument, EmitEvent, OpaqueFunction, RegisterEventHandler, SetLaunchConfiguration,
+)
 from launch.conditions import IfCondition
 from launch.event_handlers import OnProcessExit
 from launch.events import Shutdown
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
+
+
+def replay_setup(context):
+    """Enable the inferred private attitude only when explicitly requested."""
+    enabled = LaunchConfiguration('vendor_orientation').perform(context).lower()
+    if enabled not in ('true', 'false', '1', '0'):
+        raise ValueError('vendor_orientation must be true or false')
+    enabled = enabled in ('true', '1')
+    args = []
+    for option, argument in (
+            ('--file', 'file'), ('--realtime-factor', 'realtime_factor'),
+            ('--startup-delay', 'startup_delay'), ('--frame-id', 'frame_id'),
+            ('--imu-frame-id', 'imu_frame_id')):
+        args.extend([option, LaunchConfiguration(argument).perform(context)])
+    args.append('--receive-time')
+    fixed = LaunchConfiguration('frame_id').perform(context)
+    if enabled:
+        args.append('--vendor-orientation')
+        if LaunchConfiguration('rviz').perform(context).lower() in ('true', '1'):
+            fixed = LaunchConfiguration('orientation_frame').perform(context)
+            args.extend(['--orientation-frame', fixed])
+    return [SetLaunchConfiguration('replay_fixed_frame', fixed), Node(
+        package='sonar3d', executable='sonar_replay',
+        namespace=LaunchConfiguration('namespace'), output='screen', arguments=args)]
 
 
 def generate_launch_description():
@@ -26,6 +52,9 @@ def generate_launch_description():
         DeclareLaunchArgument('frame_id', default_value='sonar3d_link'),
         DeclareLaunchArgument('imu_frame_id', default_value='sonar3d_imu_link'),
         DeclareLaunchArgument('namespace', default_value='sonar3d'),
+        DeclareLaunchArgument('vendor_orientation', default_value='false',
+                              description='Experimental private attitude, local z-up, unverified heading'),
+        DeclareLaunchArgument('orientation_frame', default_value='sonar3d_attitude'),
         DeclareLaunchArgument('rviz', default_value='true'),
         DeclareLaunchArgument('rviz_images', default_value=LaunchConfiguration('rviz'),
                               description='Publish labelled quantitative RGB images for RViz'),
@@ -34,20 +63,6 @@ def generate_launch_description():
         DeclareLaunchArgument('image_range_min', default_value='0.0'),
         DeclareLaunchArgument('image_range_max', default_value='15.0'),
     ]
-    replay = Node(
-        package='sonar3d',
-        executable='sonar_replay',
-        namespace=LaunchConfiguration('namespace'),
-        output='screen',
-        arguments=[
-            '--file', LaunchConfiguration('file'),
-            '--realtime-factor', LaunchConfiguration('realtime_factor'),
-            '--startup-delay', LaunchConfiguration('startup_delay'),
-            '--frame-id', LaunchConfiguration('frame_id'),
-            '--imu-frame-id', LaunchConfiguration('imu_frame_id'),
-            '--receive-time',
-        ],
-    )
     # The documented sensor-to-IMU offset gives RViz a real sensor TF tree,
     # including its fixed frame, without inventing a vehicle or odometry pose.
     imu_tf = Node(
@@ -72,7 +87,7 @@ def generate_launch_description():
             '-d', PathJoinSubstitution([
                 FindPackageShare('sonar3d'), 'config', 'sonar_replay.rviz',
             ]),
-            '-f', LaunchConfiguration('frame_id'),
+            '-f', LaunchConfiguration('replay_fixed_frame'),
         ],
     )
     close_viewer = RegisterEventHandler(OnProcessExit(
@@ -109,4 +124,5 @@ def generate_launch_description():
         ],
     )
     return LaunchDescription(arguments + [close_viewer, close_images,
-                                          imu_tf, rviz_images, viewer, images, replay])
+                                          imu_tf, rviz_images,
+                                          OpaqueFunction(function=replay_setup), viewer, images])

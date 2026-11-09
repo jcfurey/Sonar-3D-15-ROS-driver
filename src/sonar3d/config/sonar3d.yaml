@@ -28,6 +28,7 @@
     publish_range_image: true
     publish_bitmap_images: true
     publish_imu: true
+    publish_vendor_orientation: false
     linear_acceleration_stddev: 0.0
     angular_velocity_stddev: 0.0
     diagnostic_updater:

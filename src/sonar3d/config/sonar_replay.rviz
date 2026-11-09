@@ -17,8 +17,8 @@ Visualization Manager:
     - Class: rviz_default_plugins/Axes
       Name: Sonar axes
       Enabled: true
-      Length: 1
-      Radius: 0.02
+      Length: 0.2
+      Radius: 0.005
       Reference Frame: <Fixed Frame>
       Value: true
     - Class: rviz_default_plugins/PointCloud2
