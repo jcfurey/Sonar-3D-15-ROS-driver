@@ -94,6 +94,7 @@ private:
     std::atomic<std::uint64_t> range_images{0};
     std::atomic<std::uint64_t> bitmap_images{0};
     std::atomic<std::uint64_t> imu_batches{0};
+    std::atomic<std::uint64_t> imu_orientations{0};
     std::atomic<std::uint64_t> sequence_gaps{0};
     std::atomic<std::uint64_t> duplicate_messages{0};
     std::atomic<std::uint64_t> out_of_order_messages{0};
@@ -214,6 +215,9 @@ private:
   void handle_imu_batch(
     const protocol::ImuBatch & batch,
     const builtin_interfaces::msg::Time & fallback_stamp);
+  void handle_imu_orientation(
+    const protocol::ImuOrientation & orientation,
+    const builtin_interfaces::msg::Time & fallback_stamp);
   // Offset to add to a message's sensor timestamps: zero while the sonar clock
   // agrees with receive time, otherwise the shared estimate that maps the
   // sonar clock onto ROS time.
@@ -250,6 +254,7 @@ private:
   Publisher<msg::RawPacket> raw_packet_publisher_;
   Publisher<sensor_msgs::msg::PointCloud2> point_cloud_publisher_;
   Publisher<sensor_msgs::msg::Imu> imu_publisher_;
+  Publisher<sensor_msgs::msg::Imu> orientation_publisher_;
   std::unique_ptr<tf2_ros::StaticTransformBroadcaster> static_transform_broadcaster_;
 
   // Touched only by receive_thread_ (reset while it is stopped).
@@ -257,6 +262,7 @@ private:
   SequenceState intensity_sequence_;
   SequenceState shaded_sequence_;
   SequenceState imu_sequence_;
+  SequenceState orientation_sequence_;
   // A 10 s window follows crystal drift to well under a millisecond; a 1 s
   // jump above the estimate is treated as a sonar clock step.
   SensorClockOffset clock_offset_{10'000'000'000, 1'000'000'000};

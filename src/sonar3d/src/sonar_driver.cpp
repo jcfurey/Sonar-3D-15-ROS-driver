@@ -276,6 +276,10 @@ void SonarDriver::configure_driver()
     imu_publisher_ = create_publisher<sensor_msgs::msg::Imu>(
       "imu/data_raw", rclcpp::SystemDefaultsQoS().keep_last(100), product_options);
   }
+  if (parameters.publish_vendor_orientation) {
+    orientation_publisher_ = create_publisher<sensor_msgs::msg::Imu>(
+      "imu/data", rclcpp::SystemDefaultsQoS().keep_last(100), product_options);
+  }
   if (parameters.publish_tf) {
     static_transform_broadcaster_ = std::make_unique<tf2_ros::StaticTransformBroadcaster>(*this);
     publish_imu_transform();
@@ -320,6 +324,7 @@ SonarDriver::CallbackReturn SonarDriver::on_activate(const rclcpp_lifecycle::Sta
   intensity_sequence_ = {};
   shaded_sequence_ = {};
   imu_sequence_ = {};
+  orientation_sequence_ = {};
   clock_offset_.reset();
   last_warning_ = {};
   timestamp_source_.store(TimestampSource::NONE);
@@ -407,6 +412,7 @@ void SonarDriver::release()
   raw_packet_publisher_.reset();
   point_cloud_publisher_.reset();
   imu_publisher_.reset();
+  orientation_publisher_.reset();
   receiver_.reset();
 }
 
@@ -718,6 +724,8 @@ void SonarDriver::handle_datagram(const Datagram & datagram)
           handle_bitmap_image(std::move(message), fallback_stamp);
         } else if constexpr (std::is_same_v<MessageType, protocol::ImuBatch>) {
           handle_imu_batch(message, fallback_stamp);
+        } else if constexpr (std::is_same_v<MessageType, protocol::ImuOrientation>) {
+          handle_imu_orientation(message, fallback_stamp);
         } else {
           metrics_.unknown_messages.fetch_add(1, std::memory_order_relaxed);
           RCLCPP_DEBUG(get_logger(), "Ignoring unsupported RIP message %s",
@@ -905,6 +913,26 @@ void SonarDriver::handle_imu_batch(
     }
   }
   metrics_.imu_batches.fetch_add(1, std::memory_order_relaxed);
+}
+
+void SonarDriver::handle_imu_orientation(
+  const protocol::ImuOrientation & orientation,
+  const builtin_interfaces::msg::Time & fallback_stamp)
+{
+  conversions::validate_orientation_source(orientation, settings_.use_sensor_timestamps);
+  metrics_.imu_orientations.fetch_add(1, std::memory_order_relaxed);
+  if (!orientation_publisher_ ||
+    !observe_sequence(orientation_sequence_, orientation.header.sequence_id,
+      orientation.header.timestamp))
+  {
+    return;
+  }
+  const auto offset = sensor_clock_offset(orientation.header.timestamp, fallback_stamp);
+  if (has_subscribers(orientation_publisher_)) {
+    auto message = conversions::make_orientation_message(orientation, settings_.imu_frame_id,
+      fallback_stamp, settings_.use_sensor_timestamps, offset);
+    orientation_publisher_->publish(std::make_unique<sensor_msgs::msg::Imu>(std::move(message)));
+  }
 }
 
 std::int64_t SonarDriver::sensor_clock_offset(
@@ -1148,6 +1176,7 @@ void SonarDriver::diagnose_stream(diagnostic_updater::DiagnosticStatusWrapper & 
   status.add("range_images", value(metrics_.range_images));
   status.add("bitmap_images", value(metrics_.bitmap_images));
   status.add("imu_batches", value(metrics_.imu_batches));
+  status.add("imu_orientations", value(metrics_.imu_orientations));
   status.add("sequence_gaps", value(metrics_.sequence_gaps));
   status.add("duplicates", value(metrics_.duplicate_messages));
   status.add("out_of_order", value(metrics_.out_of_order_messages));

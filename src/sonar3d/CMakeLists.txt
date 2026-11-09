@@ -53,6 +53,7 @@ protobuf_generate_cpp(
   SONAR3D_PROTO_SOURCES
   SONAR3D_PROTO_HEADERS
   proto/WaterLinkedSonarIntegrationProtocol.proto
+  proto/WaterLinkedSonarInternalProtocol.proto
 )
 
 add_library(
@@ -168,6 +169,8 @@ foreach(player_target IN ITEMS sonar_replay sonar_to_bag)
       rosbag2_cpp::rosbag2_cpp
       rosbag2_storage::rosbag2_storage
       ${sensor_msgs_TARGETS}
+      ${geometry_msgs_TARGETS}
+      tf2_ros::tf2_ros
   )
 endforeach()
 
@@ -199,6 +202,7 @@ if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
   find_package(ament_cmake_pytest REQUIRED)
   find_package(ament_lint_auto REQUIRED)
+  find_package(tf2_msgs REQUIRED)
 
   # The ament wrapper intentionally omits external include paths, so cppcheck
   # cannot expand GoogleTest's TEST macro. Analyze production code here; the
@@ -257,6 +261,7 @@ if(BUILD_TESTING)
   target_link_libraries(
     test_recording_player
     sonar3d_ros rclcpp::rclcpp rosbag2_cpp::rosbag2_cpp protobuf::libprotobuf ZLIB::ZLIB
+    ${tf2_msgs_TARGETS}
   )
   target_include_directories(test_recording_player PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
   target_compile_definitions(

@@ -101,7 +101,19 @@ struct UnknownMessage
   bool operator==(const UnknownMessage &) const = default;
 };
 
-using Message = std::variant<RangeImage, BitmapImage, ImuBatch, UnknownMessage>;
+// Private GUI recording product. Layout/convention inferred from recordings;
+// source_time_2/3 remain opaque. ROS publication is explicitly opt-in.
+struct ImuOrientation
+{
+  MessageHeader header;
+  std::uint32_t source_time_2{};
+  std::uint32_t source_time_3{};
+  std::vector<float> quaternion;  // w, x, y, z
+
+  bool operator==(const ImuOrientation &) const = default;
+};
+
+using Message = std::variant<RangeImage, BitmapImage, ImuBatch, ImuOrientation, UnknownMessage>;
 
 struct DecodedPacket
 {

@@ -222,6 +222,44 @@ protected:
   rclcpp::Subscription<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr diagnostics_;
 };
 
+TEST_P(DriverStream, PrivateOrientationIsOptInAndMalformedDataCannotPoisonSequence)
+{
+  start(true, 0.0, {rclcpp::Parameter("publish_vendor_orientation", true)});
+  std::vector<Imu::ConstSharedPtr> orientations;
+  const auto subscription = observer_->create_subscription<Imu>(
+    "imu/data", rclcpp::QoS(100), [&orientations](Imu::ConstSharedPtr message) {
+      orientations.push_back(message);
+    });
+  ASSERT_TRUE(wait_for([this] {return driver_->count_subscribers("imu/data") == 1;}));
+  sonar3d::protocol::ImuOrientation source;
+  source.header = sonar3d::testing::range_image(5).header;
+  source.quaternion = {0, 0, 0, 0};
+  sender_.send(port_, sonar3d::protocol::encode_packet(source), destination_.c_str());
+  source.quaternion = {0.5F, 0.5F, 0.5F, 0.5F};
+  sender_.send(port_, sonar3d::protocol::encode_packet(source), destination_.c_str());
+  sender_.send(port_, sonar3d::protocol::encode_packet(source), destination_.c_str());
+  ASSERT_TRUE(wait_for([&orientations] {return orientations.size() == 1;}));
+  ASSERT_TRUE(wait_for([this] {return metric("duplicates") == 1;}));
+  EXPECT_EQ(orientations[0]->header.frame_id, "test_imu");
+  EXPECT_DOUBLE_EQ(orientations[0]->orientation.y, -0.5);
+  EXPECT_DOUBLE_EQ(orientations[0]->angular_velocity_covariance[0], -1.0);
+  EXPECT_EQ(metric("malformed_packets"), 1U);
+  EXPECT_EQ(metric("unknown_messages"), 0U);
+}
+
+TEST_P(DriverStream, PrivateOrientationDefaultDoesNotPublishAnEstimate)
+{
+  start();
+  EXPECT_EQ(observer_->count_publishers("imu/data"), 0U);
+  sonar3d::protocol::ImuOrientation source;
+  source.header = sonar3d::testing::range_image(0).header;
+  source.quaternion = {1, 0, 0, 0};
+  sender_.send(port_, sonar3d::protocol::encode_packet(source), destination_.c_str());
+  ASSERT_TRUE(wait_for([this] {return metric("imu_orientations") == 1;}));
+  EXPECT_EQ(metric("unknown_messages"), 0U);
+  EXPECT_EQ(metric("sensor_clock_fallbacks"), 0U);
+}
+
 TEST_P(DriverStream, MalformedUnsubscribedProductsCannotPoisonSequenceTracking)
 {
   start();

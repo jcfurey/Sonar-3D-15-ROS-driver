@@ -29,6 +29,7 @@
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp/serialization.hpp>
 #include <rosbag2_cpp/reader.hpp>
+#include <tf2_msgs/msg/tf_message.hpp>
 
 #include "sonar3d/conversions.hpp"
 #include "sonar3d/msg/raw_packet.hpp"
@@ -237,7 +238,7 @@ TEST_F(ReplayTest, ValidationChecksAllProductsWithoutSubscribersOrPacing)
 TEST_F(ReplayTest, ValidationSeparatesUnsupportedCrcFailuresAndMalformedProducts)
 {
   const auto orientation = unknown_packet(
-    "type.googleapis.com/waterlinked.sonar.internal.ImuOrientation");
+    "type.googleapis.com/waterlinked.sonar.internal.FutureOrientation");
   const auto raw = unknown_packet("type.googleapis.com/waterlinked.sonar.internal.ImuRaw");
   auto damaged = sonar3d::protocol::encode_packet(sonar3d::testing::range_image(0));
   damaged.back() ^= 0x01;
@@ -261,7 +262,7 @@ TEST_F(ReplayTest, ValidationSeparatesUnsupportedCrcFailuresAndMalformedProducts
   EXPECT_NE(output.find(
       "Validated 1 supported packets; unsupported 4; damaged 1; malformed 3; framing errors 0"),
     std::string::npos) << output;
-  EXPECT_NE(output.find("ImuOrientation: 2 packets (payload not decoded)"), std::string::npos);
+  EXPECT_NE(output.find("FutureOrientation: 2 packets (payload not decoded)"), std::string::npos);
   EXPECT_NE(output.find("ImuRaw: 1 packets (payload not decoded)"), std::string::npos);
   EXPECT_NE(output.find("BitmapImageGreyscale8/type=99: 1 packets"), std::string::npos);
 }
@@ -269,7 +270,7 @@ TEST_F(ReplayTest, ValidationSeparatesUnsupportedCrcFailuresAndMalformedProducts
 TEST_F(ReplayTest, UnsupportedPrivateImuMessagesDoNotFailValidation)
 {
   const Recording recording({unknown_packet(
-        "type.googleapis.com/waterlinked.sonar.internal.ImuOrientation")});
+        "type.googleapis.com/waterlinked.sonar.internal.FutureOrientation")});
   PlayerProcess process(recording.path(), std::vector<std::string>{"--validate-only"});
   ASSERT_TRUE(process.wait()) << process.output();
   EXPECT_TRUE(process.succeeded()) << process.output();
@@ -290,6 +291,113 @@ TEST_F(ReplayTest, LostFramingFailsWithSummary)
   EXPECT_NE(process.output().find("framing errors 1"), std::string::npos);
 }
 
+TEST_F(ReplayTest, PrivateOrientationValidationRejectsMalformedFutureSamplesBeforePacing)
+{
+  sonar3d::protocol::ImuOrientation source;
+  source.header = sonar3d::testing::range_image(0).header;
+  source.quaternion = {1, 0, 0, 0};
+  auto malformed = source;
+  malformed.header.timestamp->seconds += 3600;
+  malformed.quaternion = {0, 0, 0, 0};
+  const Recording recording({sonar3d::protocol::encode_packet(source),
+      sonar3d::protocol::encode_packet(malformed)});
+  for (const auto & options : std::vector<std::vector<std::string>>{
+      {"--validate-only"}, {"--startup-delay", "0"}})
+  {
+    PlayerProcess process(recording.path(), options);
+    ASSERT_TRUE(process.wait()) << process.output();
+    EXPECT_NE(process.output().find(
+        "1 supported packets; unsupported 0; damaged 0; malformed 1; framing errors 0"),
+      std::string::npos) << process.output();
+    EXPECT_EQ(process.succeeded(), options[0] != "--validate-only");
+  }
+}
+
+TEST_F(ReplayTest, PrivateOrientationPublishesSeparatelyFromRawImuAndUsesSensorTime)
+{
+  sonar3d::protocol::ImuOrientation source;
+  source.header = sonar3d::testing::range_image(0).header;
+  source.quaternion = {0.5F, 0.5F, 0.5F, 0.5F};
+  const Recording recording({sonar3d::protocol::encode_packet(source)});
+  auto observer = std::make_shared<rclcpp::Node>("observer", "/sonar3d_replay_test");
+  std::vector<Imu::ConstSharedPtr> orientations;
+  const auto subscription = observer->create_subscription<Imu>(
+    "imu/data", rclcpp::QoS(10), [&orientations](Imu::ConstSharedPtr message) {
+      orientations.push_back(message);
+    });
+  PlayerProcess process(recording.path(), std::vector<std::string>{
+      "--vendor-orientation", "--startup-delay", "1"});
+  rclcpp::executors::SingleThreadedExecutor executor;
+  executor.add_node(observer);
+  const auto deadline = std::chrono::steady_clock::now() + 5s;
+  while (std::chrono::steady_clock::now() < deadline &&
+    (!process.finished() || orientations.empty()))
+  {
+    executor.spin_some();
+    std::this_thread::sleep_for(2ms);
+  }
+  ASSERT_TRUE(process.finished()) << process.output();
+  ASSERT_TRUE(process.succeeded()) << process.output();
+  ASSERT_EQ(orientations.size(), 1U);
+  EXPECT_EQ(orientations[0]->header.stamp.sec, source.header.timestamp->seconds);
+  EXPECT_EQ(orientations[0]->header.stamp.nanosec, source.header.timestamp->nanoseconds);
+  EXPECT_DOUBLE_EQ(orientations[0]->orientation.y, -0.5);
+  EXPECT_EQ(process.output().find("Published /sonar3d_replay_test/imu/data_raw"), std::string::npos);
+}
+
+TEST_F(ReplayTest, AttitudePreviewMatchesTheExactShotAndCloudRosTimestamp)
+{
+  sonar3d::protocol::ImuOrientation orientation;
+  orientation.header = sonar3d::testing::range_image(1).header;
+  orientation.quaternion = {0.5F, 0.5F, 0.5F, 0.5F};
+  auto mismatched = orientation;
+  mismatched.header.sequence_id = 2;  // Right counter, wrong acquisition time.
+  const Recording recording({
+      sonar3d::protocol::encode_packet(sonar3d::testing::range_image(0)),
+      sonar3d::protocol::encode_packet(orientation),
+      sonar3d::protocol::encode_packet(sonar3d::testing::range_image(1)),
+      sonar3d::protocol::encode_packet(sonar3d::testing::bitmap_image(
+          1, BitmapImageType::SIGNAL_STRENGTH_IMAGE)),
+      sonar3d::protocol::encode_packet(mismatched),
+      sonar3d::protocol::encode_packet(sonar3d::testing::range_image(2))});
+  auto observer = std::make_shared<rclcpp::Node>("observer", "/sonar3d_replay_test");
+  std::vector<Cloud::ConstSharedPtr> clouds;
+  std::vector<geometry_msgs::msg::TransformStamped> transforms;
+  const auto cloud_sub = observer->create_subscription<Cloud>(
+    "points", rclcpp::QoS(10), [&clouds](Cloud::ConstSharedPtr message) {
+      clouds.push_back(message);
+    });
+  const auto tf_sub = observer->create_subscription<tf2_msgs::msg::TFMessage>(
+    "/tf", rclcpp::QoS(100), [&transforms](tf2_msgs::msg::TFMessage::ConstSharedPtr message) {
+      for (const auto & transform : message->transforms) {
+        if (transform.child_frame_id == "sonar3d_link") {
+          transforms.push_back(transform);
+        }
+      }
+    });
+  PlayerProcess process(recording.path(), std::vector<std::string>{
+      "--vendor-orientation", "--orientation-frame", "local_attitude",
+      "--receive-time", "--startup-delay", "1"});
+  rclcpp::executors::SingleThreadedExecutor executor;
+  executor.add_node(observer);
+  const auto deadline = std::chrono::steady_clock::now() + 5s;
+  while (std::chrono::steady_clock::now() < deadline &&
+    (!process.finished() || clouds.empty() || transforms.empty()))
+  {
+    executor.spin_some();
+    std::this_thread::sleep_for(2ms);
+  }
+  ASSERT_TRUE(process.finished()) << process.output();
+  ASSERT_TRUE(process.succeeded()) << process.output();
+  ASSERT_EQ(clouds.size(), 1U);
+  ASSERT_EQ(transforms.size(), 1U);
+  EXPECT_EQ(transforms[0].header.stamp, clouds[0]->header.stamp);
+  EXPECT_EQ(transforms[0].header.frame_id, "local_attitude");
+  EXPECT_DOUBLE_EQ(transforms[0].transform.rotation.y, -0.5);
+  EXPECT_DOUBLE_EQ(transforms[0].transform.translation.x, 0.0);
+  EXPECT_NE(process.output().find("2 range images lack an exact orientation"), std::string::npos);
+}
+
 TEST_F(ReplayTest, PlaybackRecoversAndReportsActualPublicationCounts)
 {
   auto damaged = sonar3d::protocol::encode_packet(sonar3d::testing::range_image(0));
@@ -297,7 +405,7 @@ TEST_F(ReplayTest, PlaybackRecoversAndReportsActualPublicationCounts)
   auto malformed = sonar3d::testing::range_image(0);
   malformed.pixel_scale = -1;
   const Recording recording({
-      unknown_packet("type.googleapis.com/waterlinked.sonar.internal.ImuOrientation"),
+      unknown_packet("type.googleapis.com/waterlinked.sonar.internal.FutureOrientation"),
       damaged, sonar3d::protocol::encode_packet(malformed),
       sonar3d::protocol::encode_packet(sonar3d::testing::range_image(0))});
   auto observer = std::make_shared<rclcpp::Node>("observer", "/sonar3d_replay_test");

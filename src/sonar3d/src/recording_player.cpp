@@ -32,6 +32,8 @@
 #include <sensor_msgs/msg/imu.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <std_msgs/msg/header.hpp>
+#include <geometry_msgs/msg/transform_stamped.hpp>
+#include <tf2_ros/transform_broadcaster.hpp>
 
 #include "sonar3d/conversions.hpp"
 #include "sonar3d/playback_clock.hpp"
@@ -57,6 +59,8 @@ struct PlaybackOptions
   bool use_sensor_timestamps{true};
   bool intensity{true};
   bool validate_only{false};
+  bool vendor_orientation{false};
+  std::string orientation_frame;
   bool help{false};
 };
 
@@ -79,6 +83,8 @@ void print_usage(const char * executable)
     << "  --receive-time             Stamp products from the replay ROS clock\n"
     << "  --no-intensity             Omit the point cloud intensity field\n"
     << "  --validate-only            Check all supported conversions without publishing or pacing\n"
+    << "  --vendor-orientation       Publish experimental private attitude on imu/data\n"
+    << "  --orientation-frame FRAME  Attitude-only preview TF parent (requires --vendor-orientation)\n"
     << "  -h, --help                 Show this help\n";
 }
 
@@ -121,6 +127,10 @@ void print_usage(const char * executable)
       options.intensity = false;
     } else if (argument == "--validate-only") {
       options.validate_only = true;
+    } else if (argument == "--vendor-orientation") {
+      options.vendor_orientation = true;
+    } else if (argument == "--orientation-frame" || argument.rfind("--orientation-frame=", 0) == 0) {
+      options.orientation_frame = option_value(arguments, index, "--orientation-frame");
     } else if (argument == "--file" || argument.rfind("--file=", 0) == 0) {
       options.file = option_value(arguments, index, "--file");
     } else if (argument == "--output" || argument.rfind("--output=", 0) == 0) {
@@ -164,6 +174,13 @@ void print_usage(const char * executable)
   if (options.output.empty() && !options.storage_id.empty()) {
     throw std::invalid_argument("--storage requires --output");
   }
+  if (!options.orientation_frame.empty() &&
+    (!options.vendor_orientation || !options.output.empty() || options.validate_only ||
+    options.orientation_frame == options.frame_id || options.orientation_frame == options.imu_frame_id))
+  {
+    throw std::invalid_argument(
+      "--orientation-frame requires --vendor-orientation, publishing mode, and a distinct parent frame");
+  }
   return options;
 }
 
@@ -186,7 +203,8 @@ void print_usage(const char * executable)
     [&to_nanoseconds](const auto & value) -> std::optional<std::int64_t> {
       using MessageType = std::decay_t<decltype(value)>;
       if constexpr (std::is_same_v<MessageType, protocol::RangeImage>||
-      std::is_same_v<MessageType, protocol::BitmapImage>)
+      std::is_same_v<MessageType, protocol::BitmapImage> ||
+      std::is_same_v<MessageType, protocol::ImuOrientation>)
       {
         return value.header.timestamp ? to_nanoseconds(*value.header.timestamp) : std::nullopt;
       } else if constexpr (std::is_same_v<MessageType, protocol::ImuBatch>) {
@@ -256,6 +274,8 @@ void validate_recorded_message(const protocol::Message & source, bool use_sensor
         }
       } else if constexpr (std::is_same_v<MessageType, protocol::ImuBatch>) {
         conversions::validate_imu_source(message, use_sensor_timestamps);
+      } else if constexpr (std::is_same_v<MessageType, protocol::ImuOrientation>) {
+        conversions::validate_orientation_source(message, use_sensor_timestamps);
       }
     }, source);
 }
@@ -269,6 +289,8 @@ public:
     imu_frame_id_(options.imu_frame_id),
     use_sensor_timestamps_(options.use_sensor_timestamps),
     intensity_(options.intensity),
+    vendor_orientation_(options.vendor_orientation),
+    orientation_frame_(options.orientation_frame),
     mode_(options.validate_only ? OutputMode::VALIDATE :
       (options.output.empty() ? OutputMode::PUBLISH : OutputMode::BAG))
   {
@@ -277,6 +299,7 @@ public:
     shaded_image_.topic = resolve("shaded_image");
     point_cloud_.topic = resolve("points");
     imu_.topic = resolve("imu/data_raw");
+    orientation_.topic = resolve("imu/data");
     image_metadata_.topic = resolve("image_metadata");
     raw_packet_.topic = resolve("raw_packet");
     if (mode_ == OutputMode::BAG) {
@@ -295,8 +318,16 @@ public:
       advertise(shaded_image_, qos);
       advertise(point_cloud_, qos);
       advertise(imu_, qos);
+      if (vendor_orientation_) {
+        advertise(orientation_, qos);
+      }
       advertise(image_metadata_, qos);
       advertise(raw_packet_, qos);
+      if (!orientation_frame_.empty()) {
+        orientation_tf_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
+        RCLCPP_WARN(get_logger(),
+          "Experimental attitude-only preview: local z-up reference, unverified heading, no translation");
+      }
     }
   }
 
@@ -344,7 +375,24 @@ public:
           if (wanted(range_image_)) {
             image = conversions::make_range_image(message, header);
           }
-          const bool cloud = wanted(point_cloud_);
+          bool cloud = wanted(point_cloud_);
+          if (orientation_tf_) {
+            if (last_orientation_ && last_orientation_->header == message.header) {
+              const auto imu = conversions::make_orientation_message(*last_orientation_,
+                imu_frame_id_, fallback_stamp, use_sensor_timestamps_);
+              geometry_msgs::msg::TransformStamped transform;
+              transform.header = header;
+              transform.header.frame_id = orientation_frame_;
+              transform.child_frame_id = frame_id_;
+              transform.transform.rotation = imu.orientation;
+              orientation_tf_->sendTransform(transform);
+            } else {
+              // Keep the raw image, but never render a cloud using another
+              // shot's attitude (including a missing first orientation).
+              cloud = false;
+              ++missing_orientations_;
+            }
+          }
           if (cloud) {
             conversions::validate_point_cloud_source(message);
           }
@@ -397,6 +445,14 @@ public:
               emit(imu_, std::move(imu));
             }
           }
+        } else if constexpr (std::is_same_v<MessageType, protocol::ImuOrientation>) {
+          if ((vendor_orientation_ && wanted(orientation_)) || mode_ == OutputMode::VALIDATE) {
+            emit(orientation_, conversions::make_orientation_message(message,
+              imu_frame_id_, fallback_stamp, use_sensor_timestamps_));
+          }
+          if (orientation_tf_) {
+            last_orientation_ = message;
+          }
         }
       },
       source);
@@ -437,6 +493,7 @@ public:
   }
 
   [[nodiscard]] std::uint64_t unpaired_range_images() const {return unpaired_range_images_;}
+  [[nodiscard]] std::uint64_t missing_orientations() const {return missing_orientations_;}
 
   [[nodiscard]] const std::map<std::string, std::uint64_t> & outputs() const {return outputs_;}
   [[nodiscard]] OutputMode mode() const {return mode_;}
@@ -540,6 +597,11 @@ private:
   std::string imu_frame_id_;
   bool use_sensor_timestamps_;
   bool intensity_;
+  bool vendor_orientation_;
+  std::string orientation_frame_;
+  std::unique_ptr<tf2_ros::TransformBroadcaster> orientation_tf_;
+  std::optional<protocol::ImuOrientation> last_orientation_;
+  std::uint64_t missing_orientations_{};
   OutputMode mode_;
   CloudPairing pairing_;
   std::optional<protocol::MessageHeader> last_range_header_;
@@ -553,6 +615,7 @@ private:
   Output<sensor_msgs::msg::Image> shaded_image_;
   Output<sensor_msgs::msg::PointCloud2> point_cloud_;
   Output<sensor_msgs::msg::Imu> imu_;
+  Output<sensor_msgs::msg::Imu> orientation_;
   Output<msg::ImageMetadata> image_metadata_;
   Output<msg::RawPacket> raw_packet_;
   std::optional<std::int64_t> raw_stamp_;
@@ -705,6 +768,11 @@ std::optional<std::int64_t> first_recorded_stamp(std::istream & stream)
       node->get_logger(),
       "%" PRIu64 " range images had no signal-strength image; their points have zero intensity",
       node->unpaired_range_images());
+  }
+  if (node->missing_orientations() != 0) {
+    RCLCPP_WARN(node->get_logger(),
+      "%" PRIu64 " range images lack an exact orientation; omitted from attitude-only cloud preview",
+      node->missing_orientations());
   }
   for (const auto & [type, count] : unsupported_types) {
     RCLCPP_INFO(

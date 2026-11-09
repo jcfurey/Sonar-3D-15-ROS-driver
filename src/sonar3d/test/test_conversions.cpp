@@ -27,6 +27,49 @@
 namespace
 {
 
+TEST(Conversions, PrivateOrientationUsesScalarFirstAndChangesBothCoordinateBases)
+{
+  sonar3d::protocol::ImuOrientation source;
+  source.header.timestamp = sonar3d::protocol::Timestamp{123, 456};
+  source.quaternion = {0.5F, 0.5F, 0.5F, 0.5F};
+  const auto result = sonar3d::conversions::make_orientation_message(
+    source, "imu", builtin_interfaces::msg::Time{}, true, 1'000'000'000);
+  EXPECT_DOUBLE_EQ(result.orientation.w, 0.5);
+  EXPECT_DOUBLE_EQ(result.orientation.x, 0.5);
+  EXPECT_DOUBLE_EQ(result.orientation.y, -0.5);
+  EXPECT_DOUBLE_EQ(result.orientation.z, -0.5);
+  EXPECT_EQ(result.header.frame_id, "imu");
+  EXPECT_EQ(result.header.stamp.sec, 124);
+  EXPECT_EQ(result.header.stamp.nanosec, 456U);
+  EXPECT_DOUBLE_EQ(result.orientation_covariance[0], 0.0);
+  EXPECT_DOUBLE_EQ(result.angular_velocity_covariance[0], -1.0);
+  EXPECT_DOUBLE_EQ(result.linear_acceleration_covariance[0], -1.0);
+  // Positive vendor pitch becomes negative ROS pitch: x points up.
+  source.quaternion = {std::sqrt(0.5F), 0, std::sqrt(0.5F), 0};
+  const auto pitch = sonar3d::conversions::make_orientation_message(
+    source, "imu", builtin_interfaces::msg::Time{}).orientation;
+  EXPECT_NEAR(-2 * pitch.w * pitch.y, 1.0, 1e-7);
+}
+
+TEST(Conversions, PrivateOrientationRejectsIncompatibleOrInvalidEstimates)
+{
+  sonar3d::protocol::ImuOrientation source;
+  for (const auto & coefficients : std::vector<std::vector<float>>{
+      {}, {1, 0, 0}, {1, 0, 0, 0, 0}, {0, 0, 0, 0}, {2, 0, 0, 0},
+      {std::numeric_limits<float>::quiet_NaN(), 0, 0, 0},
+      {std::numeric_limits<float>::infinity(), 0, 0, 0}})
+  {
+    source.quaternion = coefficients;
+    EXPECT_THROW(sonar3d::conversions::validate_orientation_source(source), std::invalid_argument);
+  }
+  source.quaternion = {1.0001F, 0, 0, 0};
+  EXPECT_DOUBLE_EQ(sonar3d::conversions::make_orientation_message(
+      source, "imu", builtin_interfaces::msg::Time{}).orientation.w, 1.0);
+  source.header.timestamp = sonar3d::protocol::Timestamp{100, -1};
+  EXPECT_THROW(sonar3d::conversions::validate_orientation_source(source), std::invalid_argument);
+  EXPECT_NO_THROW(sonar3d::conversions::validate_orientation_source(source, false));
+}
+
 sonar3d::protocol::RangeImage test_range_image()
 {
   sonar3d::protocol::RangeImage image;

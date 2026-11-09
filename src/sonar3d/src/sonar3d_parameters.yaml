@@ -145,6 +145,11 @@ sonar3d:
     default_value: true
     description: "Broadcast the documented static transform from frame_id to imu_frame_id on /tf_static."
 
+  publish_vendor_orientation:
+    type: bool
+    default_value: false
+    description: "Experimental: publish decoded private GUI ImuOrientation on imu/data, orientation only in a local z-up reference with unverified heading. Does not enable private output on the sonar."
+
   point_cloud_intensity:
     type: bool
     default_value: true

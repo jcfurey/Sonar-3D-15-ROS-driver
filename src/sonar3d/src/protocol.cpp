@@ -20,6 +20,7 @@
 #include <utility>
 
 #include "WaterLinkedSonarIntegrationProtocol.pb.h"
+#include "WaterLinkedSonarInternalProtocol.pb.h"
 
 namespace sonar3d::protocol
 {
@@ -27,6 +28,7 @@ namespace
 {
 
 namespace vendor = waterlinked::sonar::protocol;
+namespace internal = waterlinked::sonar::internal;
 
 constexpr std::size_t kIdentifierSize = 4;
 constexpr std::size_t kLengthSize = 4;
@@ -201,6 +203,18 @@ void pack_message(const ImuBatch & source, google::protobuf::Any * destination)
   destination->PackFrom(message);
 }
 
+void pack_message(const ImuOrientation & source, google::protobuf::Any * destination)
+{
+  internal::ImuOrientation message;
+  to_vendor_header(source.header, message.mutable_header());
+  message.set_source_time_2(source.source_time_2);
+  message.set_source_time_3(source.source_time_3);
+  for (const auto value : source.quaternion) {
+    message.add_quaternion(value);
+  }
+  destination->PackFrom(message);
+}
+
 void pack_message(const UnknownMessage &, google::protobuf::Any *)
 {
   throw std::invalid_argument("cannot encode an unknown protobuf message without its payload");
@@ -345,6 +359,22 @@ DecodedPacket decode_packet(std::span<const std::uint8_t> bytes)
       throw ProtocolError(ErrorCode::PROTOBUF_PARSE_FAILED, true, "failed to unpack ImuBatch");
     }
     return DecodedPacket{version, from_vendor_imu_batch(message)};
+  }
+
+  if (packet.msg().Is<internal::ImuOrientation>()) {
+    internal::ImuOrientation message;
+    if (!packet.msg().UnpackTo(&message)) {
+      throw ProtocolError(ErrorCode::PROTOBUF_PARSE_FAILED, true,
+        "failed to unpack private ImuOrientation");
+    }
+    ImuOrientation result;
+    if (message.has_header()) {
+      result.header = from_vendor_header(message.header());
+    }
+    result.source_time_2 = message.source_time_2();
+    result.source_time_3 = message.source_time_3();
+    result.quaternion.assign(message.quaternion().begin(), message.quaternion().end());
+    return DecodedPacket{version, std::move(result)};
   }
 
   return DecodedPacket{version, UnknownMessage{packet.msg().type_url()}};

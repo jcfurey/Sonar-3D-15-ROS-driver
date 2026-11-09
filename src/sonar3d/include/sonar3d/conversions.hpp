@@ -74,6 +74,16 @@ void validate_sensor_timestamp(const std::optional<protocol::Timestamp> & stamp)
 void validate_point_cloud_source(const protocol::RangeImage & image);
 void validate_bitmap_source(const protocol::BitmapImage & image);
 void validate_imu_source(const protocol::ImuBatch & batch, bool use_sensor_timestamp = true);
+void validate_orientation_source(
+  const protocol::ImuOrientation & source, bool use_sensor_timestamp = true);
+
+// Orientation-only estimate in a local z-up reference with unverified heading.
+// The vendor body and world bases are both rotated 180 degrees about x.
+// Unmeasured angular velocity/acceleration are marked absent (covariance -1).
+[[nodiscard]] sensor_msgs::msg::Imu make_orientation_message(
+  const protocol::ImuOrientation & source, const std::string & frame_id,
+  const builtin_interfaces::msg::Time & fallback_stamp,
+  bool use_sensor_timestamp = true, std::int64_t sensor_offset_nanoseconds = 0);
 
 // Linear signal strength (about 30 to 10600) for a SIGNAL_STRENGTH_IMAGE
 // pixel, which Water Linked encodes as 100 log10(strength / 30); zero is no

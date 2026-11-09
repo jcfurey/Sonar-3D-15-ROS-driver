@@ -1,0 +1,14 @@
+// Observed private recording format, not a published Water Linked API.
+// See README.md, "Vendor orientation", for evidence and limitations.
+syntax = "proto3";
+package waterlinked.sonar.internal;
+import "WaterLinkedSonarIntegrationProtocol.proto";
+
+message ImuOrientation {
+  waterlinked.sonar.protocol.Header header = 1;
+  // Preserve these fields without assigning an undocumented meaning/unit.
+  uint32 source_time_2 = 2;
+  uint32 source_time_3 = 3;
+  // Observed packed float32 Hamilton quaternion, scalar first, body to world.
+  repeated float quaternion = 4;
+}

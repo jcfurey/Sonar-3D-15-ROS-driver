@@ -83,6 +83,35 @@ TEST(Protocol, RoundTripsRip1AndRip2)
   }
 }
 
+TEST(Protocol, DecodesPrivateOrientationFromAnHfRecording)
+{
+  // First packet in 167_ring.sonar, independent of our protobuf encoder.
+  const auto packet = from_hex(
+    "524950327f00000070f06f0a6e0a3d747970652e676f6f676c65617069732e636f6d2f"
+    "77617465726c696e6b65642e736f6e61722e696e7465726e616c2e496d754f7269656e"
+    "746174696f6e122d0a110a0c08bcfce7d60610a8ddaf9a0110da1a10c3d41518c9d4"
+    "15221024652bbf20702a3d92613dbfd04757bdb524a5ba");
+  const auto decoded = sonar3d::protocol::decode_packet(packet);
+  ASSERT_TRUE(std::holds_alternative<sonar3d::protocol::ImuOrientation>(decoded.message));
+  const auto & value = std::get<sonar3d::protocol::ImuOrientation>(decoded.message);
+  EXPECT_EQ(value.header.sequence_id, 3418U);
+  ASSERT_TRUE(value.header.timestamp);
+  EXPECT_EQ(value.header.timestamp->seconds, 1792671292);
+  EXPECT_EQ(value.header.timestamp->nanoseconds, 323743400);
+  EXPECT_EQ(value.source_time_2, 354883U);
+  EXPECT_EQ(value.source_time_3, 354889U);
+  ASSERT_EQ(value.quaternion.size(), 4U);
+  EXPECT_NEAR(value.quaternion[0], -0.669512, 1e-6);
+  EXPECT_NEAR(value.quaternion[2], -0.739770, 1e-6);
+  for (const auto version : {sonar3d::protocol::ProtocolVersion::RIP1,
+      sonar3d::protocol::ProtocolVersion::RIP2})
+  {
+    const auto roundtrip = sonar3d::protocol::decode_packet(
+      sonar3d::protocol::encode_packet(value, version));
+    EXPECT_EQ(std::get<sonar3d::protocol::ImuOrientation>(roundtrip.message), value);
+  }
+}
+
 TEST(Protocol, RoundTripsBitmapAndImuMessages)
 {
   sonar3d::protocol::BitmapImage bitmap;

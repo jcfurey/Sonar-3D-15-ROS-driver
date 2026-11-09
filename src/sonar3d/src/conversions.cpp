@@ -441,6 +441,50 @@ sensor_msgs::msg::Image make_bitmap_image(
   return message;
 }
 
+void validate_orientation_source(const protocol::ImuOrientation & source, bool use_sensor_timestamp)
+{
+  if (source.quaternion.size() != 4) {
+    throw std::invalid_argument("private IMU orientation must contain four quaternion coefficients");
+  }
+  double squared_norm = 0.0;
+  for (const auto value : source.quaternion) {
+    squared_norm += static_cast<double>(value) * value;
+  }
+  // Recordings have unit quaternions to within 3e-7. Reject incompatible
+  // payloads and invalid estimates instead of normalizing arbitrary vectors.
+  if (!std::isfinite(squared_norm) || std::abs(squared_norm - 1.0) > 0.01) {
+    throw std::invalid_argument("private IMU orientation quaternion is not finite and near unit");
+  }
+  if (use_sensor_timestamp) {
+    validate_sensor_timestamp(source.header.timestamp);
+  }
+}
+
+sensor_msgs::msg::Imu make_orientation_message(
+  const protocol::ImuOrientation & source, const std::string & frame_id,
+  const builtin_interfaces::msg::Time & fallback_stamp,
+  bool use_sensor_timestamp, std::int64_t sensor_offset_nanoseconds)
+{
+  validate_orientation_source(source, use_sensor_timestamp);
+  double squared_norm = 0.0;
+  for (const auto value : source.quaternion) {
+    squared_norm += static_cast<double>(value) * value;
+  }
+  const auto norm = std::sqrt(squared_norm);
+  sensor_msgs::msg::Imu result;
+  result.header = make_header(source.header, frame_id, fallback_stamp,
+    use_sensor_timestamp, sensor_offset_nanoseconds);
+  // C * R_vendor * C^-1, C = diag(1,-1,-1). Applying only a body-axis
+  // rotation would leave the reference z-down and invert the displayed tilt.
+  result.orientation.w = source.quaternion[0] / norm;
+  result.orientation.x = source.quaternion[1] / norm;
+  result.orientation.y = -source.quaternion[2] / norm;
+  result.orientation.z = -source.quaternion[3] / norm;
+  result.angular_velocity_covariance[0] = -1.0;
+  result.linear_acceleration_covariance[0] = -1.0;
+  return result;
+}
+
 std::vector<sensor_msgs::msg::Imu> make_imu_messages(
   const protocol::ImuBatch & source,
   const std::string & frame_id,
