@@ -52,6 +52,7 @@ PARAMETER_TYPES = {
     'linear_acceleration_stddev': float,
     'angular_velocity_stddev': float,
     'packet_stale_timeout': float,
+    'native_recording_queue_bytes': int,
 }
 
 

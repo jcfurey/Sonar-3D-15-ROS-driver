@@ -53,7 +53,8 @@ def generate_launch_description():
         DeclareLaunchArgument('imu_frame_id', default_value='sonar3d_imu_link'),
         DeclareLaunchArgument('namespace', default_value='sonar3d'),
         DeclareLaunchArgument('vendor_orientation', default_value='false',
-                              description='Experimental private attitude, local z-up, unverified heading'),
+                              description='Experimental private attitude, local z-up, '
+                              'unverified heading'),
         DeclareLaunchArgument('orientation_frame', default_value='sonar3d_attitude'),
         DeclareLaunchArgument('rviz', default_value='true'),
         DeclareLaunchArgument('rviz_images', default_value=LaunchConfiguration('rviz'),

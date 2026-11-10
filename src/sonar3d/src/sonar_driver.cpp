@@ -39,6 +39,19 @@ namespace
 
 using diagnostic_msgs::msg::DiagnosticStatus;
 
+msg::RecordingStatus recording_status(const RecordingState & state)
+{
+  msg::RecordingStatus message;
+  message.active = state.active;
+  message.path = state.path;
+  message.packets = state.packets;
+  message.bytes = state.bytes;
+  message.queued_bytes = state.queued_bytes;
+  message.dropped_packets = state.dropped_packets;
+  message.error = state.error;
+  return message;
+}
+
 // The sonar sends a shot's range and signal-strength images back to back.
 constexpr std::chrono::milliseconds kSignalImageWait{25};
 
@@ -148,6 +161,37 @@ SonarDriver::SonarDriver(const rclcpp::NodeOptions & options)
   diagnostics_.setHardwareID("Sonar 3D-15");
   diagnostics_.add("RIP stream", this, &SonarDriver::diagnose_stream);
   diagnostics_.add("Device", this, &SonarDriver::diagnose_device);
+  diagnostics_.add("Native recording", this, &SonarDriver::diagnose_recording);
+  start_recording_service_ = create_service<srv::StartRecording>(
+    "~/start_recording", [this](const srv::StartRecording::Request::SharedPtr request,
+    srv::StartRecording::Response::SharedPtr response) {
+      try {
+        if (!streaming_.load()) {
+          throw std::runtime_error("activate the driver before starting native recording");
+        }
+        native_recorder_.start(request->path, settings_.native_recording_queue_bytes);
+        response->success = true;
+        response->message = "Native recording started";
+        RCLCPP_INFO(get_logger(), "Recording exact RIP datagrams to %s", request->path.c_str());
+      } catch (const std::exception & error) {
+        response->success = false;
+        response->message = error.what();
+      }
+      response->status = recording_status(native_recorder_.state());
+    });
+  stop_recording_service_ = create_service<srv::StopRecording>(
+    "~/stop_recording", [this](const srv::StopRecording::Request::SharedPtr,
+    srv::StopRecording::Response::SharedPtr response) {
+      const auto state = native_recorder_.stop();
+      response->success = state.error.empty();
+      response->message = response->success ? "Native recording flushed and closed" : state.error;
+      response->status = recording_status(state);
+    });
+  recording_status_service_ = create_service<srv::GetRecordingStatus>(
+    "~/get_recording_status", [this](const srv::GetRecordingStatus::Request::SharedPtr,
+    srv::GetRecordingStatus::Response::SharedPtr response) {
+      response->status = recording_status(native_recorder_.state());
+    });
 
   if (parameter_listener_->get_params().autostart) {
     // Transition once the executor spins the node, so a component container
@@ -230,6 +274,8 @@ void SonarDriver::configure_driver()
   settings.max_sensor_clock_offset_ns = std::llround(parameters.max_sensor_clock_offset * 1.0e9);
   settings.imu_noise = {parameters.linear_acceleration_stddev, parameters.angular_velocity_stddev};
   settings.packet_stale_timeout = parameters.packet_stale_timeout;
+  settings.native_recording_queue_bytes =
+    static_cast<std::size_t>(parameters.native_recording_queue_bytes);
   settings.point_cloud_intensity = parameters.point_cloud_intensity;
   settings.expected_mode = parse_acoustics_mode(parameters.acoustics_mode);
   settings.http_port = static_cast<std::uint16_t>(parameters.http_port);
@@ -389,6 +435,10 @@ void SonarDriver::stop_streaming()
     receive_thread_.join();
   }
   streaming_.store(false);
+  const auto recording = native_recorder_.stop();
+  if (!recording.error.empty()) {
+    RCLCPP_ERROR(get_logger(), "Native recording is incomplete: %s", recording.error.c_str());
+  }
 }
 
 void SonarDriver::stop_configuration()
@@ -688,6 +738,8 @@ void SonarDriver::handle_datagram(const Datagram & datagram)
     return;
   }
 
+  // Capture independently of DDS subscribers and before decoding/sequence filtering.
+  native_recorder_.enqueue(datagram.bytes);
   const builtin_interfaces::msg::Time fallback_stamp = now();
   if (has_subscribers(raw_packet_publisher_)) {
     auto raw = std::make_unique<msg::RawPacket>();
@@ -1033,6 +1085,19 @@ bool SonarDriver::observe_sequence(
   clock_offset_.reset();
   pairing_.clear();
   return accept();
+}
+
+void SonarDriver::diagnose_recording(diagnostic_updater::DiagnosticStatusWrapper & status)
+{
+  const auto recording = native_recorder_.state();
+  status.summary(recording.error.empty() ? DiagnosticStatus::OK : DiagnosticStatus::ERROR,
+    recording.error.empty() ? (recording.active ? "recording" : "idle") : recording.error);
+  status.add("active", recording.active);
+  status.add("path", recording.path);
+  status.add("packets", recording.packets);
+  status.add("bytes", recording.bytes);
+  status.add("queued_bytes", recording.queued_bytes);
+  status.add("dropped_packets", recording.dropped_packets);
 }
 
 void SonarDriver::diagnose_stream(diagnostic_updater::DiagnosticStatusWrapper & status)

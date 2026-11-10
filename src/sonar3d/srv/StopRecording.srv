@@ -1,0 +1,5 @@
+---
+# Success means all accepted datagrams were written, fsynced, and closed.
+bool success
+string message
+sonar3d/RecordingStatus status

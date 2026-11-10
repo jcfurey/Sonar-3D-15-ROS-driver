@@ -84,7 +84,8 @@ void print_usage(const char * executable)
     << "  --no-intensity             Omit the point cloud intensity field\n"
     << "  --validate-only            Check all supported conversions without publishing or pacing\n"
     << "  --vendor-orientation       Publish experimental private attitude on imu/data\n"
-    << "  --orientation-frame FRAME  Attitude-only preview TF parent (requires --vendor-orientation)\n"
+    << "  --orientation-frame FRAME  Attitude-only preview TF parent "
+    "(requires --vendor-orientation)\n"
     << "  -h, --help                 Show this help\n";
 }
 
@@ -129,7 +130,7 @@ void print_usage(const char * executable)
       options.validate_only = true;
     } else if (argument == "--vendor-orientation") {
       options.vendor_orientation = true;
-    } else if (argument == "--orientation-frame" || argument.rfind("--orientation-frame=", 0) == 0) {
+    } else if (argument == "--orientation-frame" || argument.starts_with("--orientation-frame=")) {
       options.orientation_frame = option_value(arguments, index, "--orientation-frame");
     } else if (argument == "--file" || argument.rfind("--file=", 0) == 0) {
       options.file = option_value(arguments, index, "--file");
@@ -176,10 +177,12 @@ void print_usage(const char * executable)
   }
   if (!options.orientation_frame.empty() &&
     (!options.vendor_orientation || !options.output.empty() || options.validate_only ||
-    options.orientation_frame == options.frame_id || options.orientation_frame == options.imu_frame_id))
+    options.orientation_frame == options.frame_id ||
+    options.orientation_frame == options.imu_frame_id))
   {
     throw std::invalid_argument(
-      "--orientation-frame requires --vendor-orientation, publishing mode, and a distinct parent frame");
+      "--orientation-frame requires --vendor-orientation, publishing mode, "
+      "and a distinct parent frame");
   }
   return options;
 }
@@ -203,7 +206,7 @@ void print_usage(const char * executable)
     [&to_nanoseconds](const auto & value) -> std::optional<std::int64_t> {
       using MessageType = std::decay_t<decltype(value)>;
       if constexpr (std::is_same_v<MessageType, protocol::RangeImage>||
-      std::is_same_v<MessageType, protocol::BitmapImage> ||
+      std::is_same_v<MessageType, protocol::BitmapImage>||
       std::is_same_v<MessageType, protocol::ImuOrientation>)
       {
         return value.header.timestamp ? to_nanoseconds(*value.header.timestamp) : std::nullopt;
@@ -326,7 +329,8 @@ public:
       if (!orientation_frame_.empty()) {
         orientation_tf_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
         RCLCPP_WARN(get_logger(),
-          "Experimental attitude-only preview: local z-up reference, unverified heading, no translation");
+          "Experimental attitude-only preview: local z-up reference, "
+          "unverified heading, no translation");
       }
     }
   }
@@ -492,11 +496,11 @@ public:
     }
   }
 
-  [[nodiscard]] std::uint64_t unpaired_range_images() const {return unpaired_range_images_;}
-  [[nodiscard]] std::uint64_t missing_orientations() const {return missing_orientations_;}
+  [[nodiscard]] std::uint64_t unpaired_range_images() const{return unpaired_range_images_;}
+  [[nodiscard]] std::uint64_t missing_orientations() const{return missing_orientations_;}
 
-  [[nodiscard]] const std::map<std::string, std::uint64_t> & outputs() const {return outputs_;}
-  [[nodiscard]] OutputMode mode() const {return mode_;}
+  [[nodiscard]] const std::map<std::string, std::uint64_t> & outputs() const{return outputs_;}
+  [[nodiscard]] OutputMode mode() const{return mode_;}
 
   // Close the bag so its metadata is complete before the summary is printed.
   void finish() {writer_.reset();}
@@ -771,7 +775,8 @@ std::optional<std::int64_t> first_recorded_stamp(std::istream & stream)
   }
   if (node->missing_orientations() != 0) {
     RCLCPP_WARN(node->get_logger(),
-      "%" PRIu64 " range images lack an exact orientation; omitted from attitude-only cloud preview",
+      "%" PRIu64 " range images lack an exact orientation; "
+      "omitted from attitude-only cloud preview",
       node->missing_orientations());
   }
   for (const auto & [type, count] : unsupported_types) {

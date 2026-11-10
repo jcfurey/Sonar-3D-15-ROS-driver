@@ -1,0 +1,6 @@
+# Absolute path on the driver host. Parent must exist; file must not exist.
+string path
+---
+bool success
+string message
+sonar3d/RecordingStatus status

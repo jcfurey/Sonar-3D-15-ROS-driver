@@ -342,7 +342,8 @@ TEST_F(ReplayTest, PrivateOrientationPublishesSeparatelyFromRawImuAndUsesSensorT
   EXPECT_EQ(orientations[0]->header.stamp.sec, source.header.timestamp->seconds);
   EXPECT_EQ(orientations[0]->header.stamp.nanosec, source.header.timestamp->nanoseconds);
   EXPECT_DOUBLE_EQ(orientations[0]->orientation.y, -0.5);
-  EXPECT_EQ(process.output().find("Published /sonar3d_replay_test/imu/data_raw"), std::string::npos);
+  EXPECT_EQ(process.output().find("Published /sonar3d_replay_test/imu/data_raw"),
+      std::string::npos);
 }
 
 TEST_F(ReplayTest, AttitudePreviewMatchesTheExactShotAndCloudRosTimestamp)

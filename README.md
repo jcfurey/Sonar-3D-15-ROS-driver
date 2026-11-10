@@ -391,6 +391,66 @@ is converting. The OS can adjust or clamp the request; `/diagnostics` reports
 the effective socket value as `udp_receive_buffer_bytes`. This setting
 changes only the driver's socket.
 
+## Native recording during live operation
+
+With the driver active, record an MCAP bag and a native `.sonar` file together:
+
+```bash
+ros2 run sonar3d sonar_record_bag --output /absolute/path/to/new_dive
+# Ctrl+C pauses the bag, drains/fsyncs the native writer, then finalizes the bag.
+```
+
+The parent directory must exist; the output directory must be new. The command
+creates `new_dive/sonar.sonar` and `new_dive/native_recording.json` alongside
+the bag. The manifest reports final packet/byte counts and any capture error.
+The default bag topics are the driver's raw packets, images, points, metadata,
+public raw IMU, `/tf_static`, and `/diagnostics`. Add other vehicle topics with
+standard bag arguments after `--`, for example:
+
+```bash
+ros2 run sonar3d sonar_record_bag --output /data/new_dive \
+  --driver-node /sonar3d/sonar3d_driver -- \
+  --topics /sonar3d/raw_packet /camera/image_raw /tf /tf_static /odom /diagnostics
+```
+
+Use `--duration 60` for a timed capture. `--driver-node` identifies the fully
+qualified lifecycle node; its default is `/sonar3d/sonar3d_driver`. The helper
+starts the bag paused, starts native capture, then resumes the bag. On exit it
+pauses the bag before stopping native capture. Native capture therefore has
+small pre/post-roll around the bag, rather than exact timestamp boundaries.
+Wait for `RECORDING READY` before beginning a test. Pausing the bag separately
+does not pause native capture; use this helper's Ctrl+C to stop both.
+
+Native capture does not require ROS topic subscribers or `publish_raw_packets`.
+It stores accepted-source UDP datagrams before decoding and sequence checks,
+preserving unknown fields, duplicates, and damaged packets. The format is the
+same concatenation of RIP datagrams used by the reference `.sonar` files;
+no device-side recording API or reconstruction of processed clouds is involved.
+It captures only products the sonar actually transmits. Packet loss before the
+host receives a datagram cannot be recovered by this writer.
+
+The receive thread enqueues data to a disk worker. The default bounded queue is
+64 MiB (`native_recording_queue_bytes`), plus one in-flight datagram. Queue
+overflow or disk errors stop capture, persist an error in the services and
+`Native recording` diagnostic, and cause the helper to exit unsuccessfully.
+Existing files are never overwritten. Deactivation/shutdown drains and closes
+an active capture. A forced process kill or power loss cannot guarantee a flush.
+
+For another bag orchestration script, call the driver's services directly:
+
+```bash
+ros2 service call /sonar3d/sonar3d_driver/start_recording sonar3d/srv/StartRecording \
+  '{path: /absolute/path/to/dive.sonar}'
+ros2 service call /sonar3d/sonar3d_driver/get_recording_status sonar3d/srv/GetRecordingStatus '{}'
+ros2 service call /sonar3d/sonar3d_driver/stop_recording sonar3d/srv/StopRecording '{}'
+```
+
+Starting requires an active driver and an absolute `.sonar` path whose parent
+exists. Stop waits for accepted packets to be written and fsynced. Check
+`success` and `status.error`; an incomplete recording remains an error until a
+new capture starts. Repeated stops are safe. Ordinary `ros2 bag record` alone
+does not invoke these services.
+
 ## Recording playback
 
 Playback is native C++:
@@ -607,6 +667,7 @@ directly with `--output` as above):
 
 ```bash
 ros2 bag record \
+  /sonar3d/raw_packet \
   /sonar3d/range_image \
   /sonar3d/intensity_image \
   /sonar3d/shaded_image \
@@ -736,6 +797,15 @@ replay also attaches the recording's SHA-256 to live snapshots; when starting
 the image viewer separately for replay, pass `--source-recording survey.sonar`.
 
 ## Tests
+
+Native capture tests cover exact-byte preservation, exclusive file creation,
+queue overflow, restart, destructor/deactivation flushing, and capture with all
+ROS data products disabled. To additionally round-trip vendor recordings:
+
+```bash
+SONAR3D_REFERENCE_DIR="$HOME/Downloads" colcon test --packages-select sonar3d \
+  --ctest-args -R test_native_recorder --output-on-failure
+```
 
 ```bash
 colcon test --packages-select sonar3d --return-code-on-test-failure

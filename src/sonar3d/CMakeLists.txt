@@ -31,7 +31,9 @@ find_package(tf2_ros REQUIRED)
 find_package(ZLIB REQUIRED)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
-  "msg/ImageMetadata.msg" "msg/RawPacket.msg" DEPENDENCIES std_msgs)
+  "msg/ImageMetadata.msg" "msg/RawPacket.msg" "msg/RecordingStatus.msg"
+  "srv/StartRecording.srv" "srv/StopRecording.srv" "srv/GetRecordingStatus.srv"
+  DEPENDENCIES std_msgs)
 rosidl_get_typesupport_target(sonar3d_typesupport ${PROJECT_NAME} rosidl_typesupport_cpp)
 
 # Ubuntu's libsnappy-dev exports Snappy::snappy on newer releases. Retain a
@@ -76,7 +78,7 @@ target_link_libraries(
 )
 
 file(GLOB_RECURSE sonar3d_sources CONFIGURE_DEPENDS
-  "src/*.cpp" "src/*.yaml" "include/*.hpp" "proto/*.proto" "msg/*.msg")
+  "src/*.cpp" "src/*.yaml" "include/*.hpp" "proto/*.proto" "msg/*.msg" "srv/*.srv")
 list(APPEND sonar3d_sources "${CMAKE_CURRENT_SOURCE_DIR}/CMakeLists.txt"
   "${CMAKE_CURRENT_SOURCE_DIR}/package.xml")
 list(SORT sonar3d_sources)
@@ -108,7 +110,7 @@ target_link_libraries(
     ${sonar3d_typesupport}
 )
 
-add_library(sonar3d_io SHARED src/http_client.cpp src/udp_receiver.cpp)
+add_library(sonar3d_io SHARED src/http_client.cpp src/udp_receiver.cpp src/native_recorder.cpp)
 target_compile_features(sonar3d_io PUBLIC cxx_std_20)
 target_include_directories(
   sonar3d_io
@@ -198,6 +200,9 @@ install(PROGRAMS tools/sonar_image_publisher.py DESTINATION lib/${PROJECT_NAME}
   RENAME sonar_image_publisher)
 install(FILES tools/sonar_image_science.py DESTINATION lib/${PROJECT_NAME})
 
+install(PROGRAMS tools/sonar_record_bag.py DESTINATION lib/${PROJECT_NAME}
+  RENAME sonar_record_bag)
+
 if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
   find_package(ament_cmake_pytest REQUIRED)
@@ -219,6 +224,7 @@ if(BUILD_TESTING)
     test/test_udp_receiver.cpp
     test/test_driver_stream.cpp
     test/test_recording_player.cpp
+    test/test_native_recorder.cpp
   )
   ament_lint_auto_find_test_dependencies()
   ament_add_pytest_test(test_image_science test/test_image_science.py
@@ -250,6 +256,11 @@ if(BUILD_TESTING)
   ament_add_gtest(test_sensor_clock test/test_sensor_clock.cpp)
   target_include_directories(
     test_sensor_clock PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+
+  ament_add_gtest(test_native_recorder test/test_native_recorder.cpp)
+  target_link_libraries(test_native_recorder sonar3d_io sonar3d_protocol)
+  ament_add_pytest_test(test_record_bag test/test_record_bag.py
+    APPEND_ENV PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/tools PYTEST_DISABLE_PLUGIN_AUTOLOAD=1)
 
   ament_add_gtest(test_udp_receiver test/test_udp_receiver.cpp)
   target_link_libraries(test_udp_receiver sonar3d_io)

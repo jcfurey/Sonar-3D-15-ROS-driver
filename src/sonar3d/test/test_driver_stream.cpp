@@ -8,7 +8,11 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <cstdlib>
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <string>
@@ -221,6 +225,52 @@ protected:
   std::vector<rclcpp::SubscriptionBase::SharedPtr> subscriptions_;
   rclcpp::Subscription<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr diagnostics_;
 };
+
+TEST_P(DriverStream, NativeRecordingNeedsNoSubscribersAndDeactivationFlushes)
+{
+  start(false);
+  char pattern[] = "/tmp/sonar3d-native-stream-XXXXXX";
+  const auto directory = mkdtemp(pattern);
+  ASSERT_NE(directory, nullptr);
+  const auto path = std::string(directory) + "/capture.sonar";
+  struct Cleanup
+  {
+    std::string path;
+    ~Cleanup() {std::filesystem::remove_all(path);}
+  } cleanup{directory};
+  const auto starter = observer_->create_client<sonar3d::srv::StartRecording>(
+    "/sonar3d_stream_test/sonar3d_driver/start_recording");
+  ASSERT_TRUE(wait_for([&] {return starter->service_is_ready();}));
+  auto request = std::make_shared<sonar3d::srv::StartRecording::Request>();
+  request->path = path;
+  auto beginning = starter->async_send_request(request);
+  ASSERT_TRUE(wait_for([&] {return beginning.wait_for(0s) == std::future_status::ready;}));
+  ASSERT_TRUE(beginning.get()->success);
+  const auto good = sonar3d::protocol::encode_packet(sonar3d::testing::range_image(42));
+  auto bad = good;
+  bad.back() ^= 0xff;
+  // Products and raw publication are disabled; duplicates and bad CRCs must
+  // still reach the native file before the decoder drops them.
+  for (const auto & packet : {good, good, bad}) {
+    sender_.send(port_, packet, destination_.c_str());
+  }
+  ASSERT_TRUE(wait_for([this] {
+      return metric("duplicates") == 1 && metric("malformed_packets") == 1;
+    }));
+  ASSERT_EQ(driver_->deactivate().id(), lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE);
+  std::ifstream file(path, std::ios::binary);
+  const std::vector<std::uint8_t> actual{
+    std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()};
+  auto expected = good;
+  expected.insert(expected.end(), good.begin(), good.end());
+  expected.insert(expected.end(), bad.begin(), bad.end());
+  EXPECT_EQ(actual, expected);
+  request->path = std::string(directory) + "/inactive.sonar";
+  auto inactive = starter->async_send_request(request);
+  ASSERT_TRUE(wait_for([&] {return inactive.wait_for(0s) == std::future_status::ready;}));
+  EXPECT_FALSE(inactive.get()->success);
+  EXPECT_FALSE(std::filesystem::exists(request->path));
+}
 
 TEST_P(DriverStream, PrivateOrientationIsOptInAndMalformedDataCannotPoisonSequence)
 {

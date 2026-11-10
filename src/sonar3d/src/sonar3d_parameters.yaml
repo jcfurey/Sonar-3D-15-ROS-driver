@@ -200,3 +200,10 @@ sonar3d:
     description: "Age in seconds after which an active RIP stream is diagnosed as stale."
     validation:
       bounds<>: [0.1, 60.0]
+
+  native_recording_queue_bytes:
+    type: int
+    default_value: 67108864
+    description: "Maximum queued native recording bytes. Overflow stops capture with an error; disk I/O never runs on the UDP receive thread. One in-flight datagram is additional."
+    validation:
+      bounds<>: [65507, 1073741824]

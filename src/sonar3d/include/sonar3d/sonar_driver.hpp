@@ -32,6 +32,10 @@
 #include <tf2_ros/static_transform_broadcaster.hpp>
 
 #include "sonar3d/acoustics_mode.hpp"
+#include "sonar3d/native_recorder.hpp"
+#include "sonar3d/srv/start_recording.hpp"
+#include "sonar3d/srv/stop_recording.hpp"
+#include "sonar3d/srv/get_recording_status.hpp"
 #include "sonar3d/conversions.hpp"
 #include "sonar3d/http_client.hpp"
 #include "sonar3d/protocol.hpp"
@@ -139,6 +143,7 @@ private:
     std::int64_t max_sensor_clock_offset_ns{0};
     conversions::ImuNoise imu_noise;
     double packet_stale_timeout{2.0};
+    std::size_t native_recording_queue_bytes{64U * 1024U * 1024U};
     bool point_cloud_intensity{true};
     // From acoustics_mode: images are checked against it even when
     // configure_sonar is false.
@@ -229,6 +234,7 @@ private:
     const std::optional<protocol::Timestamp> & timestamp);
   void diagnose_stream(diagnostic_updater::DiagnosticStatusWrapper & status);
   void diagnose_device(diagnostic_updater::DiagnosticStatusWrapper & status);
+  void diagnose_recording(diagnostic_updater::DiagnosticStatusWrapper & status);
   void publish_imu_transform();
   void start_configuration(const ConfigurationRequest & request);
   // Runs on configuration_thread_: applies the request, repeating it after
@@ -247,6 +253,10 @@ private:
 
   // Configured state.
   std::unique_ptr<UdpReceiver> receiver_;
+  NativeRecorder native_recorder_;
+  rclcpp::Service<srv::StartRecording>::SharedPtr start_recording_service_;
+  rclcpp::Service<srv::StopRecording>::SharedPtr stop_recording_service_;
+  rclcpp::Service<srv::GetRecordingStatus>::SharedPtr recording_status_service_;
   Publisher<sensor_msgs::msg::Image> range_image_publisher_;
   Publisher<sensor_msgs::msg::Image> intensity_image_publisher_;
   Publisher<sensor_msgs::msg::Image> shaded_image_publisher_;

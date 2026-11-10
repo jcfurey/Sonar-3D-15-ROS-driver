@@ -444,7 +444,8 @@ sensor_msgs::msg::Image make_bitmap_image(
 void validate_orientation_source(const protocol::ImuOrientation & source, bool use_sensor_timestamp)
 {
   if (source.quaternion.size() != 4) {
-    throw std::invalid_argument("private IMU orientation must contain four quaternion coefficients");
+    throw std::invalid_argument(
+        "private IMU orientation must contain four quaternion coefficients");
   }
   double squared_norm = 0.0;
   for (const auto value : source.quaternion) {
