@@ -40,7 +40,8 @@ def replay_setup(context):
             args.extend(['--orientation-frame', fixed])
     return [SetLaunchConfiguration('replay_fixed_frame', fixed), Node(
         package='sonar3d', executable='sonar_replay',
-        namespace=LaunchConfiguration('namespace'), output='screen', arguments=args)]
+        namespace=LaunchConfiguration('namespace'), output='screen', arguments=args,
+        respawn=LaunchConfiguration('loop'), respawn_delay=0.25)]
 
 
 def generate_launch_description():
@@ -48,6 +49,8 @@ def generate_launch_description():
     arguments = [
         DeclareLaunchArgument('file', description='Absolute path to the .sonar recording'),
         DeclareLaunchArgument('realtime_factor', default_value='1.0'),
+        DeclareLaunchArgument('loop', default_value='false',
+                              description='Restart the recording after EOF'),
         DeclareLaunchArgument('startup_delay', default_value='2.0'),
         DeclareLaunchArgument('frame_id', default_value='sonar3d_link'),
         DeclareLaunchArgument('imu_frame_id', default_value='sonar3d_imu_link'),

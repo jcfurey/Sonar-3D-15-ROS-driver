@@ -648,6 +648,7 @@ Optional launch arguments are `realtime_factor`, `startup_delay`, `frame_id`,
 `imu_frame_id`, `namespace`, `vendor_orientation`, `orientation_frame`, and
 `rviz` (`false` for headless replay). Closing RViz stops replay;
 after recording EOF, RViz stays open with the last frame.
+Set `loop:=true` to restart playback after EOF while keeping RViz open.
 
 In the Nautilus workspace, the host helper stages a recording into the shared
 `/tmp` mount and passes the current display credentials to the GPU container:
