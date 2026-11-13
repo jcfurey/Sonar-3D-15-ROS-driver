@@ -41,6 +41,9 @@ TEST(UdpReceiver, NonblockingReceivePreservesPacketOwnershipAndSource)
   ASSERT_TRUE(received_second);
   EXPECT_EQ(received_first->bytes, first);
   EXPECT_EQ(received_second->bytes, second);
+  EXPECT_GT(received_first->receive_utc_ns, 0);
+  EXPECT_GT(received_first->receive_monotonic_ns, 0);
+  EXPECT_GE(received_second->receive_monotonic_ns, received_first->receive_monotonic_ns);
   EXPECT_EQ(sonar3d::format_ipv4(received_first->source_address), "127.0.0.1");
   EXPECT_FALSE(receiver.receive());
 }

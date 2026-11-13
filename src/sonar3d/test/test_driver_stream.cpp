@@ -878,11 +878,18 @@ TEST_P(DriverStream, RawPacketsPreserveDuplicatesUnsupportedProductsAndDamagedBy
   start();
   subscribe();
   std::vector<sonar3d::msg::RawPacket::ConstSharedPtr> raw;
+  std::vector<std_msgs::msg::String::ConstSharedPtr> timing;
+  const auto timing_subscription = observer_->create_subscription<std_msgs::msg::String>(
+    "/session/timing/observations", rclcpp::QoS(100),
+    [&timing](std_msgs::msg::String::ConstSharedPtr message) {timing.push_back(message);});
   const auto subscription = observer_->create_subscription<sonar3d::msg::RawPacket>(
     "raw_packet", rclcpp::QoS(100),
     [&raw](sonar3d::msg::RawPacket::ConstSharedPtr message) {raw.push_back(message);});
   ASSERT_TRUE(discovered());
   ASSERT_TRUE(wait_for([this] {return driver_->count_subscribers("raw_packet") == 1;}));
+  ASSERT_TRUE(wait_for([this] {
+    return driver_->count_subscribers("/session/timing/observations") == 1;
+  }));
   const auto range = sonar3d::protocol::encode_packet(sonar3d::testing::range_image(0));
   auto unsupported = sonar3d::testing::bitmap_image(0, BitmapImageType::SIGNAL_STRENGTH_IMAGE);
   unsupported.type = static_cast<BitmapImageType>(99);
@@ -893,12 +900,14 @@ TEST_P(DriverStream, RawPacketsPreserveDuplicatesUnsupportedProductsAndDamagedBy
   for (const auto & bytes : packets) {
     sender_.send(port_, bytes, destination_.c_str());
   }
-  ASSERT_TRUE(wait_for([&raw] {return raw.size() == 4;}));
+  ASSERT_TRUE(wait_for([&raw, &timing] {return raw.size() == 4 && timing.size() == 4;}));
   for (std::size_t index = 0; index < raw.size(); ++index) {
     EXPECT_EQ(raw[index]->data, packets[index]);
     EXPECT_EQ(raw[index]->packet_index, index);
     EXPECT_EQ(raw[index]->source_address, "127.0.0.1");
     EXPECT_EQ(raw[index]->header.frame_id, "test_sonar");
+    EXPECT_NE(timing[index]->data.find("\"ingress_id\":" + std::to_string(index)), std::string::npos);
+    EXPECT_NE(timing[index]->data.find("\"boundary\":\"udp_datagram\""), std::string::npos);
     EXPECT_NEAR((driver_->now() - rclcpp::Time(raw[index]->header.stamp)).seconds(), 0.0, 0.5);
   }
   ASSERT_TRUE(wait_for([this] {return metric("crc_failures") == 1;}));

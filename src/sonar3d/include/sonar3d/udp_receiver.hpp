@@ -24,6 +24,9 @@ struct Datagram
   std::vector<std::uint8_t> bytes;
   // IPv4 source address in host byte order.
   std::uint32_t source_address{};
+  // Application ingress, immediately after recvfrom and before copying/decoding.
+  std::int64_t receive_utc_ns{};
+  std::int64_t receive_monotonic_ns{};
 };
 
 // Parse a literal dotted-quad IPv4 address into host byte order.

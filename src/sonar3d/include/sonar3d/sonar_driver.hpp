@@ -29,6 +29,7 @@
 #include <sensor_msgs/msg/imu.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <std_msgs/msg/header.hpp>
+#include <std_msgs/msg/string.hpp>
 #include <tf2_ros/static_transform_broadcaster.hpp>
 
 #include "sonar3d/acoustics_mode.hpp"
@@ -262,6 +263,8 @@ private:
   Publisher<sensor_msgs::msg::Image> shaded_image_publisher_;
   Publisher<msg::ImageMetadata> image_metadata_publisher_;
   Publisher<msg::RawPacket> raw_packet_publisher_;
+  Publisher<std_msgs::msg::String> ingress_timing_publisher_;
+  std::int64_t ingress_epoch_ns_{};
   Publisher<sensor_msgs::msg::PointCloud2> point_cloud_publisher_;
   Publisher<sensor_msgs::msg::Imu> imu_publisher_;
   Publisher<sensor_msgs::msg::Imu> orientation_publisher_;

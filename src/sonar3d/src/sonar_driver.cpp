@@ -298,6 +298,8 @@ void SonarDriver::configure_driver()
   if (parameters.publish_raw_packets) {
     raw_packet_publisher_ = create_publisher<msg::RawPacket>(
       "raw_packet", rclcpp::SystemDefaultsQoS().keep_last(100), product_options);
+    ingress_timing_publisher_ = create_publisher<std_msgs::msg::String>(
+      "/session/timing/observations", rclcpp::SystemDefaultsQoS().keep_last(100));
   }
   if (parameters.publish_range_image || parameters.publish_bitmap_images) {
     image_metadata_publisher_ = create_publisher<msg::ImageMetadata>(
@@ -366,6 +368,7 @@ SonarDriver::CallbackReturn SonarDriver::on_activate(const rclcpp_lifecycle::Sta
 {
   // Activate the publishers before the receive thread can use them.
   rclcpp_lifecycle::LifecycleNode::on_activate(state);
+  ingress_epoch_ns_ = steady_time_nanoseconds();
   range_sequence_ = {};
   intensity_sequence_ = {};
   shaded_sequence_ = {};
@@ -460,6 +463,7 @@ void SonarDriver::release()
   shaded_image_publisher_.reset();
   image_metadata_publisher_.reset();
   raw_packet_publisher_.reset();
+  ingress_timing_publisher_.reset();
   point_cloud_publisher_.reset();
   imu_publisher_.reset();
   orientation_publisher_.reset();
@@ -741,6 +745,19 @@ void SonarDriver::handle_datagram(const Datagram & datagram)
   // Capture independently of DDS subscribers and before decoding/sequence filtering.
   native_recorder_.enqueue(datagram.bytes);
   const builtin_interfaces::msg::Time fallback_stamp = now();
+  if (has_subscribers(ingress_timing_publisher_)) {
+    // A companion record preserves ingress clocks without changing RawPacket's
+    // schema, keeping existing bags and consumers compatible.
+    std_msgs::msg::String timing;
+    timing.data = "{\"schema_version\":1,\"source_id\":\"sonar3d\",\"instance\":\"" +
+      std::to_string(ingress_epoch_ns_) + "\",\"ingress_id\":" +
+      std::to_string(value(metrics_.datagrams) - 1) + ",\"raw_header_stamp_ns\":" +
+      std::to_string(rclcpp::Time(fallback_stamp).nanoseconds()) +
+      ",\"receipt\":{\"utc_ns\":" + std::to_string(datagram.receive_utc_ns) +
+      ",\"monotonic_ns\":" + std::to_string(datagram.receive_monotonic_ns) +
+      "},\"boundary\":\"udp_datagram\",\"quality\":\"unverified_device_clock\",\"uncertainty_ns\":null}";
+    ingress_timing_publisher_->publish(std::move(timing));
+  }
   if (has_subscribers(raw_packet_publisher_)) {
     auto raw = std::make_unique<msg::RawPacket>();
     raw->header.stamp = fallback_stamp;

@@ -194,6 +194,10 @@ std::optional<Datagram> UdpReceiver::receive()
   }
 
   Datagram datagram;
+  datagram.receive_utc_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+    std::chrono::system_clock::now().time_since_epoch()).count();
+  datagram.receive_monotonic_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+    std::chrono::steady_clock::now().time_since_epoch()).count();
   datagram.bytes.assign(buffer_.begin(), buffer_.begin() + static_cast<std::size_t>(received));
   datagram.source_address = ntohl(source.sin_addr.s_addr);
   return datagram;
