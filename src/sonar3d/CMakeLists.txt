@@ -78,7 +78,7 @@ target_link_libraries(
 )
 
 file(GLOB_RECURSE sonar3d_sources CONFIGURE_DEPENDS
-  "src/*.cpp" "src/*.yaml" "include/*.hpp" "proto/*.proto" "msg/*.msg" "srv/*.srv")
+  "src/*.cpp" "src/*.hpp" "src/*.yaml" "include/*.hpp" "proto/*.proto" "msg/*.msg" "srv/*.srv")
 list(APPEND sonar3d_sources "${CMAKE_CURRENT_SOURCE_DIR}/CMakeLists.txt"
   "${CMAKE_CURRENT_SOURCE_DIR}/package.xml")
 list(SORT sonar3d_sources)
@@ -156,6 +156,13 @@ target_link_libraries(
 )
 rclcpp_components_register_nodes(sonar3d_component "sonar3d::SonarDriver")
 
+# File-only timing extraction shares the full validated RIP decoder. It never
+# initializes ROS or opens a sensor connection.
+add_library(sonar3d_timing STATIC src/packet_timing.cpp)
+target_link_libraries(sonar3d_timing PUBLIC sonar3d_protocol nlohmann_json::nlohmann_json)
+add_executable(sonar_packet_timing src/packet_timing_cli.cpp)
+target_link_libraries(sonar_packet_timing PRIVATE sonar3d_timing)
+
 add_executable(sonar_publisher src/sonar_publisher.cpp)
 target_link_libraries(sonar_publisher PRIVATE sonar3d_component)
 
@@ -189,7 +196,7 @@ install(
   RUNTIME DESTINATION lib/${PROJECT_NAME}
 )
 install(
-  TARGETS sonar_publisher sonar_replay sonar_to_bag RUNTIME DESTINATION lib/${PROJECT_NAME}
+  TARGETS sonar_publisher sonar_replay sonar_to_bag sonar_packet_timing RUNTIME DESTINATION lib/${PROJECT_NAME}
 )
 install(DIRECTORY include/ DESTINATION include)
 install(DIRECTORY config launch DESTINATION share/${PROJECT_NAME})
@@ -218,6 +225,7 @@ if(BUILD_TESTING)
     test/test_conversions.cpp
     test/test_http_client.cpp
     test/test_protocol.cpp
+    test/test_packet_timing.cpp
     test/test_playback_clock.cpp
     test/test_range_signal_pairing.cpp
     test/test_sensor_clock.cpp
@@ -233,6 +241,10 @@ if(BUILD_TESTING)
     APPEND_ENV
       PYTHONPATH=${CMAKE_CURRENT_BINARY_DIR}/rosidl_generator_py:${CMAKE_CURRENT_SOURCE_DIR}/tools:${CMAKE_CURRENT_SOURCE_DIR}/test
       PYTEST_DISABLE_PLUGIN_AUTOLOAD=1)
+
+  ament_add_gtest(test_packet_timing test/test_packet_timing.cpp)
+  target_include_directories(test_packet_timing PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+  target_link_libraries(test_packet_timing sonar3d_timing)
 
   ament_add_gtest(test_protocol test/test_protocol.cpp)
   target_link_libraries(test_protocol sonar3d_protocol)

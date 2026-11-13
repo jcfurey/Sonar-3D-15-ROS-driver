@@ -755,7 +755,8 @@ void SonarDriver::handle_datagram(const Datagram & datagram)
       std::to_string(rclcpp::Time(fallback_stamp).nanoseconds()) +
       ",\"receipt\":{\"utc_ns\":" + std::to_string(datagram.receive_utc_ns) +
       ",\"monotonic_ns\":" + std::to_string(datagram.receive_monotonic_ns) +
-      "},\"boundary\":\"udp_datagram\",\"quality\":\"unverified_device_clock\",\"uncertainty_ns\":null}";
+      "},\"boundary\":\"udp_datagram\",\"quality\":\"unverified_device_clock\","
+      "\"uncertainty_ns\":null}";
     ingress_timing_publisher_->publish(std::move(timing));
   }
   if (has_subscribers(raw_packet_publisher_)) {

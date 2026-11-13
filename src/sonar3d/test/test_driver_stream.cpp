@@ -906,7 +906,8 @@ TEST_P(DriverStream, RawPacketsPreserveDuplicatesUnsupportedProductsAndDamagedBy
     EXPECT_EQ(raw[index]->packet_index, index);
     EXPECT_EQ(raw[index]->source_address, "127.0.0.1");
     EXPECT_EQ(raw[index]->header.frame_id, "test_sonar");
-    EXPECT_NE(timing[index]->data.find("\"ingress_id\":" + std::to_string(index)), std::string::npos);
+    EXPECT_NE(
+      timing[index]->data.find("\"ingress_id\":" + std::to_string(index)), std::string::npos);
     EXPECT_NE(timing[index]->data.find("\"boundary\":\"udp_datagram\""), std::string::npos);
     EXPECT_NEAR((driver_->now() - rclcpp::Time(raw[index]->header.stamp)).seconds(), 0.0, 0.5);
   }
